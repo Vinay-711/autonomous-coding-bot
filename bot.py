@@ -2005,9 +2005,11 @@ async def main():
     if not GEMINI_API_KEY:
         print("\n" + "=" * 70)
         print("❌ Error: GEMINI_API_KEY is not set!")
-        print("👉 Get a free Gemini API key at: https://aistudio.google.com/")
-        print("👉 Quickest setup: run ./run.sh (it will configure everything for you)")
-        print("   Or add it to your .env file: GEMINI_API_KEY=your_key_here")
+        print("👉 You must provide your own free Google Gemini API key to use AutoCoder AI.")
+        print("👉 Get your own free key in 10 seconds: https://aistudio.google.com/")
+        print("👉 Save your key by running:")
+        print("   autocoder config")
+        print("   (or add GEMINI_API_KEY=\"your_key_here\" to ~/.autocoder/.env or .env)")
         print("=" * 70 + "\n")
         sys.exit(1)
 

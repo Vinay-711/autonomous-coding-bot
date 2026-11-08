@@ -100,18 +100,19 @@ if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
     fi
 fi
 
-# 6. Configuration Check
+# 6. Configuration Check (Bring Your Own API Key)
 CONFIG_FILE="$INSTALL_ROOT/.env"
 if [ ! -f "$CONFIG_FILE" ] && [ ! -f "$APP_DIR/.env" ]; then
     echo ""
-    echo -e "${YELLOW}🔑 Gemini API Key Setup:${NC}"
-    echo -e "Get a free key from: ${CYAN}https://aistudio.google.com/${NC}"
-    read -r -p "Enter your Google Gemini API Key (or press Enter to skip): " USER_KEY
+    echo -e "${YELLOW}${BOLD}🔑 Bring Your Own API Key (Required):${NC}"
+    echo -e "AutoCoder AI requires each user to provide ${BOLD}their own free Google Gemini API key${NC}."
+    echo -e "👉 Get your own free key in 10 seconds (no credit card): ${CYAN}https://aistudio.google.com/${NC}\n"
+    read -r -p "Enter your personal Gemini API Key: " USER_KEY
     if [ -n "$USER_KEY" ]; then
         echo "GEMINI_API_KEY=\"$USER_KEY\"" > "$CONFIG_FILE"
-        echo -e "${GREEN}✅ Key saved to $CONFIG_FILE${NC}"
+        echo -e "${GREEN}✅ Key saved securely to $CONFIG_FILE${NC}"
     else
-        echo -e "${YELLOW}ℹ️  You can set your API key later by running: autocoder config${NC}"
+        echo -e "${YELLOW}⚠️  No key entered. You must set your own key before running: autocoder config${NC}"
     fi
 fi
 

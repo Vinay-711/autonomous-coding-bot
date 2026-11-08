@@ -113,10 +113,11 @@ fi
 # ------------------------------------------------------------------------------
 setup_env_wizard() {
     echo -e "\n${PURPLE}${BOLD}╔═══════════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${PURPLE}${BOLD}║                🔑 Quick Configuration Setup Wizard                    ║${NC}"
+    echo -e "${PURPLE}${BOLD}║           🔑 Bring Your Own API Key (BYOK) Setup Wizard               ║${NC}"
     echo -e "${PURPLE}${BOLD}╚═══════════════════════════════════════════════════════════════════════╝${NC}"
-    echo -e "AutoCoder AI requires a free Google Gemini API key to solve problems."
-    echo -e "👉 Get your key in 10 seconds (free): ${CYAN}${BOLD}https://aistudio.google.com/${NC}\n"
+    echo -e "AutoCoder AI is open-source and requires each user to provide their own personal"
+    echo -e "Google Gemini API key. Your key stays 100% private on your own machine."
+    echo -e "👉 Get your own free key in 10 seconds: ${CYAN}${BOLD}https://aistudio.google.com/${NC}\n"
 
     CURRENT_KEY=""
     CURRENT_GH=""

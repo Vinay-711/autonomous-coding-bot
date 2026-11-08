@@ -2,6 +2,13 @@
 
 Welcome to **AutoCoder AI**! This guide contains everything you need to set up, configure, and use the autonomous multi-platform coding bot from your terminal.
 
+> [!IMPORTANT]
+> **🔑 Bring Your Own API Key (BYOK)**:
+> To run AutoCoder AI, you **must use your own free Google Gemini API key**.
+> - Get your free key (takes 10 seconds, no credit card): [Google AI Studio](https://aistudio.google.com/)
+> - Your personal API key is stored securely on your own device in `~/.autocoder/.env` and is never shared or tracked in git.
+> - Configure or update your key anytime by running: `autocoder config`
+
 ---
 
 ## ⚡ 1. Fast Global Terminal Installation
@@ -183,3 +190,4 @@ When `GITHUB_USERNAME` is configured in your `.env`, AutoCoder AI automatically:
   ```bash
   playwright install chromium
   ```
+

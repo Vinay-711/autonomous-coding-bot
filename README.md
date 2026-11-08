@@ -8,6 +8,13 @@
 
 An autonomous AI pair programmer that **discovers unsolved competitive programming problems**, writes optimal **Java solutions** using **Google Gemini**, verifies them locally with `javac`, injects them into the browser editor, validates live judge verdicts, and **automatically commits and pushes verified solutions to GitHub**.
 
+> [!IMPORTANT]
+> **🔑 Bring Your Own API Key (BYOK)**:
+> This tool is 100% open-source and **requires each user to provide their own free Google Gemini API key**.
+> - Get your free API key in 10 seconds: [Google AI Studio](https://aistudio.google.com/) (no credit card required).
+> - Your key stays private and stored locally on your machine in `~/.autocoder/.env` (never uploaded or shared).
+> - Set it once during installation, or anytime by running `autocoder config`.
+
 ---
 
 ## 🌟 Supported Platforms
