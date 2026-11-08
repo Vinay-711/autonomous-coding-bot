@@ -1499,20 +1499,38 @@ async def process_problem(
                 if not is_logged_in:
                     print("\n" + "=" * 68)
                     print("⚠️  [Codeforces] You are not logged in to Codeforces in this browser profile!")
-                    print("👉 Please log in to your Codeforces account in the open Chrome window.")
+                    print(f"👉 Please enter your password for '{CODEFORCES_HANDLE}' in the open Chrome window.")
                     print("   (Your login will be preserved in saved_chrome_login for all future runs)")
                     print("=" * 68)
+                    try:
+                        await page.goto("https://codeforces.com/enter", wait_until="domcontentloaded", timeout=15000)
+                        if CODEFORCES_HANDLE:
+                            await page.locator('input[name="handleOrEmail"]').fill(CODEFORCES_HANDLE)
+                        cb = page.locator('input[name="remember"]')
+                        if await cb.count() > 0:
+                            await cb.check()
+                    except Exception:
+                        pass
                     if sys.platform == "darwin":
                         try:
                             subprocess.run(["osascript", "-e", 'tell application "Google Chrome" to activate'], capture_output=True)
                         except Exception:
                             pass
+                    logged_in = False
                     for _ in range(45):
                         await asyncio.sleep(2)
                         logged_in = await page.evaluate("""() => !!document.querySelector('a[href*="/logout"], a[href*="/profile/"]')""")
                         if logged_in:
-                            print("   ✅ Detected Codeforces login! Continuing with submission...")
+                            print("   ✅ Detected Codeforces login! Navigating back to submit page...")
+                            await page.goto("https://codeforces.com/problemset/submit", wait_until="domcontentloaded", timeout=25000)
+                            await asyncio.sleep(2)
                             break
+                    if not logged_in:
+                        page._anti_bot_blocked = True
+                        print("\n🛑 Login timed out. Codeforces submissions require an authenticated user account.")
+                        filename = get_safe_java_filename(url, platform_name)
+                        save_java_solution(filename, solution_code, url, explanation, platform_name)
+                        return False
                 
                 # Fill problem code (e.g. 1352C)
                 await page.locator('input[name="submittedProblemCode"]').fill(prob_code)
@@ -1788,32 +1806,29 @@ async def execute_batch(
         except Exception:
             pass
 
-        # 1b. If port 9222 is not active, on macOS visible run, activate Chrome with remote debugging
-        if not is_cdp and not headless and sys.platform == "darwin":
-            chrome_app = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-            if os.path.exists(chrome_app):
+        # 1b. If port 9222 is not active, launch Chrome with dedicated user-data-dir on port 9222
+        if not is_cdp and not headless:
+            chrome_app = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" if sys.platform == "darwin" else ""
+            if chrome_app and os.path.exists(chrome_app):
                 try:
-                    chrome_check = subprocess.run(["pgrep", "-f", "Google Chrome"], capture_output=True)
-                    if chrome_check.returncode == 0:
-                        print("🌐 Enabling remote debugging on Google Chrome (port 9222)...")
-                        subprocess.run(["osascript", "-e", 'tell application "Google Chrome" to quit'], capture_output=True)
-                        await asyncio.sleep(2)
-                        subprocess.run(["killall", "Google Chrome"], capture_output=True)
+                    user_data_path = str(BASE_DIR / "saved_chrome_login")
+                    print("🌐 Launching dedicated Chrome on port 9222...")
+                    subprocess.Popen([chrome_app, "--remote-debugging-port=9222", f"--user-data-dir={user_data_path}", "--no-first-run", "--no-default-browser-check"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    for _ in range(8):
                         await asyncio.sleep(1)
-
-                    subprocess.Popen([chrome_app, "--remote-debugging-port=9222", "--restore-last-session"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    await asyncio.sleep(2)
-
-                    with urllib.request.urlopen("http://localhost:9222/json/version", timeout=3) as resp:
-                        if resp.status == 200:
-                            print("🔗 Connecting directly to your running Google Chrome browser via CDP (port 9222)...")
-                            cdp_browser = await p.chromium.connect_over_cdp("http://localhost:9222")
-                            context = cdp_browser.contexts[0]
-                            page = await context.new_page()
-                            browser = cdp_browser
-                            is_cdp = True
-                            print("✅ Successfully connected to your live Chrome with all your accounts & logins!")
-                except Exception as e:
+                        try:
+                            with urllib.request.urlopen("http://localhost:9222/json/version", timeout=1) as resp:
+                                if resp.status == 200:
+                                    cdp_browser = await p.chromium.connect_over_cdp("http://localhost:9222")
+                                    context = cdp_browser.contexts[0]
+                                    page = context.pages[0] if context.pages else await context.new_page()
+                                    browser = cdp_browser
+                                    is_cdp = True
+                                    print("✅ Successfully connected to dedicated Chrome via CDP (port 9222)!")
+                                    break
+                        except Exception:
+                            pass
+                except Exception:
                     pass
 
         # 2. Fallback to launching persistent Chrome context

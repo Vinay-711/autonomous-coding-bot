@@ -16,9 +16,6 @@ echo "======================================================================="
 CHROME_BIN=""
 if [[ "$OSTYPE" == "darwin"* ]]; then
     CHROME_BIN="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-    osascript -e 'tell application "Google Chrome" to quit' 2>/dev/null
-    sleep 2
-    killall "Google Chrome" 2>/dev/null || true
 elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
     CHROME_BIN=$(which google-chrome || which google-chrome-stable || which chromium || which chromium-browser || echo "")
     pkill -f "chrome" 2>/dev/null || true
@@ -27,14 +24,17 @@ elif [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" ]]; then
     taskkill //F //IM chrome.exe 2>/dev/null || true
 fi
 
+USER_DATA_DIR="$SCRIPT_DIR/saved_chrome_login"
+mkdir -p "$USER_DATA_DIR"
+
 if [ -n "$CHROME_BIN" ] && [ -x "$CHROME_BIN" ]; then
-    echo "Starting: $CHROME_BIN"
-    "$CHROME_BIN" --remote-debugging-port=9222 --restore-last-session >/dev/null 2>&1 &
+    echo "Starting: $CHROME_BIN with dedicated profile..."
+    "$CHROME_BIN" --remote-debugging-port=9222 --user-data-dir="$USER_DATA_DIR" --no-first-run --no-default-browser-check >/dev/null 2>&1 &
 elif [ -n "$CHROME_BIN" ]; then
-    "$CHROME_BIN" --remote-debugging-port=9222 --restore-last-session >/dev/null 2>&1 &
+    "$CHROME_BIN" --remote-debugging-port=9222 --user-data-dir="$USER_DATA_DIR" --no-first-run --no-default-browser-check >/dev/null 2>&1 &
 else
     echo "⚠️  Could not auto-locate Chrome binary. Trying default 'google-chrome'..."
-    google-chrome --remote-debugging-port=9222 --restore-last-session >/dev/null 2>&1 &
+    google-chrome --remote-debugging-port=9222 --user-data-dir="$USER_DATA_DIR" --no-first-run --no-default-browser-check >/dev/null 2>&1 &
 fi
 
 sleep 2
