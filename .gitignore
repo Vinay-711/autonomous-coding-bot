@@ -1,0 +1,32 @@
+# Environment variables & secrets
+.env
+*.env
+!.env.example
+
+# Browser profile and session cookies
+saved_chrome_login/
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# Runtime logs and temporary solution archives
+logs/
+solutions/
+repos/
+solved_history.json
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.bak*
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Test and scratch files
+test_*.py
+he_discovered_links.txt

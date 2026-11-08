@@ -1,0 +1,17 @@
+# Add the problem URLs you want the bot to solve below (one per line)
+# Lines starting with # are ignored.
+
+# 1. LeetCode:
+https://leetcode.com/problems/two-sum/description/
+
+# 2. HackerRank:
+https://www.hackerrank.com/challenges/solve-me-first/problem
+
+# 3. Codeforces:
+https://codeforces.com/problemset/problem/4/A
+
+# 4. HackerEarth:
+https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/zoos-04664a78/
+
+# 5. CodeChef:
+https://www.codechef.com/problems/FLOW001
