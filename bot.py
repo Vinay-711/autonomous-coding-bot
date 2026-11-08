@@ -1073,6 +1073,7 @@ async def verify_live_submission_verdict(page: Page, platform_type: str, url: st
             }""")
             for pe in page_errs:
                 if "anti-bot" in pe.lower() or "verification" in pe.lower():
+                    page._anti_bot_blocked = True
                     return False, "Codeforces anti-bot verification (Cloudflare Turnstile) challenge required."
                 if len(pe) > 2:
                     return False, f"Codeforces form error: {pe}"
@@ -1598,6 +1599,12 @@ async def process_problem(
                             await page.locator('input.submit').click()
                             await asyncio.sleep(3)
                             break
+                    if not token:
+                        page._anti_bot_blocked = True
+                        print("\n🛑 Codeforces anti-bot verification was not completed.")
+                        filename = get_safe_java_filename(url, platform_name)
+                        save_java_solution(filename, solution_code, url, explanation, platform_name)
+                        return False
             except Exception as e:
                 print(f"   ⚠️  Codeforces submit notice: {e}")
         else:
@@ -1728,6 +1735,11 @@ async def solve_platform_quota(
             SolvedRegistry.mark_solved(platform, url)
             print(f"🎉 [{platform.upper()}] Progress: {accepted_count}/{target_accepted} ACCEPTED & COMMITTED TO GITHUB!\n")
         else:
+            if getattr(page, "_anti_bot_blocked", False):
+                print(f"\n🛑 [{platform.upper()}] Platform is gated by Cloudflare Anti-Bot verification.")
+                print(f"🛑 Stopping {platform.upper()} attempts immediately to avoid continuous looping.")
+                print(f"📁 Generated Java solution has been saved to: {SOLUTIONS_DIR.resolve()}\n")
+                break
             print(f"⚠️ [{platform.upper()}] Problem was NOT accepted by the judge.")
             print(f"🔄 Selecting next unsolved replacement problem to guarantee {target_accepted} accepted solutions...\n")
 
@@ -1775,6 +1787,34 @@ async def execute_batch(
                     print("✅ Successfully connected to your live Chrome with all your accounts & logins!")
         except Exception:
             pass
+
+        # 1b. If port 9222 is not active, on macOS visible run, activate Chrome with remote debugging
+        if not is_cdp and not headless and sys.platform == "darwin":
+            chrome_app = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+            if os.path.exists(chrome_app):
+                try:
+                    chrome_check = subprocess.run(["pgrep", "-f", "Google Chrome"], capture_output=True)
+                    if chrome_check.returncode == 0:
+                        print("🌐 Enabling remote debugging on Google Chrome (port 9222)...")
+                        subprocess.run(["osascript", "-e", 'tell application "Google Chrome" to quit'], capture_output=True)
+                        await asyncio.sleep(2)
+                        subprocess.run(["killall", "Google Chrome"], capture_output=True)
+                        await asyncio.sleep(1)
+
+                    subprocess.Popen([chrome_app, "--remote-debugging-port=9222", "--restore-last-session"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    await asyncio.sleep(2)
+
+                    with urllib.request.urlopen("http://localhost:9222/json/version", timeout=3) as resp:
+                        if resp.status == 200:
+                            print("🔗 Connecting directly to your running Google Chrome browser via CDP (port 9222)...")
+                            cdp_browser = await p.chromium.connect_over_cdp("http://localhost:9222")
+                            context = cdp_browser.contexts[0]
+                            page = await context.new_page()
+                            browser = cdp_browser
+                            is_cdp = True
+                            print("✅ Successfully connected to your live Chrome with all your accounts & logins!")
+                except Exception as e:
+                    pass
 
         # 2. Fallback to launching persistent Chrome context
         if not is_cdp:
