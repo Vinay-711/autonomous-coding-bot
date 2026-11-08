@@ -38,8 +38,8 @@ if env_file.exists():
         pass
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-GITHUB_USERNAME = os.environ.get("GITHUB_USERNAME", "Vinay-711").strip()
-CODEFORCES_HANDLE = os.environ.get("CODEFORCES_HANDLE", "vinay711").strip()
+GITHUB_USERNAME = os.environ.get("GITHUB_USERNAME", "").strip()
+CODEFORCES_HANDLE = os.environ.get("CODEFORCES_HANDLE", "").strip()
 
 AI_MODELS = [
     "gemini-3.1-flash-lite",
@@ -1270,6 +1270,9 @@ def save_java_solution(filename: str, code: str, url: str, explanation: str, pla
 
 def commit_solution_to_github(platform_type: str, url: str, code: str, explanation: str, platform_name: str) -> bool:
     """Commits and pushes the solution to the user's dedicated GitHub repository for that platform."""
+    if not GITHUB_USERNAME:
+        return False
+
     if platform_type not in PLATFORM_REPO_CONFIG:
         return False
 
@@ -1842,6 +1845,22 @@ async def main():
         help="Run browser in headless mode (recommended for scheduled/daemon execution)"
     )
     args = parser.parse_args()
+
+    if not GEMINI_API_KEY:
+        print("\n" + "=" * 70)
+        print("❌ Error: GEMINI_API_KEY is not set!")
+        print("👉 Get a free Gemini API key at: https://aistudio.google.com/")
+        print("👉 Quickest setup: run ./run.sh (it will configure everything for you)")
+        print("   Or add it to your .env file: GEMINI_API_KEY=your_key_here")
+        print("=" * 70 + "\n")
+        sys.exit(1)
+
+    if len(sys.argv) == 1:
+        print("\n" + "=" * 70)
+        print("🚀 AutoCoder AI - Starting Autonomous Coding Batch")
+        print(f"   Target: {args.count} {args.difficulty.upper()} Java problems across all 5 platforms")
+        print("   Tip: Run './run.sh' for an interactive menu, or use --help for flags")
+        print("=" * 70 + "\n")
 
     async def run_batch():
         await execute_batch(

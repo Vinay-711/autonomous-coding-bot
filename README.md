@@ -58,16 +58,53 @@ flowchart TD
 
 ---
 
-## 🚀 Quickstart Guide
+## 🚀 1-Minute Quickstart (Recommended)
+
+Get started in 2 commands — zero complex setup or manual configuration required:
+
+```bash
+# 1. Clone the repository
+git clone https://github.com/Vinay-711/autonomous-coding-bot.git
+cd autonomous-coding-bot
+
+# 2. Run the one-click launcher
+chmod +x run.sh && ./run.sh
+```
+
+### What `run.sh` does automatically:
+1. 🔍 **Prerequisite Checks**: Verifies Python 3 and Java (`javac`) on your machine.
+2. 📦 **Virtual Environment**: Automatically creates `.venv` and manages it.
+3. 📥 **Dependency Installation**: Installs Python libraries (`google-genai`, `playwright`, etc.) and downloads Chromium.
+4. 🔑 **Interactive Setup Wizard**: Prompts you for a free Google Gemini API key (from [Google AI Studio](https://aistudio.google.com/)) and sets up `.env`.
+5. 🎮 **Interactive Menu**: Lets you pick your routine, choose specific platforms, connect to real Chrome, or install background automation with a single keypress!
+
+```text
+╔═══════════════════════════════════════════════════════════════════════╗
+║              🤖 AutoCoder AI: Autonomous Coding Agent                 ║
+║       Multi-Platform Problem Solver • Java Verification • GitHub      ║
+╚═══════════════════════════════════════════════════════════════════════╝
+
+  [1] 🌟 Run Daily Quota (Solve 5 problems on ALL 5 platforms - 25 total)
+  [2] 🎯 Solve a Single Platform (LeetCode, Codeforces, HackerRank, etc.)
+  [3] 📄 Solve custom URLs from problems.txt
+  [4] 🌐 Connect Real Chrome (Bypass Cloudflare Turnstile & anti-bot)
+  [5] ⏰ Setup Automated Daily 6:00 PM Schedule (macOS Background Service)
+  [6] ⚙️  Reconfigure API Keys & Settings
+  [0] 🚪 Exit
+```
+
+---
+
+<details>
+<summary><b>🛠️ Alternative: Manual Setup (for advanced users)</b></summary>
 
 ### 1. Prerequisites
 - **Python 3.10+**: Ensure Python is installed (`python3 --version`).
 - **Java JDK 17 or 21**: Ensure `javac` and `java` are available on your PATH.
 - **Google Chrome**: For browser automation and session persistence.
 - **Gemini API Key**: Get a free API key from [Google AI Studio](https://aistudio.google.com/).
-- **GitHub CLI (`gh`)**: Recommended for seamless repository cloning and pushing (`brew install gh` on macOS).
 
-### 2. Installation
+### 2. Manual Installation
 ```bash
 # Clone the repository
 git clone https://github.com/Vinay-711/autonomous-coding-bot.git
@@ -84,7 +121,7 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
-### 3. Configuration
+### 3. Manual Configuration
 Copy `.env.example` to `.env` and fill in your credentials:
 ```bash
 cp .env.example .env
@@ -95,16 +132,18 @@ Edit `.env`:
 # Google Gemini API Key
 GEMINI_API_KEY="your-gemini-api-key-here"
 
-# Your GitHub Username (for auto-commit repositories)
+# Your GitHub Username (optional, for auto-commit repositories)
 GITHUB_USERNAME="your-github-username"
 
-# Your Competitive Programming Handles
+# Your Competitive Programming Handles (optional)
 CODEFORCES_HANDLE="your-cf-handle"
 LEETCODE_USERNAME="your-leetcode-username"
 HACKERRANK_USERNAME="your-hackerrank-username"
 HACKEREARTH_USERNAME="your-hackerearth-username"
 CODECHEF_USERNAME="your-codechef-username"
 ```
+
+</details>
 
 ---
 

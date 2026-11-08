@@ -3,7 +3,7 @@
 # Setup Daily macOS Launchd Service for AI Java Coding Bot
 # ==============================================================================
 
-PLIST_NAME="com.vinxy.codingbot.plist"
+PLIST_NAME="com.autocoder.codingbot.plist"
 PLIST_PATH="$HOME/Library/LaunchAgents/$PLIST_NAME"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="$PROJECT_DIR/.venv/bin/python3"
@@ -33,7 +33,7 @@ cat << EOF > "$PLIST_PATH"
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.vinxy.codingbot</string>
+    <string>com.autocoder.codingbot</string>
     <key>WorkingDirectory</key>
     <string>$PROJECT_DIR</string>
     <key>EnvironmentVariables</key>
@@ -87,7 +87,7 @@ echo "   Scheduled Time: 06:00 PM (18:00) every day"
 echo "   Platforms     : All 5 (LeetCode, Codeforces, HackerRank, CodeChef, HackerEarth)"
 echo "   Problems      : 5 Medium-to-Hard questions per platform (25 total / day)"
 echo "   Language      : Java (OpenJDK 25 / Java 17+)"
-echo "   GitHub Commits: Auto-commit & push to Vinay-711/*-daily repositories"
+echo "   GitHub Commits: Auto-commit & push to ${GITHUB_USERNAME:-your-username}/*-daily repositories"
 echo "   Output Log    : $LOG_FILE"
 echo "======================================================================="
 echo "To check service status:"
