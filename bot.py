@@ -1490,6 +1490,28 @@ async def process_problem(
                 
                 await page.goto("https://codeforces.com/problemset/submit", wait_until="domcontentloaded", timeout=25000)
                 await asyncio.sleep(2)
+
+                # Check if logged in
+                is_logged_in = await page.evaluate("""() => {
+                    return !!document.querySelector('a[href*="/logout"], a[href*="/profile/"]');
+                }""")
+                if not is_logged_in:
+                    print("\n" + "=" * 68)
+                    print("⚠️  [Codeforces] You are not logged in to Codeforces in this browser profile!")
+                    print("👉 Please log in to your Codeforces account in the open Chrome window.")
+                    print("   (Your login will be preserved in saved_chrome_login for all future runs)")
+                    print("=" * 68)
+                    if sys.platform == "darwin":
+                        try:
+                            subprocess.run(["osascript", "-e", 'tell application "Google Chrome" to activate'], capture_output=True)
+                        except Exception:
+                            pass
+                    for _ in range(45):
+                        await asyncio.sleep(2)
+                        logged_in = await page.evaluate("""() => !!document.querySelector('a[href*="/logout"], a[href*="/profile/"]')""")
+                        if logged_in:
+                            print("   ✅ Detected Codeforces login! Continuing with submission...")
+                            break
                 
                 # Fill problem code (e.g. 1352C)
                 await page.locator('input[name="submittedProblemCode"]').fill(prob_code)
@@ -1763,9 +1785,8 @@ async def execute_batch(
                     channel="chrome",
                     headless=headless,
                     user_agent=DEFAULT_USER_AGENT,
-                    ignore_default_args=["--no-sandbox"],
+                    ignore_default_args=["--enable-automation", "--no-sandbox"],
                     args=[
-                        "--disable-blink-features=AutomationControlled",
                         "--no-first-run",
                         "--no-default-browser-check",
                     ],
@@ -1776,15 +1797,22 @@ async def execute_batch(
                     user_data_dir=str(BASE_DIR / "saved_chrome_login"),
                     headless=headless,
                     user_agent=DEFAULT_USER_AGENT,
-                    ignore_default_args=["--no-sandbox"],
-                    args=["--disable-blink-features=AutomationControlled"],
+                    ignore_default_args=["--enable-automation", "--no-sandbox"],
+                    args=[
+                        "--no-first-run",
+                        "--no-default-browser-check",
+                    ],
                 )
             await browser.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {
+                Object.defineProperty(Object.getPrototypeOf(navigator), 'webdriver', {
                     get: () => undefined
                 });
             """)
-            page = browser.pages[0] if browser.pages else await browser.new_page()
+            # Ensure add_init_script is applied to the active page
+            p0 = browser.pages[0] if browser.pages else None
+            page = await browser.new_page()
+            if p0:
+                await p0.close()
 
         # Brief pause to let browser initialize
         await asyncio.sleep(2)
