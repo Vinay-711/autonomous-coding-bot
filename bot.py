@@ -23,19 +23,26 @@ from playwright.async_api import async_playwright, Page, BrowserContext
 # Configuration & Environment Setup
 # ==============================================================================
 BASE_DIR = Path(__file__).resolve().parent
+CONFIG_DIR = Path.home() / ".autocoder"
+CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
-# Auto-load .env file if present
-env_file = BASE_DIR / ".env"
-if env_file.exists():
-    try:
-        with open(env_file, "r", encoding="utf-8") as _ef:
-            for _line in _ef:
-                _line = _line.strip()
-                if _line and not _line.startswith("#") and "=" in _line:
-                    _k, _v = _line.split("=", 1)
-                    os.environ.setdefault(_k.strip(), _v.strip().strip("'\""))
-    except Exception:
-        pass
+# Auto-load .env file from working directory, user config dir, or base dir
+env_candidates = [
+    Path.cwd() / ".env",
+    CONFIG_DIR / ".env",
+    BASE_DIR / ".env",
+]
+for _env in env_candidates:
+    if _env.exists():
+        try:
+            with open(_env, "r", encoding="utf-8") as _ef:
+                for _line in _ef:
+                    _line = _line.strip()
+                    if _line and not _line.startswith("#") and "=" in _line:
+                        _k, _v = _line.split("=", 1)
+                        os.environ.setdefault(_k.strip(), _v.strip().strip("'\""))
+        except Exception:
+            pass
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GITHUB_USERNAME = os.environ.get("GITHUB_USERNAME", "").strip()
@@ -49,9 +56,9 @@ AI_MODELS = [
     "gemini-2.5-flash",
 ]
 SOLUTIONS_DIR = BASE_DIR / "solutions"
-SOLUTIONS_DIR.mkdir(exist_ok=True)
+SOLUTIONS_DIR.mkdir(parents=True, exist_ok=True)
 LOGS_DIR = BASE_DIR / "logs"
-LOGS_DIR.mkdir(exist_ok=True)
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
 # ==============================================================================
@@ -177,6 +184,8 @@ class CodingAnswer(BaseModel):
 # Central Solved Registry (Eliminates All Repeated Questions)
 # ==============================================================================
 HISTORY_FILE = BASE_DIR / "solved_history.json"
+if not HISTORY_FILE.exists() and (CONFIG_DIR / "solved_history.json").exists():
+    HISTORY_FILE = CONFIG_DIR / "solved_history.json"
 
 class SolvedRegistry:
     """Central registry tracking all solved problems across all platforms, local folders, and git repos."""
@@ -249,8 +258,13 @@ class SolvedRegistry:
         try:
             with open(HISTORY_FILE, "w", encoding="utf-8") as f:
                 json.dump({p: sorted(list(s)) for p, s in all_solved.items()}, f, indent=2)
-        except Exception as e:
-            print(f"⚠️ Failed to write to solved_history.json: {e}")
+        except Exception:
+            try:
+                fallback_file = CONFIG_DIR / "solved_history.json"
+                with open(fallback_file, "w", encoding="utf-8") as f:
+                    json.dump({p: sorted(list(s)) for p, s in all_solved.items()}, f, indent=2)
+            except Exception as e:
+                print(f"⚠️ Failed to write to solved_history.json: {e}")
 
 def get_existing_solved_slugs() -> Set[str]:
     """Backward compatibility helper."""
@@ -1210,7 +1224,7 @@ async def verify_codeforces_samples_java(page: Page, code: str) -> Tuple[bool, s
 # ==============================================================================
 # URL Helpers & File Archival (.java)
 # ==============================================================================
-REPOS_DIR = Path("/Users/vinxy/AUTOMATION/repos")
+REPOS_DIR = BASE_DIR / "repos"
 
 PLATFORM_REPO_CONFIG = {
     "leetcode": {
@@ -1795,9 +1809,151 @@ async def run_daily_scheduler(scheduled_time_str: str, batch_coro_func):
             print(f"❌ Scheduled run encountered an error: {e}")
 
 # ==============================================================================
+# CLI Helper Utilities & Subcommands
+# ==============================================================================
+def print_status_summary():
+    """Prints a beautiful summary table of solved problems across all platforms."""
+    all_solved = SolvedRegistry.get_all_solved(force_refresh=True)
+    print("\n" + "=" * 68)
+    print("      📊 AutoCoder AI: Solved Problems Status & Registry")
+    print("=" * 68)
+    print(f"  {'Platform':<16} {'Status':<14} {'Verified Count':>16}")
+    print("  " + "─" * 64)
+    total = 0
+    display_names = {
+        "leetcode": "LeetCode",
+        "codeforces": "Codeforces",
+        "hackerrank": "HackerRank",
+        "codechef": "CodeChef",
+        "hackerearth": "HackerEarth",
+    }
+    for p, name in display_names.items():
+        cnt = len(all_solved.get(p, set()))
+        total += cnt
+        status_icon = "🟢 Active" if cnt > 0 else "⚪ None yet"
+        print(f"  {name:<16} {status_icon:<14} {cnt:>12} solved")
+    print("  " + "─" * 64)
+    print(f"  {'TOTAL':<16} {'🏆 Accepted':<14} {total:>12} problems")
+    print("=" * 68)
+    print(f"  📁 Solved Registry : {HISTORY_FILE.resolve()}")
+    print(f"  📁 Solution Files   : {SOLUTIONS_DIR.resolve()}")
+    if GITHUB_USERNAME:
+        print(f"  🐙 GitHub Profile   : https://github.com/{GITHUB_USERNAME}")
+    print("=" * 68 + "\n")
+
+def interactive_config_wizard():
+    """Interactively configures or updates API keys and competitive programming handles."""
+    print("\n" + "=" * 68)
+    print("      ⚙️  AutoCoder AI: Configuration Wizard")
+    print("=" * 68)
+    print("AutoCoder AI needs a free Google Gemini API key to solve problems.")
+    print("👉 Get your key in 10 seconds (free): https://aistudio.google.com/\n")
+
+    current_key = os.environ.get("GEMINI_API_KEY", "")
+    key_preview = f" [{current_key[:8]}...]" if current_key else ""
+    try:
+        new_key = input(f"Enter your Google Gemini API Key{key_preview}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nAborted.")
+        return
+    api_key = new_key or current_key
+
+    while not api_key:
+        print("❌ Gemini API Key cannot be empty!")
+        try:
+            api_key = input("Enter your Google Gemini API Key: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nAborted.")
+            return
+
+    current_gh = os.environ.get("GITHUB_USERNAME", "")
+    gh_preview = f" [{current_gh}]" if current_gh else ""
+    try:
+        new_gh = input(f"Enter your GitHub Username (optional){gh_preview}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        new_gh = ""
+    gh_user = new_gh or current_gh
+
+    current_cf = os.environ.get("CODEFORCES_HANDLE", "")
+    cf_preview = f" [{current_cf}]" if current_cf else ""
+    try:
+        new_cf = input(f"Enter your Codeforces Handle (optional){cf_preview}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        new_cf = ""
+    cf_handle = new_cf or current_cf
+
+    # Save to .env (current dir or CONFIG_DIR)
+    target_env = Path.cwd() / ".env" if (Path.cwd() / ".git").exists() or (Path.cwd() / "bot.py").exists() else CONFIG_DIR / ".env"
+    env_content = f"""# AutoCoder AI Configuration
+GEMINI_API_KEY="{api_key}"
+GITHUB_USERNAME="{gh_user}"
+CODEFORCES_HANDLE="{cf_handle}"
+"""
+    target_env.write_text(env_content, encoding="utf-8")
+    print(f"\n✅ Configuration saved to: {target_env.resolve()}")
+    print("=" * 68 + "\n")
+
+def launch_chrome_debug():
+    """Launches Chrome with remote debugging on port 9222."""
+    script = BASE_DIR / "connect_chrome.sh"
+    if script.exists():
+        subprocess.run(["bash", str(script)])
+    else:
+        if sys.platform == "darwin":
+            subprocess.run(["osascript", "-e", 'tell application "Google Chrome" to quit'], capture_output=True)
+            time.sleep(1)
+            subprocess.Popen(["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "--remote-debugging-port=9222", "--restore-last-session"])
+        elif sys.platform.startswith("linux"):
+            subprocess.Popen(["google-chrome", "--remote-debugging-port=9222", "--restore-last-session"])
+        print("🌐 Chrome launched on port 9222!")
+
+def setup_schedule():
+    """Configures the daily background schedule."""
+    script = BASE_DIR / "setup_daily_schedule.sh"
+    if script.exists():
+        subprocess.run(["bash", str(script)])
+    else:
+        print("ℹ️ Daily schedule is configured via 'autocoder --daily 18:00'")
+
+def launch_interactive_menu():
+    """Launches the interactive menu."""
+    script = BASE_DIR / "run.sh"
+    if script.exists():
+        subprocess.run(["bash", str(script)])
+    else:
+        print("Tip: Run 'autocoder daily' or 'autocoder solve <platform>'")
+
+# ==============================================================================
 # Main Entry Point
 # ==============================================================================
 async def main():
+    if len(sys.argv) > 1:
+        cmd = sys.argv[1].lower()
+        if cmd == "status":
+            print_status_summary()
+            return
+        elif cmd in ["config", "setup"]:
+            interactive_config_wizard()
+            return
+        elif cmd == "chrome":
+            launch_chrome_debug()
+            return
+        elif cmd == "schedule":
+            setup_schedule()
+            return
+        elif cmd == "menu":
+            launch_interactive_menu()
+            return
+        elif cmd == "daily":
+            # Run daily quota: replace 'daily' with --platform all
+            sys.argv = [sys.argv[0], "--platform", "all", "--count", "5", "--difficulty", "medium-hard", "--mode", "both"] + sys.argv[2:]
+        elif cmd == "solve":
+            if len(sys.argv) > 2 and not sys.argv[2].startswith("-"):
+                plat = sys.argv[2]
+                sys.argv = [sys.argv[0], "--platform", plat] + sys.argv[3:]
+            else:
+                sys.argv = [sys.argv[0]] + sys.argv[2:]
+
     parser = argparse.ArgumentParser(description="Fully Autonomous AI Java Coding Bot")
     parser.add_argument(
         "--platform",
@@ -1880,5 +2036,12 @@ async def main():
     else:
         await run_batch()
 
+def cli():
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n👋 AutoCoder AI stopped by user. See you next time!")
+        sys.exit(0)
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    cli()

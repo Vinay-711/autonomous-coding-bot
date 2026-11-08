@@ -95,6 +95,40 @@ chmod +x run.sh && ./run.sh
 
 ---
 
+## 💻 Global Terminal Command (`autocoder`)
+
+You can install `autocoder` as a global terminal command so anyone on your machine can run it directly from **any directory** without needing to `cd` into the project!
+
+### Quick Install (macOS / Linux)
+```bash
+# Option 1: One-line install via curl
+curl -fsSL https://raw.githubusercontent.com/Vinay-711/autonomous-coding-bot/main/install.sh | bash
+
+# Option 2: From local cloned repository
+./install.sh
+
+# Option 3: Via Python package manager (pipx / pip)
+pipx install git+https://github.com/Vinay-711/autonomous-coding-bot.git
+```
+
+Once installed, simply open **any terminal** and use `autocoder` commands:
+
+| Command | What it does |
+| :--- | :--- |
+| `autocoder` | Launch the interactive menu or start the daily routine |
+| `autocoder daily` | Solve today's quota: 5 medium-hard problems on **all 5 platforms** (25 total) |
+| `autocoder solve leetcode` | Autonomous solving on **LeetCode** (`--count 5`) |
+| `autocoder solve codeforces` | Autonomous solving on **Codeforces** (`--count 5`) |
+| `autocoder solve hackerrank` | Autonomous solving on **HackerRank** (`--count 5`) |
+| `autocoder solve codechef` | Autonomous solving on **CodeChef** (`--count 5`) |
+| `autocoder solve hackerearth` | Autonomous solving on **HackerEarth** (`--count 5`) |
+| `autocoder status` | View a live summary table of solved problems across platforms |
+| `autocoder chrome` | Launch Google Chrome with remote debugging (bypasses Cloudflare Turnstile) |
+| `autocoder schedule` | Install/view the automated 6:00 PM daily background service |
+| `autocoder config` | Interactive setup wizard to update Gemini API key & handles |
+
+---
+
 <details>
 <summary><b>🛠️ Alternative: Manual Setup (for advanced users)</b></summary>
 
@@ -147,30 +181,34 @@ CODECHEF_USERNAME="your-codechef-username"
 
 ---
 
-## 💻 Usage
+## 💻 Usage & Commands
 
-### Run Across All 5 Platforms
+### 🌟 Run Daily Quota (All 5 Platforms)
 Solve 5 verified problems on every platform (25 problems total):
 ```bash
+# Using global command
+autocoder daily
+
+# Or via Python
 python3 bot.py --platform all --count 5 --difficulty medium-hard --mode both
 ```
 
-### Run on a Single Platform
+### 🎯 Run on a Single Platform
 ```bash
 # LeetCode
-python3 bot.py --platform leetcode --count 5 --difficulty medium-hard --mode both
+autocoder solve leetcode --count 5
 
 # Codeforces
-python3 bot.py --platform codeforces --count 5 --difficulty medium-hard --mode both
+autocoder solve codeforces --count 5
 
 # HackerRank
-python3 bot.py --platform hackerrank --count 5 --difficulty medium-hard --mode both
+autocoder solve hackerrank --count 5
 
 # CodeChef
-python3 bot.py --platform codechef --count 5 --difficulty medium-hard --mode both
+autocoder solve codechef --count 5
 
 # HackerEarth
-python3 bot.py --platform hackerearth --count 5 --difficulty medium-hard --mode both
+autocoder solve hackerearth --count 5
 ```
 
 ### CLI Arguments

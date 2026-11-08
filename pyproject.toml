@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autocoder-ai"
+version = "1.0.0"
+description = "Autonomous Multi-Platform Coding Agent for LeetCode, Codeforces, HackerRank, CodeChef, and HackerEarth"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Vinay", email = "vinay@users.noreply.github.com"}
+]
+keywords = [
+    "competitive-programming",
+    "leetcode",
+    "codeforces",
+    "hackerrank",
+    "codechef",
+    "hackerearth",
+    "automation",
+    "ai-agent",
+    "playwright",
+    "gemini"
+]
+dependencies = [
+    "google-genai>=2.34.0",
+    "playwright>=1.40.0",
+    "pydantic>=2.0.0",
+    "pyperclip>=1.8.0",
+]
+
+[project.scripts]
+autocoder = "bot:cli"
+
+[project.urls]
+Homepage = "https://github.com/Vinay-711/autonomous-coding-bot"
+Repository = "https://github.com/Vinay-711/autonomous-coding-bot.git"
