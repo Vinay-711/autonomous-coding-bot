@@ -58,16 +58,58 @@ flowchart TD
 
 ---
 
-## 🚀 1-Minute Quickstart (Recommended)
+## 🚀 Quickstart: Install Terminal Command (Fastest)
 
-Get started in 2 commands — zero complex setup or manual configuration required:
+Install the `autocoder` global terminal command in **one step** (works on macOS & Linux from any directory):
 
 ```bash
-# 1. Clone the repository
+# Option 1: 1-Line Global Installation (Recommended)
+curl -fsSL https://raw.githubusercontent.com/Vinay-711/autonomous-coding-bot/main/install.sh | bash
+```
+
+Or install from a local clone:
+```bash
+# Option 2: Local Installer
 git clone https://github.com/Vinay-711/autonomous-coding-bot.git
 cd autonomous-coding-bot
+chmod +x install.sh && ./install.sh
+```
 
-# 2. Run the one-click launcher
+Or via Python package manager (`pipx` / `pip`):
+```bash
+# Option 3: Via pipx
+pipx install git+https://github.com/Vinay-711/autonomous-coding-bot.git
+```
+
+> 📖 **Full Guide**: See **[INSTRUCTIONS.md](INSTRUCTIONS.md)** for full documentation, examples, and troubleshooting.
+
+---
+
+## 💻 Available Terminal Commands
+
+Once installed, simply open **any terminal window** and run:
+
+| Command | Action |
+| :--- | :--- |
+| `autocoder` | Launch the interactive menu or start the daily routine |
+| `autocoder daily` | Solve today's quota: 5 medium-hard problems on **all 5 platforms** (25 total) |
+| `autocoder solve leetcode` | Autonomous solving on **LeetCode** (`--count 5`) |
+| `autocoder solve codeforces` | Autonomous solving on **Codeforces** (`--count 5`) |
+| `autocoder solve hackerrank` | Autonomous solving on **HackerRank** (`--count 5`) |
+| `autocoder solve codechef` | Autonomous solving on **CodeChef** (`--count 5`) |
+| `autocoder solve hackerearth` | Autonomous solving on **HackerEarth** (`--count 5`) |
+| `autocoder status` | View a live summary table of verified solved problems across all platforms |
+| `autocoder chrome` | Launch Google Chrome with remote debugging on port `9222` (bypasses Cloudflare Turnstile) |
+| `autocoder schedule` | Set up or inspect the automated 6:00 PM background schedule |
+| `autocoder config` | Interactive configuration wizard to update Gemini API keys and handles |
+
+---
+
+## 🎮 Interactive Menu Runner (`./run.sh`)
+
+If you prefer running interactively from within the repository:
+
+```bash
 chmod +x run.sh && ./run.sh
 ```
 
@@ -92,40 +134,6 @@ chmod +x run.sh && ./run.sh
   [6] ⚙️  Reconfigure API Keys & Settings
   [0] 🚪 Exit
 ```
-
----
-
-## 💻 Global Terminal Command (`autocoder`)
-
-You can install `autocoder` as a global terminal command so anyone on your machine can run it directly from **any directory** without needing to `cd` into the project!
-
-### Quick Install (macOS / Linux)
-```bash
-# Option 1: One-line install via curl
-curl -fsSL https://raw.githubusercontent.com/Vinay-711/autonomous-coding-bot/main/install.sh | bash
-
-# Option 2: From local cloned repository
-./install.sh
-
-# Option 3: Via Python package manager (pipx / pip)
-pipx install git+https://github.com/Vinay-711/autonomous-coding-bot.git
-```
-
-Once installed, simply open **any terminal** and use `autocoder` commands:
-
-| Command | What it does |
-| :--- | :--- |
-| `autocoder` | Launch the interactive menu or start the daily routine |
-| `autocoder daily` | Solve today's quota: 5 medium-hard problems on **all 5 platforms** (25 total) |
-| `autocoder solve leetcode` | Autonomous solving on **LeetCode** (`--count 5`) |
-| `autocoder solve codeforces` | Autonomous solving on **Codeforces** (`--count 5`) |
-| `autocoder solve hackerrank` | Autonomous solving on **HackerRank** (`--count 5`) |
-| `autocoder solve codechef` | Autonomous solving on **CodeChef** (`--count 5`) |
-| `autocoder solve hackerearth` | Autonomous solving on **HackerEarth** (`--count 5`) |
-| `autocoder status` | View a live summary table of solved problems across platforms |
-| `autocoder chrome` | Launch Google Chrome with remote debugging (bypasses Cloudflare Turnstile) |
-| `autocoder schedule` | Install/view the automated 6:00 PM daily background service |
-| `autocoder config` | Interactive setup wizard to update Gemini API key & handles |
 
 ---
 

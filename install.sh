@@ -139,3 +139,4 @@ if [ $PATH_UPDATED -eq 1 ]; then
     echo -e "   source $SHELL_PROFILE"
 fi
 echo -e "${GREEN}Happy coding! 🚀${NC}"
+
