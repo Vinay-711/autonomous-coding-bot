@@ -1510,10 +1510,72 @@ async def process_problem(
                 # Fill source code
                 await page.locator('textarea#sourceCodeTextarea, textarea[name="source"]').fill(solution_code)
                 print("   📋 Pasted Java solution code.")
-                
+
+                # Check for Cloudflare Turnstile anti-bot challenge
+                has_turnstile = await page.evaluate("""() => {
+                    const cf = document.querySelector('iframe[src*="cloudflare"], iframe[src*="turnstile"], .cf-turnstile, input[name="cf-turnstile-response"]');
+                    return !!cf;
+                }""")
+
+                if has_turnstile:
+                    token = await page.evaluate("""() => {
+                        const el = document.querySelector('input[name="cf-turnstile-response"]');
+                        return el && el.value && el.value.length > 5 ? el.value : '';
+                    }""")
+                    if not token:
+                        print("\n" + "=" * 68)
+                        print("🛡️  [Codeforces] Cloudflare Anti-Bot Verification Detected!")
+                        print("=" * 68)
+                        print("👉 Please complete the verification directly in your open Chrome window.")
+                        print("   Waiting for verification to complete (up to 90s)...")
+                        print("=" * 68)
+                        if sys.platform == "darwin":
+                            try:
+                                subprocess.run(["osascript", "-e", 'tell application "Google Chrome" to activate'], capture_output=True)
+                            except Exception:
+                                pass
+
+                        for sec in range(45):
+                            await asyncio.sleep(2)
+                            token = await page.evaluate("""() => {
+                                const el = document.querySelector('input[name="cf-turnstile-response"]');
+                                return el && el.value && el.value.length > 5 ? el.value : '';
+                            }""")
+                            if token:
+                                print("   ✅ Human verification completed in Chrome! Submitting...")
+                                break
+                            if sec > 0 and sec % 5 == 0:
+                                print(f"   ⏳ Waiting for human verification in Chrome ({90 - sec * 2}s remaining)...")
+
                 # Click submit
                 await page.locator('input.submit').click()
                 print("   🚀 Clicked Codeforces Submit! Waiting for judge verdict...")
+                await asyncio.sleep(3)
+
+                # Check if submission was blocked due to anti-bot verification
+                err_text = await page.evaluate("""() => {
+                    const els = Array.from(document.querySelectorAll('.error, .error__desc, span[class*="error"]'));
+                    return els.map(e => (e.innerText || '').trim()).join(' ');
+                }""")
+                if "anti-bot" in err_text.lower() or "verification" in err_text.lower():
+                    print("\n⚠️  Codeforces notice: 'Please complete the anti-bot verification'")
+                    print("👉 Please click the verification box in Chrome. Giving 30s before retry...")
+                    if sys.platform == "darwin":
+                        try:
+                            subprocess.run(["osascript", "-e", 'tell application "Google Chrome" to activate'], capture_output=True)
+                        except Exception:
+                            pass
+                    for _ in range(15):
+                        await asyncio.sleep(2)
+                        token = await page.evaluate("""() => {
+                            const el = document.querySelector('input[name="cf-turnstile-response"]');
+                            return el && el.value && el.value.length > 5 ? el.value : '';
+                        }""")
+                        if token:
+                            print("   ✅ Verification detected! Re-submitting now...")
+                            await page.locator('input.submit').click()
+                            await asyncio.sleep(3)
+                            break
             except Exception as e:
                 print(f"   ⚠️  Codeforces submit notice: {e}")
         else:
@@ -1697,10 +1759,11 @@ async def execute_batch(
             print("\n🌐 Launching dedicated Chrome browser with persistent session...")
             try:
                 browser = await p.chromium.launch_persistent_context(
-                    user_data_dir="./saved_chrome_login",
+                    user_data_dir=str(BASE_DIR / "saved_chrome_login"),
                     channel="chrome",
                     headless=headless,
                     user_agent=DEFAULT_USER_AGENT,
+                    ignore_default_args=["--no-sandbox"],
                     args=[
                         "--disable-blink-features=AutomationControlled",
                         "--no-first-run",
@@ -1710,9 +1773,10 @@ async def execute_batch(
             except Exception as e:
                 print(f"⚠️  Could not launch Chrome with channel='chrome' ({e}). Using default Chromium...")
                 browser = await p.chromium.launch_persistent_context(
-                    user_data_dir="./saved_chrome_login",
+                    user_data_dir=str(BASE_DIR / "saved_chrome_login"),
                     headless=headless,
                     user_agent=DEFAULT_USER_AGENT,
+                    ignore_default_args=["--no-sandbox"],
                     args=["--disable-blink-features=AutomationControlled"],
                 )
             await browser.add_init_script("""
