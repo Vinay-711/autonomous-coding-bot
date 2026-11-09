@@ -424,28 +424,62 @@ async def discover_codeforces_candidates(page: Page, count: int = 15, difficulty
 
     # Fallback to curated catalog if API fails or yields insufficient candidates
     if len(candidates) < count:
-        catalog_fallback = [
-            "https://codeforces.com/problemset/problem/1352/C",
-            "https://codeforces.com/problemset/problem/1520/D",
-            "https://codeforces.com/problemset/problem/474/B",
-            "https://codeforces.com/problemset/problem/520/B",
-            "https://codeforces.com/problemset/problem/580/C",
-            "https://codeforces.com/problemset/problem/20/C",
-            "https://codeforces.com/problemset/problem/466/C",
-            "https://codeforces.com/problemset/problem/371/C",
-            "https://codeforces.com/problemset/problem/339/D",
-            "https://codeforces.com/problemset/problem/1294/C",
-            "https://codeforces.com/problemset/problem/459/B",
-            "https://codeforces.com/problemset/problem/1360/D",
-            "https://codeforces.com/problemset/problem/550/A",
-            "https://codeforces.com/problemset/problem/276/C",
-            "https://codeforces.com/problemset/problem/489/C",
-            "https://codeforces.com/problemset/problem/1335/D",
-            "https://codeforces.com/problemset/problem/1343/C",
-            "https://codeforces.com/problemset/problem/1352/D",
-            "https://codeforces.com/problemset/problem/1360/C",
-            "https://codeforces.com/problemset/problem/1374/C",
-        ]
+        if difficulty.lower() == "easy":
+            catalog_fallback = [
+                "https://codeforces.com/problemset/problem/4/A",
+                "https://codeforces.com/problemset/problem/71/A",
+                "https://codeforces.com/problemset/problem/231/A",
+                "https://codeforces.com/problemset/problem/158/A",
+                "https://codeforces.com/problemset/problem/282/A",
+                "https://codeforces.com/problemset/problem/112/A",
+                "https://codeforces.com/problemset/problem/339/A",
+                "https://codeforces.com/problemset/problem/263/A",
+                "https://codeforces.com/problemset/problem/546/A",
+                "https://codeforces.com/problemset/problem/791/A",
+                "https://codeforces.com/problemset/problem/617/A",
+                "https://codeforces.com/problemset/problem/59/A",
+                "https://codeforces.com/problemset/problem/977/A",
+                "https://codeforces.com/problemset/problem/266/A",
+                "https://codeforces.com/problemset/problem/281/A",
+                "https://codeforces.com/problemset/problem/110/A",
+                "https://codeforces.com/problemset/problem/734/A",
+                "https://codeforces.com/problemset/problem/41/A",
+                "https://codeforces.com/problemset/problem/677/A",
+                "https://codeforces.com/problemset/problem/1030/A",
+                "https://codeforces.com/problemset/problem/467/A",
+                "https://codeforces.com/problemset/problem/344/A",
+                "https://codeforces.com/problemset/problem/486/A",
+                "https://codeforces.com/problemset/problem/271/A",
+                "https://codeforces.com/problemset/problem/136/A",
+                "https://codeforces.com/problemset/problem/200/B",
+                "https://codeforces.com/problemset/problem/144/A",
+                "https://codeforces.com/problemset/problem/996/A",
+                "https://codeforces.com/problemset/problem/1328/A",
+                "https://codeforces.com/problemset/problem/520/A",
+            ]
+        else:
+            catalog_fallback = [
+                "https://codeforces.com/problemset/problem/1352/C",
+                "https://codeforces.com/problemset/problem/1520/D",
+                "https://codeforces.com/problemset/problem/474/B",
+                "https://codeforces.com/problemset/problem/520/B",
+                "https://codeforces.com/problemset/problem/580/C",
+                "https://codeforces.com/problemset/problem/20/C",
+                "https://codeforces.com/problemset/problem/466/C",
+                "https://codeforces.com/problemset/problem/371/C",
+                "https://codeforces.com/problemset/problem/339/D",
+                "https://codeforces.com/problemset/problem/1294/C",
+                "https://codeforces.com/problemset/problem/459/B",
+                "https://codeforces.com/problemset/problem/1360/D",
+                "https://codeforces.com/problemset/problem/550/A",
+                "https://codeforces.com/problemset/problem/276/C",
+                "https://codeforces.com/problemset/problem/489/C",
+                "https://codeforces.com/problemset/problem/1335/D",
+                "https://codeforces.com/problemset/problem/1343/C",
+                "https://codeforces.com/problemset/problem/1352/D",
+                "https://codeforces.com/problemset/problem/1360/C",
+                "https://codeforces.com/problemset/problem/1374/C",
+            ]
         for u in catalog_fallback:
             slug = u.rstrip("/").split("/")[-2] + "_" + u.rstrip("/").split("/")[-1]
             if not SolvedRegistry.is_solved("codeforces", slug) and u not in candidates:
@@ -500,7 +534,12 @@ async def discover_codechef_candidates(page: Page, count: int = 15, difficulty: 
     print(f"\n🔍 [CodeChef] Finding up to {count} unsolved problems (Difficulty: {difficulty.upper()})...")
     candidates = []
 
-    pages_to_check = [10, 20, 30, 40, 50, 60] if difficulty.lower() in ["medium-hard", "hard-medium", "medium"] else [20, 40, 60, 80]
+    if difficulty.lower() == "easy":
+        pages_to_check = [0, 1, 2, 3, 4, 5, 6, 7]
+    elif difficulty.lower() in ["medium-hard", "hard-medium", "medium"]:
+        pages_to_check = [10, 20, 30, 40, 50, 60]
+    else:
+        pages_to_check = [20, 40, 60, 80]
     for p_num in pages_to_check:
         if len(candidates) >= count:
             break
@@ -520,6 +559,9 @@ async def discover_codechef_candidates(page: Page, count: int = 15, difficulty: 
                                 continue
                         elif difficulty.lower() == "medium":
                             if r < 1200 or r > 1600:
+                                continue
+                        elif difficulty.lower() == "easy":
+                            if r > 1100:
                                 continue
                     except Exception:
                         continue
@@ -559,8 +601,37 @@ async def discover_hackerearth_candidates(page: Page, count: int = 15, difficult
     print(f"\n🔍 [HackerEarth] Finding up to {count} unsolved problems (Difficulty: {difficulty.upper()})...")
     candidates = []
 
-    # Curated catalog of verified, active Medium/Hard algorithmic challenges across topics
-    catalog = [
+    # Curated catalog of verified, active algorithmic challenges across topics
+    if difficulty.lower() == "easy":
+        catalog = [
+            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/zoos-06063825/",
+            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/roy-and-profile/",
+            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/find-product/",
+            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/count-divisors/",
+            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/palindromic-string/",
+            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/toggle-string/",
+            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/cost-of-balloons/",
+            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/divisibility-2-ee324d20/",
+            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/ali-and-helping-innocent-people/",
+            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/maximum-borders-9ecec21a/",
+            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/seven-segments-bm-1/",
+            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/split-houses/",
+            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/excursion-2-0a544a49/",
+            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/step-up-3-c82ee783/",
+            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/number-of-steps-38e680a5/",
+            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/best-index-1-45a2f8ff/",
+            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/minimum-steps-9/",
+            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/factorial-4/",
+            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/friend-relationship-1/",
+            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/maximum-number-11-c917f6bd/",
+            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/going-to-office-e2d4d5d3/",
+            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/conject-it/",
+            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/lift-queries/",
+            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/e-maze-in-1aa4e2ac/",
+            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/magical-word-6/",
+        ]
+    else:
+        catalog = [
         "https://www.hackerearth.com/practice/algorithms/graphs/breadth-first-search/practice-problems/algorithm/cloudy-days-82a872ec/",
         "https://www.hackerearth.com/practice/algorithms/graphs/breadth-first-search/practice-problems/algorithm/waves-b18625d7/",
         "https://www.hackerearth.com/practice/algorithms/graphs/breadth-first-search/practice-problems/algorithm/zero-path-a7d370fd/",
@@ -611,12 +682,21 @@ async def discover_hackerearth_candidates(page: Page, count: int = 15, difficult
 
     # If more needed, crawl live tracks
     if len(candidates) < count:
-        tracks = [
-            "https://www.hackerearth.com/practice/algorithms/graphs/breadth-first-search/practice-problems/",
-            "https://www.hackerearth.com/practice/algorithms/graphs/depth-first-search/practice-problems/",
-            "https://www.hackerearth.com/practice/algorithms/dynamic-programming/introduction-to-dynamic-programming-1/practice-problems/",
-            "https://www.hackerearth.com/practice/data-structures/trees/binary-search-tree/practice-problems/",
-        ]
+        if difficulty.lower() == "easy":
+            tracks = [
+                "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/",
+                "https://www.hackerearth.com/practice/basic-programming/complexity-analysis/time-and-space-complexity/practice-problems/",
+                "https://www.hackerearth.com/practice/basic-programming/operators/basics-of-operators/practice-problems/",
+                "https://www.hackerearth.com/practice/algorithms/searching/linear-search/practice-problems/",
+                "https://www.hackerearth.com/practice/algorithms/sorting/bubble-sort/practice-problems/",
+            ]
+        else:
+            tracks = [
+                "https://www.hackerearth.com/practice/algorithms/graphs/breadth-first-search/practice-problems/",
+                "https://www.hackerearth.com/practice/algorithms/graphs/depth-first-search/practice-problems/",
+                "https://www.hackerearth.com/practice/algorithms/dynamic-programming/introduction-to-dynamic-programming-1/practice-problems/",
+                "https://www.hackerearth.com/practice/data-structures/trees/binary-search-tree/practice-problems/",
+            ]
         for target_url in tracks:
             if len(candidates) >= count:
                 break
