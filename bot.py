@@ -885,23 +885,29 @@ IMPORTANT FORMATTING:
 
     last_error = None
     for model_name in AI_MODELS:
-        try:
-            print(f"   🤖 Querying {model_name} for Java solution...")
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=CodingAnswer,
-                    temperature=0.1,
-                ),
-            )
-            result = CodingAnswer.model_validate_json(response.text)
-            clean_code = clean_code_string(result.code)
-            return clean_code, result.explanation
-        except Exception as e:
-            last_error = e
-            print(f"   ⚠️  Model {model_name} failed: {e}. Trying next model...")
+        for m_retry in range(2):
+            try:
+                print(f"   🤖 Querying {model_name} for Java solution...")
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=CodingAnswer,
+                        temperature=0.1,
+                    ),
+                )
+                result = CodingAnswer.model_validate_json(response.text)
+                clean_code = clean_code_string(result.code)
+                return clean_code, result.explanation
+            except Exception as e:
+                last_error = e
+                err_str = str(e).lower()
+                if ("503" in err_str or "unavailable" in err_str or "429" in err_str or "rate" in err_str) and m_retry == 0:
+                    time.sleep(2)
+                    continue
+                print(f"   ⚠️  Model {model_name} failed: {e}. Trying next model...")
+                break
 
     raise RuntimeError(f"All Gemini models failed. Last error: {last_error}")
 
@@ -1801,6 +1807,7 @@ async def solve_platform_quota(
         print(f"❌ Unknown platform for quota solving: {platform}")
         return 0
 
+    page._anti_bot_blocked = False
     accepted_count = 0
     attempt_count = 0
     max_attempts = target_accepted * 3  # Up to 3x attempts to guarantee quota fulfillment
@@ -1809,6 +1816,7 @@ async def solve_platform_quota(
     pool_idx = 0
 
     while accepted_count < target_accepted and attempt_count < max_attempts:
+        page._anti_bot_blocked = False
         if pool_idx >= len(candidate_pool):
             print(f"⚠️ Exhausted initial candidate pool. Querying additional candidates for {platform}...")
             more_candidates = await disc_func(page, count=max_attempts, difficulty=difficulty)
@@ -1839,8 +1847,10 @@ async def solve_platform_quota(
             accepted_count += 1
             SolvedRegistry.mark_solved(platform, url)
             print(f"🎉 [{platform.upper()}] Progress: {accepted_count}/{target_accepted} ACCEPTED & COMMITTED TO GITHUB!\n")
+            await asyncio.sleep(6)
         else:
             if getattr(page, "_anti_bot_blocked", False):
+                page._anti_bot_blocked = False
                 print(f"\n🛑 [{platform.upper()}] Platform is gated by Cloudflare Anti-Bot verification.")
                 print(f"🛑 Stopping {platform.upper()} attempts immediately to avoid continuous looping.")
                 print(f"📁 Generated Java solution has been saved to: {SOLUTIONS_DIR.resolve()}\n")
