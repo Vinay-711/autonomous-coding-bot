@@ -1,6 +1,13 @@
 import asyncio
 import os
 import sys
+
+# Ensure unbuffered real-time stdout/stderr line logging
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(line_buffering=True)
+
 import re
 import json
 import time
