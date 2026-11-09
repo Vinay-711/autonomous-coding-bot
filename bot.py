@@ -1979,13 +1979,16 @@ async def execute_batch(
                     total_accepted += 1
                 if idx < len(urls_to_solve):
                     await asyncio.sleep(4)
-        elif platform == "all":
-            all_platforms = ["leetcode", "codeforces", "hackerrank", "codechef", "hackerearth"]
-            print(f"\n📊 Starting autonomous quota run: {count} ACCEPTED problems on EACH of the 5 platforms ({count * 5} total)...")
+        elif platform == "all" or "," in platform:
+            if platform == "all":
+                all_platforms = ["leetcode", "codeforces", "hackerrank", "codechef", "hackerearth"]
+            else:
+                all_platforms = [p.strip().lower() for p in platform.split(",") if p.strip()]
+            print(f"\n📊 Starting autonomous quota run: {count} ACCEPTED problems on EACH of the {len(all_platforms)} platforms ({count * len(all_platforms)} total)...")
             for p_name in all_platforms:
                 acc = await solve_platform_quota(page, p_name, target_accepted=count, difficulty=difficulty, mode=mode)
                 total_accepted += acc
-            print(f"\n🏆 ALL PLATFORMS COMPLETED! {total_accepted}/{count * 5} total problems verified Accepted & committed to GitHub!")
+            print(f"\n🏆 COMPLETED! {total_accepted}/{count * len(all_platforms)} total problems verified Accepted & committed to GitHub!")
         else:
             total_accepted = await solve_platform_quota(page, platform, target_accepted=count, difficulty=difficulty, mode=mode)
             print(f"\n🏆 {platform.upper()} COMPLETED! {total_accepted}/{count} problems verified Accepted & committed to GitHub!")
@@ -2201,9 +2204,8 @@ async def main():
     parser = argparse.ArgumentParser(description="Fully Autonomous AI Java Coding Bot")
     parser.add_argument(
         "--platform",
-        choices=["leetcode", "codeforces", "hackerrank", "codechef", "hackerearth", "all", "file"],
         default="all",
-        help="Platform to solve unsolved problems from (default: all)"
+        help="Platform to solve unsolved problems from (e.g. codeforces, hackerrank, or comma-separated list, or 'all', default: all)"
     )
     parser.add_argument(
         "--count",
