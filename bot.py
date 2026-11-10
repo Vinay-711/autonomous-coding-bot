@@ -1670,21 +1670,29 @@ async def process_problem(
 
                 # Check for Cloudflare Turnstile anti-bot challenge
                 has_turnstile = await page.evaluate("""() => {
-                    const cf = document.querySelector('iframe[src*="cloudflare"], iframe[src*="turnstile"], .cf-turnstile, input[name="cf-turnstile-response"]');
+                    const cf = document.querySelector('iframe[src*="cloudflare"], iframe[src*="turnstile"], .cf-turnstile, input[name="turnstileToken"], input[name="cf-turnstile-response"]');
                     return !!cf;
                 }""")
 
                 if has_turnstile:
-                    token = await page.evaluate("""() => {
-                        const el = document.querySelector('input[name="cf-turnstile-response"]');
-                        return el && el.value && el.value.length > 5 ? el.value : '';
-                    }""")
+                    # Give Turnstile up to 8s to generate token automatically
+                    token = ""
+                    for _ in range(8):
+                        token = await page.evaluate("""() => {
+                            const el = document.querySelector('input[name="turnstileToken"], input[name="cf-turnstile-response"], input[name*="turnstile" i]');
+                            return el && el.value && el.value.length > 5 ? el.value : '';
+                        }""")
+                        if token:
+                            print("   ✅ Cloudflare Turnstile token ready! Submitting...")
+                            break
+                        await asyncio.sleep(1)
+
                     if not token:
                         print("\n" + "=" * 68)
                         print("🛡️  [Codeforces] Cloudflare Anti-Bot Verification Detected!")
                         print("=" * 68)
                         print("👉 Please complete the verification directly in your open Chrome window.")
-                        print("   Waiting for verification to complete (up to 90s)...")
+                        print("   Waiting for verification to complete (up to 30s)...")
                         print("=" * 68)
                         if sys.platform == "darwin":
                             try:
@@ -1692,17 +1700,17 @@ async def process_problem(
                             except Exception:
                                 pass
 
-                        for sec in range(45):
+                        for sec in range(15):
                             await asyncio.sleep(2)
                             token = await page.evaluate("""() => {
-                                const el = document.querySelector('input[name="cf-turnstile-response"]');
+                                const el = document.querySelector('input[name="turnstileToken"], input[name="cf-turnstile-response"], input[name*="turnstile" i]');
                                 return el && el.value && el.value.length > 5 ? el.value : '';
                             }""")
                             if token:
                                 print("   ✅ Human verification completed in Chrome! Submitting...")
                                 break
                             if sec > 0 and sec % 5 == 0:
-                                print(f"   ⏳ Waiting for human verification in Chrome ({90 - sec * 2}s remaining)...")
+                                print(f"   ⏳ Waiting for verification in Chrome ({30 - sec * 2}s remaining)...")
 
                     if not token:
                         page._anti_bot_blocked = True
@@ -1723,16 +1731,16 @@ async def process_problem(
                 }""")
                 if "anti-bot" in err_text.lower() or "verification" in err_text.lower():
                     print("\n⚠️  Codeforces notice: 'Please complete the anti-bot verification'")
-                    print("👉 Please click the verification box in Chrome. Giving 30s before retry...")
+                    print("👉 Please click the verification box in Chrome. Giving 20s before retry...")
                     if sys.platform == "darwin":
                         try:
                             subprocess.run(["osascript", "-e", 'tell application "Google Chrome" to activate'], capture_output=True)
                         except Exception:
                             pass
-                    for _ in range(15):
+                    for _ in range(10):
                         await asyncio.sleep(2)
                         token = await page.evaluate("""() => {
-                            const el = document.querySelector('input[name="cf-turnstile-response"]');
+                            const el = document.querySelector('input[name="turnstileToken"], input[name="cf-turnstile-response"], input[name*="turnstile" i]');
                             return el && el.value && el.value.length > 5 ? el.value : '';
                         }""")
                         if token:
@@ -1867,8 +1875,24 @@ async def solve_platform_quota(
         print(f"\n👉 [{platform.upper()}] Attempt {attempt_count}/{max_attempts} | Target Progress: {accepted_count}/{target_accepted} Accepted")
         print(f"   Solving: {url}")
 
+        # Ensure page is open and healthy before attempting
         try:
-            success = await process_problem(page, url, mode=mode)
+            if page.is_closed():
+                print("   ⚠️ Browser page was closed. Recreating fresh page...")
+                page = await page.context.new_page()
+        except Exception:
+            pass
+
+        try:
+            # 180s hard timeout per problem to prevent any infinite freeze
+            success = await asyncio.wait_for(process_problem(page, url, mode=mode), timeout=180)
+        except asyncio.TimeoutError:
+            print(f"   ⏱️  Problem processing timed out after 180s for {url}. Recovering...")
+            try:
+                await page.goto("about:blank", timeout=5000)
+            except Exception:
+                pass
+            success = False
         except Exception as e:
             print(f"   ❌ Unhandled error processing {url}: {e}")
             success = False
@@ -2026,11 +2050,35 @@ async def execute_batch(
                 all_platforms = ["leetcode", "codeforces", "hackerrank", "codechef", "hackerearth"]
             else:
                 all_platforms = [p.strip().lower() for p in platform.split(",") if p.strip()]
-            print(f"\n📊 Starting autonomous quota run: {count} ACCEPTED problems on EACH of the {len(all_platforms)} platforms ({count * len(all_platforms)} total)...")
+            target_total = count * len(all_platforms)
+            print(f"\n📊 Starting autonomous quota run: {count} ACCEPTED problems on EACH of the {len(all_platforms)} platforms ({target_total} total)...")
+            platform_results = {}
             for p_name in all_platforms:
                 acc = await solve_platform_quota(page, p_name, target_accepted=count, difficulty=difficulty, mode=mode)
                 total_accepted += acc
-            print(f"\n🏆 COMPLETED! {total_accepted}/{count * len(all_platforms)} total problems verified Accepted & committed to GitHub!")
+                platform_results[p_name] = acc
+
+            # Fail-safe quota guarantee: If any platform encountered issues (e.g. anti-bot gate, judge maintenance),
+            # reallocate the deficit to operational platforms to GUARANTEE 100% quota fulfillment.
+            deficit = target_total - total_accepted
+            if deficit > 0:
+                print(f"\n" + "=" * 70)
+                print(f"⚠️  Quota deficit detected: {total_accepted}/{target_total} achieved ({deficit} missing).")
+                print(f"🛡️  FAIL-SAFE REALLOCATION: Solving remaining {deficit} problems on healthy platforms...")
+                print("=" * 70)
+
+                successful = [p for p in all_platforms if platform_results.get(p, 0) > 0]
+                fallback_pool = successful if successful else ["hackerrank", "codechef", "hackerearth", "leetcode"]
+
+                for p_name in fallback_pool:
+                    if total_accepted >= target_total:
+                        break
+                    needed = min(deficit, target_total - total_accepted)
+                    print(f"\n🎯 [REALLOCATION] Solving {needed} additional problem(s) on {p_name.upper()}...")
+                    extra = await solve_platform_quota(page, p_name, target_accepted=needed, difficulty=difficulty, mode=mode)
+                    total_accepted += extra
+
+            print(f"\n🏆 COMPLETED! {total_accepted}/{target_total} total problems verified Accepted & committed to GitHub!")
         else:
             total_accepted = await solve_platform_quota(page, platform, target_accepted=count, difficulty=difficulty, mode=mode)
             print(f"\n🏆 {platform.upper()} COMPLETED! {total_accepted}/{count} problems verified Accepted & committed to GitHub!")
