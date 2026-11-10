@@ -852,6 +852,12 @@ def ask_gemini_for_java_code(
 2. If the starter template defines `class Result` and `public class Solution`, you MUST include BOTH classes intact in your output.
 3. NEVER omit or remove `public class Solution` or its `main` method, because HackerRank judge runs `Solution.main`!
 4. Write optimal algorithm in `Result` (or `Solution`), using fast I/O and handling all constraints and multiple test cases.
+5. STRICT JAVA 8 COMPATIBILITY REQUIRED (HackerRank judge executes with Java 8):
+   - DO NOT use the 'var' keyword (use explicit types like int, String, List<Integer>, etc.).
+   - DO NOT use Java 11+ methods like 'String.strip()', 'String.repeat()', or 'String.isBlank()' (use 'trim()' or standard loops).
+   - DO NOT use Java 9+ factory methods like 'List.of()', 'Set.of()', or 'Map.of()' (use 'Arrays.asList()' or 'new ArrayList<>()').
+   - DO NOT use 'Stream.toList()' (use '.collect(Collectors.toList())').
+   - DO NOT use modern switch expressions (use standard switch-case statements).
 """
     else:  # hackerearth
         platform_instructions = f"""
@@ -859,15 +865,23 @@ def ask_gemini_for_java_code(
 2. The primary class MUST be named 'TestClass' (e.g. `public class TestClass {{ public static void main(String[] args) throws Exception {{ ... }} }}`).
 3. Read input from System.in using BufferedReader / Scanner and print to System.out.
 4. Optimal time and space complexity.
+5. STRICT JAVA 8 COMPATIBILITY REQUIRED (HackerEarth judge executes with Java 8):
+   - DO NOT use the 'var' keyword (use explicit types like int, String, List<Integer>, etc.).
+   - DO NOT use Java 11+ methods like 'String.strip()', 'String.repeat()', or 'String.isBlank()' (use 'trim()' or standard loops).
+   - DO NOT use Java 9+ factory methods like 'List.of()', 'Set.of()', or 'Map.of()' (use 'Arrays.asList()' or 'new ArrayList<>()').
+   - DO NOT use 'Stream.toList()' (use '.collect(Collectors.toList())').
+   - DO NOT use modern switch expressions (use standard switch-case statements).
 """
 
     starter_section = f"STARTER CODE TEMPLATE:\n```java\n{starter_code}\n```" if starter_code.strip() else "STARTER CODE TEMPLATE: None provided. Write a complete standalone Java solution."
 
     feedback_section = f"\nATTENTION - PREVIOUS ATTEMPT FAILED WITH ERROR:\n{error_feedback}\nPlease diagnose and fix the issue in Java." if error_feedback else ""
 
+    java_version_spec = "Java 8 (STRICT Java 8 compatibility, NO var, NO Java 9+ methods)" if platform_type in ["hackerrank", "hackerearth"] else "Java (Java 17/21)"
+
     prompt = f"""
 You are an expert competitive programmer and Java software engineer.
-Solve this {platform_name} coding problem in Java (Java 17/21).
+Solve this {platform_name} coding problem in Java ({java_version_spec}).
 
 PROBLEM STATEMENT:
 {problem_text}
@@ -1104,8 +1118,12 @@ def compile_java_code_locally(code: str, platform_type: str) -> Tuple[bool, str,
             f.write(cleaned)
 
         try:
+            cmd = ["javac"]
+            if platform_type in ["hackerrank", "hackerearth"]:
+                cmd.extend(["-Xlint:-options", "--release", "8"])
+            cmd.append(str(src_file))
             comp_proc = subprocess.run(
-                ["javac", str(src_file)],
+                cmd,
                 capture_output=True,
                 text=True,
                 timeout=15
@@ -1205,6 +1223,11 @@ async def verify_live_submission_verdict(page: Page, platform_type: str, url: st
                                         return False, verdict
             except Exception:
                 pass
+        try:
+            if "/submit" in page.url:
+                page._anti_bot_blocked = True
+        except Exception:
+            pass
         return False, "No recent matching submission registered on Codeforces (check anti-bot verification)."
 
     elif platform_type == "leetcode":
@@ -1681,6 +1704,13 @@ async def process_problem(
                             if sec > 0 and sec % 5 == 0:
                                 print(f"   ⏳ Waiting for human verification in Chrome ({90 - sec * 2}s remaining)...")
 
+                    if not token:
+                        page._anti_bot_blocked = True
+                        print("\n🛑 Codeforces anti-bot verification (Cloudflare Turnstile) was not completed.")
+                        filename = get_safe_java_filename(url, platform_name)
+                        save_java_solution(filename, solution_code, url, explanation, platform_name)
+                        return False
+
                 # Click submit
                 await page.locator('input.submit').click()
                 print("   🚀 Clicked Codeforces Submit! Waiting for judge verdict...")
@@ -1882,6 +1912,18 @@ async def execute_batch(
     print(f"   Difficulty : {difficulty.upper()}")
     print(f"   Mode       : {mode.upper()}")
     print("=" * 70)
+
+    # Verify internet connectivity before proceeding (e.g. after system wake)
+    for net_try in range(10):
+        try:
+            import urllib.request
+            with urllib.request.urlopen("https://www.google.com", timeout=3) as resp:
+                if resp.status == 200:
+                    break
+        except Exception:
+            if net_try < 9:
+                print(f"   ⏳ Waiting for internet connection to be active ({net_try + 1}/10)...")
+                await asyncio.sleep(3)
 
     async with async_playwright() as p:
         browser = None
