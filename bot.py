@@ -56,11 +56,9 @@ GITHUB_USERNAME = os.environ.get("GITHUB_USERNAME", "").strip()
 CODEFORCES_HANDLE = os.environ.get("CODEFORCES_HANDLE", "").strip()
 
 AI_MODELS = [
-    "gemini-3.8-flash",
-    "gemini-3.7-flash",
-    "gemini-3.6-flash",
-    "gemini-2.5-pro",
     "gemini-2.5-flash",
+    "gemini-3.5-flash",
+    "gemini-3.6-flash",
     "gemini-3.1-flash-lite",
 ]
 SOLUTIONS_DIR = BASE_DIR / "solutions"
@@ -871,7 +869,13 @@ def ask_gemini_for_java_code(
     if not GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY is not set.")
 
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    client = genai.Client(
+        api_key=GEMINI_API_KEY,
+        http_options=types.HttpOptions(
+            api_version="v1beta",
+            timeout=90000,
+        )
+    )
 
     if platform_type == "leetcode":
         platform_instructions = """
