@@ -712,15 +712,35 @@ async def discover_hackerearth_candidates(page: Page, count: int = 15, difficult
                 "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/",
                 "https://www.hackerearth.com/practice/basic-programming/complexity-analysis/time-and-space-complexity/practice-problems/",
                 "https://www.hackerearth.com/practice/basic-programming/operators/basics-of-operators/practice-problems/",
+                "https://www.hackerearth.com/practice/basic-programming/bit-manipulation/basics-of-bit-manipulation/practice-problems/",
+                "https://www.hackerearth.com/practice/basic-programming/implementation/basics-of-implementation/practice-problems/",
                 "https://www.hackerearth.com/practice/algorithms/searching/linear-search/practice-problems/",
+                "https://www.hackerearth.com/practice/algorithms/searching/binary-search/practice-problems/",
                 "https://www.hackerearth.com/practice/algorithms/sorting/bubble-sort/practice-problems/",
+                "https://www.hackerearth.com/practice/algorithms/sorting/insertion-sort/practice-problems/",
+                "https://www.hackerearth.com/practice/data-structures/arrays/1-d/practice-problems/",
             ]
-        else:
+        elif difficulty.lower() == "hard":
+            tracks = [
+                "https://www.hackerearth.com/practice/algorithms/graphs/minimum-spanning-tree/practice-problems/",
+                "https://www.hackerearth.com/practice/algorithms/graphs/articulation-points-and-bridges/practice-problems/",
+                "https://www.hackerearth.com/practice/algorithms/dynamic-programming/state-space-reduction/practice-problems/",
+                "https://www.hackerearth.com/practice/algorithms/dynamic-programming/2-dimensional/practice-problems/",
+                "https://www.hackerearth.com/practice/data-structures/advanced-data-structures/trie-keyword-tree/practice-problems/",
+                "https://www.hackerearth.com/practice/data-structures/advanced-data-structures/segment-trees/practice-problems/",
+                "https://www.hackerearth.com/practice/data-structures/advanced-data-structures/fenwick-binary-indexed-trees/practice-problems/",
+            ]
+        else:  # medium or medium-hard
             tracks = [
                 "https://www.hackerearth.com/practice/algorithms/graphs/breadth-first-search/practice-problems/",
                 "https://www.hackerearth.com/practice/algorithms/graphs/depth-first-search/practice-problems/",
+                "https://www.hackerearth.com/practice/algorithms/graphs/shortest-path-algorithms/practice-problems/",
+                "https://www.hackerearth.com/practice/algorithms/greedy/basics-of-greedy-algorithms/practice-problems/",
                 "https://www.hackerearth.com/practice/algorithms/dynamic-programming/introduction-to-dynamic-programming-1/practice-problems/",
                 "https://www.hackerearth.com/practice/data-structures/trees/binary-search-tree/practice-problems/",
+                "https://www.hackerearth.com/practice/data-structures/stacks/basics-of-stacks/practice-problems/",
+                "https://www.hackerearth.com/practice/data-structures/queues/basics-of-queues/practice-problems/",
+                "https://www.hackerearth.com/practice/data-structures/hash-tables/basics-of-hash-tables/practice-problems/",
             ]
         for target_url in tracks:
             if len(candidates) >= count:
