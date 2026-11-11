@@ -56,11 +56,12 @@ GITHUB_USERNAME = os.environ.get("GITHUB_USERNAME", "").strip()
 CODEFORCES_HANDLE = os.environ.get("CODEFORCES_HANDLE", "").strip()
 
 AI_MODELS = [
-    "gemini-3.1-flash-lite",
-    "gemini-3.6-flash",
-    "gemini-3.5-flash",
     "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-2.5-pro",
     "gemini-2.5-flash",
+    "gemini-3.1-flash-lite",
 ]
 SOLUTIONS_DIR = BASE_DIR / "solutions"
 SOLUTIONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -779,17 +780,34 @@ async def switch_editor_to_java(page: Page, platform_type: str):
                         break
 
         elif platform_type == "hackerrank":
-            lang_btn = page.locator("button:has-text('Python'), button:has-text('C++'), select.select-language").first
-            if await lang_btn.count() > 0 and await lang_btn.is_visible():
-                txt = (await lang_btn.inner_text()).strip()
-                if "Java" not in txt:
-                    await lang_btn.click()
-                    await asyncio.sleep(0.6)
-                    opt = page.locator("li:has-text('Java 15'), li:has-text('Java 8'), li:has-text('Java')").first
-                    if await opt.count() > 0:
-                        await opt.click()
-                        print("   ☕ Automatically switched HackerRank editor to Java.")
+            # Check current selected language in HackerRank's custom React-Select container
+            current_lang = await page.evaluate("""() => {
+                const el = document.querySelector('.select-language, [class*="select-language"]');
+                return el ? (el.innerText || '').trim() : '';
+            }""")
+            if "Java" not in current_lang:
+                input_loc = page.locator("#select-language-input").first
+                if await input_loc.count() > 0:
+                    try:
+                        await input_loc.click()
+                        await asyncio.sleep(0.4)
+                        await input_loc.fill("Java 8")
+                        await asyncio.sleep(0.4)
+                        await page.keyboard.press("Enter")
                         await asyncio.sleep(1.5)
+                        print("   ☕ Automatically switched HackerRank editor to Java 8 via #select-language-input!")
+                    except Exception as e:
+                        print(f"   ⚠️ Could not switch via input: {e}")
+                else:
+                    container = page.locator(".select-language, div[class*='select-language']").first
+                    if await container.count() > 0:
+                        await container.click()
+                        await asyncio.sleep(0.6)
+                        opt = page.locator("div[id*='react-select']:has-text('Java 8'), div[id*='react-select']:has-text('Java 15'), div[id*='react-select']:has-text('Java'), li:has-text('Java')").first
+                        if await opt.count() > 0:
+                            await opt.click()
+                            print("   ☕ Automatically switched HackerRank editor to Java.")
+                            await asyncio.sleep(1.5)
 
         elif platform_type == "codechef":
             lang_btn = page.locator("button:has-text('Python'), button:has-text('C++'), select[name='language']").first
