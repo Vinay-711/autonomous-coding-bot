@@ -159,6 +159,13 @@ class ExecutionResult:
     security_violation: bool = False
     error_message: Optional[str] = None
 
+class DiagnosticCategory(str, Enum):
+    COMPILATION_ERROR = "COMPILATION_ERROR"
+    PARSER_ERROR = "PARSER_ERROR"
+    ALGORITHM_ERROR = "ALGORITHM_ERROR"
+    TIMEOUT_ERROR = "TIMEOUT_ERROR"
+    MEMORY_ERROR = "MEMORY_ERROR"
+
 @dataclass
 class SampleTestResult:
     sample_index: int
@@ -168,6 +175,8 @@ class SampleTestResult:
     actual_output: str
     error_message: Optional[str] = None
     diff: Optional[str] = None
+    diagnostic_category: Optional[DiagnosticCategory] = None
+    stderr: Optional[str] = None
 
 @dataclass
 class VerificationPipelineResult:
@@ -178,6 +187,7 @@ class VerificationPipelineResult:
     sample_results: List[SampleTestResult] = field(default_factory=list)
     repair_attempts: int = 0
     failure_reason: Optional[str] = None
+    diagnostic_category: Optional[DiagnosticCategory] = None
 
 @dataclass
 class PublishResult:
@@ -307,7 +317,11 @@ def classify_failure(
 
     msg_low = (str(error_msg) if error_msg else "").lower()
 
-    # Rate limiting
+    # Distinguish AI generation rate limits / errors from coding platform rate limits
+    if any(k in msg_low for k in ["gemini", "ai generation", "all gemini models failed", "resource_exhausted", "generativeai"]):
+        return FailureCode.TRANSIENT
+
+    # Rate limiting (platform-level)
     if any(k in msg_low for k in ["rate limit", "429", "too many requests", "retry-after", "cooling down", "quota exceeded"]):
         return FailureCode.RATE_LIMITED
 
@@ -508,6 +522,16 @@ def get_rate_limiter(platform: str) -> PlatformRateLimiter:
 
 get_platform_limiter = get_rate_limiter
 
+_PLATFORM_QUOTA_DIAGNOSTICS: Dict[str, str] = {}
+
+def set_platform_quota_diagnostic(platform: str, reason: str):
+    p = platform.lower().strip()
+    _PLATFORM_QUOTA_DIAGNOSTICS[p] = reason
+
+def get_platform_quota_diagnostic(platform: str) -> str:
+    p = platform.lower().strip()
+    return _PLATFORM_QUOTA_DIAGNOSTICS.get(p, "")
+
 async def detect_security_challenge_or_captcha(page: Page) -> SecurityChallengeDetection:
     """Detects CAPTCHA, Cloudflare challenges, and login walls without bypassing them."""
     if not page:
@@ -520,7 +544,7 @@ async def detect_security_challenge_or_captcha(page: Page) -> SecurityChallengeD
         pass
 
     # 1. URL-based challenge indicators
-    if any(k in curr_url.lower() for k in ["/challenge", "/captcha", "checkpoint", "/login?next=", "/enter?back="]):
+    if any(k in curr_url.lower() for k in ["/challenge-platform/", "/cdn-cgi/challenge-platform/", "/captcha", "/checkpoint", "/login?next=", "/enter?back="]):
         return SecurityChallengeDetection(
             detected=True,
             challenge_type="url_challenge_or_login_barrier",
@@ -2743,7 +2767,9 @@ OFFLINE_PROBLEM_CATALOG: Dict[str, List[Dict[str, Any]]] = {
                 "    }\n"
                 "}"
             ),
-            "samples": []
+            "samples": [
+                {"input": "121", "expected": "true"}
+            ]
         },
         {
             "id": "roman-to-integer",
@@ -2770,7 +2796,9 @@ OFFLINE_PROBLEM_CATALOG: Dict[str, List[Dict[str, Any]]] = {
                 "    }\n"
                 "}"
             ),
-            "samples": []
+            "samples": [
+                {"input": "III", "expected": "3"}
+            ]
         }
     ],
     "codeforces": [
@@ -2823,7 +2851,9 @@ OFFLINE_PROBLEM_CATALOG: Dict[str, List[Dict[str, Any]]] = {
                 "    }\n"
                 "}"
             ),
-            "samples": []
+            "samples": [
+                {"input": "4\nword\nlocalization\ninternationalization\npneumonoultramicroscopicsilicovolcanoconiosis\n", "expected": "word\nl10n\ni18n\np43s\n"}
+            ]
         }
     ],
     "hackerrank": [
@@ -3585,6 +3615,67 @@ async def switch_editor_to_java(page: Page, platform_type: str):
 # ==============================================================================
 # AI Solver Engine (Gemini 2.5 generating Java solutions)
 # ==============================================================================
+JAVA_FAST_SCANNER_TEMPLATE = """static class FastScanner {
+    BufferedReader br = new BufferedReader(new InputStreamReader(System.in));
+    StringTokenizer st;
+
+    FastScanner() {}
+    FastScanner(InputStream in) { br = new BufferedReader(new InputStreamReader(in)); }
+
+    String next() {
+        while (st == null || !st.hasMoreTokens()) {
+            try {
+                String line = br.readLine();
+                if (line == null) return null;
+                st = new StringTokenizer(line);
+            } catch (IOException e) {
+                return null;
+            }
+        }
+        return st.nextToken();
+    }
+
+    boolean hasNext() {
+        while (st == null || !st.hasMoreTokens()) {
+            try {
+                String line = br.readLine();
+                if (line == null) return false;
+                st = new StringTokenizer(line);
+            } catch (IOException e) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    int nextInt() {
+        String s = next();
+        if (s == null) throw new NoSuchElementException("EOF encountered while reading int");
+        return Integer.parseInt(s);
+    }
+
+    long nextLong() {
+        String s = next();
+        if (s == null) throw new NoSuchElementException("EOF encountered while reading long");
+        return Long.parseLong(s);
+    }
+
+    double nextDouble() {
+        String s = next();
+        if (s == null) throw new NoSuchElementException("EOF encountered while reading double");
+        return Double.parseDouble(s);
+    }
+
+    String nextLine() {
+        st = null;
+        try {
+            return br.readLine();
+        } catch (IOException e) {
+            return null;
+        }
+    }
+}"""
+
 def ask_gemini_for_java_code(
     problem_text: str,
     starter_code: str,
@@ -3661,8 +3752,34 @@ def ask_gemini_for_java_code(
         platform_instructions = f"""
 1. Write a complete, standalone Java program for {platform_name}.
 2. The class MUST be named 'Main' (e.g. `public class Main {{ public static void main(String[] args) throws IOException {{ ... }} }}`).
-3. Read all input from standard input using fast I/O:
-   Use `BufferedReader br = new BufferedReader(new InputStreamReader(System.in));` and `StringTokenizer st;`.
+3. CRITICAL INPUT PARSING & AVOIDANCE OF NumberFormatException:
+   - Competitive programming input frequently has multiple space-separated numbers on one line (e.g., '1 2' or '10 20 30').
+   - NEVER call `Integer.parseInt(br.readLine())` directly on lines with multiple integers! That crashes with NumberFormatException.
+   - Use the FastScanner helper class (or StringTokenizer) to parse whitespace-separated tokens individually:
+```java
+static class FastScanner {{
+    BufferedReader br = new BufferedReader(new InputStreamReader(System.in));
+    StringTokenizer st;
+    String next() {{
+        while (st == null || !st.hasMoreTokens()) {{
+            try {{ String l = br.readLine(); if (l == null) return null; st = new StringTokenizer(l); }}
+            catch (IOException e) {{ return null; }}
+        }}
+        return st.nextToken();
+    }}
+    boolean hasNext() {{
+        while (st == null || !st.hasMoreTokens()) {{
+            try {{ String l = br.readLine(); if (l == null) return false; st = new StringTokenizer(l); }}
+            catch (IOException e) {{ return false; }}
+        }}
+        return true;
+    }}
+    int nextInt() {{ return Integer.parseInt(next()); }}
+    long nextLong() {{ return Long.parseLong(next()); }}
+    double nextDouble() {{ return Double.parseDouble(next()); }}
+    String nextLine() {{ st = null; try {{ return br.readLine(); }} catch (IOException e) {{ return null; }} }}
+}}
+```
 4. Handle multiple test cases (T) if required by the problem statement.
 5. Print the output to System.out using PrintWriter or System.out.println.
 6. Optimal time & space complexity to prevent TLE (Time Limit Exceeded).
@@ -3673,7 +3790,8 @@ def ask_gemini_for_java_code(
 2. If the starter template defines `class Result` and `public class Solution`, you MUST include BOTH classes intact in your output.
 3. NEVER omit or remove `public class Solution` or its `main` method, because HackerRank judge runs `Solution.main`!
 4. Write optimal algorithm in `Result` (or `Solution`), using fast I/O and handling all constraints and multiple test cases.
-5. STRICT JAVA 8 COMPATIBILITY REQUIRED (HackerRank judge executes with Java 8):
+5. Avoid NumberFormatException by parsing whitespace-separated tokens with StringTokenizer/Scanner when reading multiple numbers from a single line.
+6. STRICT JAVA 8 COMPATIBILITY REQUIRED (HackerRank judge executes with Java 8):
    - DO NOT use the 'var' keyword (use explicit types like int, String, List<Integer>, etc.).
    - DO NOT use Java 11+ methods like 'String.strip()', 'String.repeat()', or 'String.isBlank()' (use 'trim()' or standard loops).
    - DO NOT use Java 9+ factory methods like 'List.of()', 'Set.of()', or 'Map.of()' (use 'Arrays.asList()' or 'new ArrayList<>()').
@@ -3684,7 +3802,7 @@ def ask_gemini_for_java_code(
         platform_instructions = """
 1. For HackerEarth, write a complete, standalone Java program.
 2. The primary class MUST be named 'TestClass' (e.g. `public class TestClass { public static void main(String[] args) throws Exception { ... } }`).
-3. Read input from System.in using BufferedReader / Scanner and print to System.out.
+3. Read input from System.in using FastScanner or Scanner to parse whitespace-separated tokens cleanly. Never assume one integer per line.
 4. Optimal time and space complexity.
 5. STRICT JAVA 8 COMPATIBILITY REQUIRED (HackerEarth judge executes with Java 8):
    - DO NOT use the 'var' keyword (use explicit types like int, String, List<Integer>, etc.).
@@ -3747,7 +3865,7 @@ IMPORTANT FORMATTING:
     raise RuntimeError(f"All Gemini models failed. Last error: {last_error}")
 
 def clean_code_string(code: str) -> str:
-    """Removes stray markdown fences if any."""
+    """Removes stray markdown fences and trailing syntax noise after final closing brace if any."""
     code = code.strip()
     if code.startswith("```java"):
         code = code[7:]
@@ -3755,7 +3873,32 @@ def clean_code_string(code: str) -> str:
         code = code[3:]
     if code.endswith("```"):
         code = code[:-3]
+    code = code.strip()
+
+    # Strip stray trailing punctuation or noise after the final closing brace
+    last_brace = code.rfind("}")
+    if last_brace != -1:
+        after_brace = code[last_brace + 1:]
+        stripped_after = after_brace.strip()
+        if stripped_after and all(ch in ".;'`\" \n\r\t" for ch in stripped_after):
+            code = code[:last_brace + 1]
+
     return code.strip()
+
+def validate_problem_text_completeness(text: str, min_length: int = 10) -> Tuple[bool, Optional[str]]:
+    """
+    Validates whether extracted problem text is complete before generation.
+    Rejects incomplete extractions (< 10 chars, empty, or error placeholders).
+    """
+    if not text or len(text.strip()) < min_length:
+        return False, f"Problem description too short ({len(text.strip()) if text else 0} chars, minimum {min_length} required)."
+
+    t_low = text.lower().strip()
+    error_placeholders = ["loading...", "loading", "404 not found", "access denied", "page not found", "error"]
+    if t_low in error_placeholders or any(t_low.startswith(p) for p in ["404 ", "error:"]):
+        return False, "Page returned an error placeholder instead of problem description."
+
+    return True, None
 
 # ==============================================================================
 # Browser Page Helpers (Selectors & Text Extraction)
@@ -4395,22 +4538,107 @@ def execute_java_sandboxed(
         )
 
 def extract_sample_test_cases_from_text(problem_text: str) -> List[SampleTestCase]:
-    """Extracts sample inputs and outputs from problem descriptions."""
+    """
+    Extracts sample inputs and outputs from problem descriptions.
+    Prevents format specification prose from being captured as sample inputs,
+    and cleanly terminates sample outputs before Explanation/Note/Constraints sections.
+    """
+    lines = problem_text.splitlines()
     samples: List[SampleTestCase] = []
 
-    pattern1 = re.compile(
-        r"(?:Sample\s+Input|Input)\s*(?:\d*)\s*:?\s*\n([\s\S]*?)\n\s*(?:Sample\s+Output|Output)\s*(?:\d*)\s*:?\s*\n([\s\S]*?)(?=(?:Sample\s+Input|Input|\Z))",
+    current_inp: List[str] = []
+    current_out: List[str] = []
+    state = "NONE"  # "INP", "OUT"
+    in_examples_section = False
+    sample_counter = 1
+
+    re_term = re.compile(
+        r"^\s*(?:explanation|notes?|constraints?|subtasks?|scoring|author|time limit|memory limit)\b",
         re.IGNORECASE
     )
-    for i, (inp, out) in enumerate(pattern1.findall(problem_text), 1):
-        clean_inp = inp.strip()
-        clean_out = out.strip()
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if state == "INP":
+                current_inp.append(line)
+            elif state == "OUT":
+                current_out.append(line)
+            continue
+
+        if re.match(r"^\s*examples?\b", stripped, re.IGNORECASE):
+            in_examples_section = True
+            continue
+
+        # Check section termination
+        if re_term.match(stripped):
+            if state == "OUT" and (current_inp or current_out):
+                clean_inp = "\n".join(current_inp).strip()
+                clean_out = "\n".join(current_out).strip()
+                if clean_inp or clean_out:
+                    samples.append(SampleTestCase(input_text=clean_inp, expected_output=clean_out, sample_index=sample_counter))
+                    sample_counter += 1
+                current_inp, current_out = [], []
+            state = "NONE"
+            continue
+
+        # Check Input header
+        is_inp_header = False
+        if re.match(r"^\s*(?:sample\s+(?:test\s+case\s+)?(?:\d+\s+)?input|example\s+(?:\d+\s+)?input)\s*(?:\d+)?\s*:?$", stripped, re.IGNORECASE):
+            is_inp_header = True
+        elif in_examples_section and re.match(r"^\s*input\s*(?:\d+)?\s*:?$", stripped, re.IGNORECASE):
+            is_inp_header = True
+        elif re.match(r"^\s*input\s*:\s*$", stripped, re.IGNORECASE) and not re.match(r"input format", stripped, re.IGNORECASE):
+            is_inp_header = True
+
+        if is_inp_header:
+            if state == "OUT" and (current_inp or current_out):
+                clean_inp = "\n".join(current_inp).strip()
+                clean_out = "\n".join(current_out).strip()
+                if clean_inp or clean_out:
+                    samples.append(SampleTestCase(input_text=clean_inp, expected_output=clean_out, sample_index=sample_counter))
+                    sample_counter += 1
+                current_inp, current_out = [], []
+            state = "INP"
+            continue
+
+        # Check Output header
+        is_out_header = False
+        if re.match(r"^\s*(?:sample\s+(?:test\s+case\s+)?(?:\d+\s+)?output|example\s+(?:\d+\s+)?output)\s*(?:\d+)?\s*:?$", stripped, re.IGNORECASE):
+            is_out_header = True
+        elif in_examples_section and re.match(r"^\s*output\s*(?:\d+)?\s*:?$", stripped, re.IGNORECASE):
+            is_out_header = True
+        elif re.match(r"^\s*output\s*:\s*$", stripped, re.IGNORECASE) and not re.match(r"output format", stripped, re.IGNORECASE):
+            is_out_header = True
+
+        if is_out_header:
+            state = "OUT"
+            continue
+
+        if state == "INP":
+            # Filter out specification prose like "The first line contains an integer T"
+            prose_starts = (
+                "the first line", "the first (and", "first line", "an integer", "each test case",
+                "the input", "input format", "contains a single", "the only line", "standard input"
+            )
+            if any(stripped.lower().startswith(ps) for ps in prose_starts):
+                state = "NONE"
+                current_inp = []
+                continue
+            current_inp.append(line)
+        elif state == "OUT":
+            current_out.append(line)
+
+    if state == "OUT" and (current_inp or current_out):
+        clean_inp = "\n".join(current_inp).strip()
+        clean_out = "\n".join(current_out).strip()
         if clean_inp or clean_out:
-            samples.append(SampleTestCase(input_text=clean_inp, expected_output=clean_out, sample_index=i))
+            samples.append(SampleTestCase(input_text=clean_inp, expected_output=clean_out, sample_index=sample_counter))
 
     if samples:
         return samples
 
+    # Fallback pattern for inline or LeetCode style examples
     pattern2 = re.compile(
         r"Example\s*\d*:?\s*Input:?\s*([^\n]+(?:\n[^\n]+)*?)\s*Output:?\s*([^\n]+(?:\n[^\n]+)*?)(?=Example|Explanation|Note|Constraints|\Z)",
         re.IGNORECASE
@@ -4418,6 +4646,7 @@ def extract_sample_test_cases_from_text(problem_text: str) -> List[SampleTestCas
     for i, (inp, out) in enumerate(pattern2.findall(problem_text), 1):
         clean_inp = inp.strip()
         clean_out = out.strip()
+        clean_out = re.split(r"\n\s*(?:Explanation|Note|Constraints)\b", clean_out, flags=re.IGNORECASE)[0].strip()
         if clean_inp or clean_out:
             samples.append(SampleTestCase(input_text=clean_inp, expected_output=clean_out, sample_index=i))
 
@@ -4456,6 +4685,8 @@ def run_all_sample_tests_sandboxed(
 ) -> Tuple[bool, List[SampleTestResult], str]:
     """Compiles and executes Java code against sample test cases in an isolated sandbox."""
     if not samples:
+        if platform_type in ["codeforces", "codechef", "hackerearth"]:
+            return False, [], "No sample test cases provided; sample execution is required for stdin/stdout problems."
         return True, [], "No sample test cases provided; compilation check only."
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -4489,7 +4720,9 @@ def run_all_sample_tests_sandboxed(
                     input_text=sample.input_text,
                     expected_output=sample.expected_output,
                     actual_output="",
-                    error_message=exec_res.error_message
+                    error_message=exec_res.error_message,
+                    diagnostic_category=DiagnosticCategory.TIMEOUT_ERROR,
+                    stderr=exec_res.stderr
                 )
                 results.append(res)
                 summary.append(f"Sample {sample.sample_index}: TIME LIMIT EXCEEDED ({timeout_sec}s)")
@@ -4501,22 +4734,33 @@ def run_all_sample_tests_sandboxed(
                     input_text=sample.input_text,
                     expected_output=sample.expected_output,
                     actual_output="",
-                    error_message=exec_res.error_message
+                    error_message=exec_res.error_message,
+                    diagnostic_category=DiagnosticCategory.MEMORY_ERROR,
+                    stderr=exec_res.stderr
                 )
                 results.append(res)
                 summary.append(f"Sample {sample.sample_index}: MEMORY LIMIT EXCEEDED ({max_memory_mb}MB)")
             elif not exec_res.success:
                 all_passed = False
+                err_low = (exec_res.stderr or "").lower()
+                is_parser_err = any(k in err_low for k in [
+                    "numberformatexception", "nosuchelementexception", "inputmismatchexception",
+                    "stringindexoutofboundsexception"
+                ]) or ("arrayindexoutofboundsexception" in err_low and any(k in err_low for k in ["main", "scanner", "token", "read"]))
+                d_cat = DiagnosticCategory.PARSER_ERROR if is_parser_err else DiagnosticCategory.ALGORITHM_ERROR
+
                 res = SampleTestResult(
                     sample_index=sample.sample_index,
                     passed=False,
                     input_text=sample.input_text,
                     expected_output=sample.expected_output,
                     actual_output=exec_res.stdout,
-                    error_message=exec_res.error_message
+                    error_message=exec_res.error_message,
+                    diagnostic_category=d_cat,
+                    stderr=exec_res.stderr
                 )
                 results.append(res)
-                summary.append(f"Sample {sample.sample_index}: RUNTIME ERROR (Code {exec_res.return_code})\nStderr: {exec_res.stderr.strip()}")
+                summary.append(f"Sample {sample.sample_index}: RUNTIME ERROR [{d_cat.value}] (Code {exec_res.return_code})\nStderr: {exec_res.stderr.strip()}")
             else:
                 matches, diff_msg = compare_sample_outputs(exec_res.stdout, sample.expected_output)
                 if matches:
@@ -4538,7 +4782,8 @@ def run_all_sample_tests_sandboxed(
                         expected_output=sample.expected_output,
                         actual_output=exec_res.stdout,
                         error_message=diff_msg,
-                        diff=diff_msg
+                        diff=diff_msg,
+                        diagnostic_category=DiagnosticCategory.ALGORITHM_ERROR
                     )
                     results.append(res)
                     summary.append(f"Sample {sample.sample_index}: FAILED\nInput:\n{sample.input_text}\nExpected:\n{sample.expected_output}\nActual:\n{exec_res.stdout}\nDiff: {diff_msg}")
@@ -4651,7 +4896,23 @@ def verify_and_repair_java_pipeline(
 
         print("   ✅ Local javac compilation PASSED cleanly!")
 
-        # 5. Sample Test Cases Check
+        # 5. Sample Test Cases Check (Strictly required for stdin/stdout problems)
+        is_stdin_problem = platform_type in ["codeforces", "codechef", "hackerearth"] or (
+            platform_type == "hackerrank" and any(k in solution_code for k in ["Scanner", "BufferedReader", "FastScanner"])
+        )
+        if is_stdin_problem and not samples:
+            print(f"   ⚠️ Sample execution is strictly required for stdin/stdout problems on {platform_name}, but no sample cases were provided.")
+            return VerificationPipelineResult(
+                success=False,
+                solution_code=cleaned_code,
+                explanation=explanation,
+                compilation=last_comp_res,
+                sample_results=[],
+                repair_attempts=repair_idx,
+                failure_reason="Sample test execution is required before submission for stdin/stdout problems, but no sample test cases were available.",
+                diagnostic_category=DiagnosticCategory.PARSER_ERROR
+            )
+
         samples_passed, sample_results, sample_summary = run_all_sample_tests_sandboxed(
             code=cleaned_code,
             samples=samples,
@@ -4668,14 +4929,28 @@ def verify_and_repair_java_pipeline(
             s_inp = failed_s.input_text if failed_s else ""
             s_exp = failed_s.expected_output if failed_s else ""
             s_act = failed_s.actual_output if failed_s else ""
-            last_feedback = (
-                f"SAMPLE TEST CASE #{s_idx} FAILED:\n"
-                f"Input:\n{s_inp}\n"
-                f"Expected Output:\n{s_exp}\n"
-                f"Actual Output:\n{s_act}\n"
-                f"Exact Diagnostic:\n{diag}\n"
-                f"Diagnose the algorithmic failure and output a corrected solution."
-            )
+            d_cat = failed_s.diagnostic_category if (failed_s and failed_s.diagnostic_category) else DiagnosticCategory.ALGORITHM_ERROR
+
+            feedback_lines = [
+                f"SAMPLE TEST CASE #{s_idx} FAILED [{d_cat.value}]:",
+                f"Input:\n{s_inp}",
+                f"Expected Output:\n{s_exp}",
+                f"Actual Output:\n{s_act}",
+            ]
+            if failed_s and failed_s.stderr and failed_s.stderr.strip():
+                feedback_lines.append(f"Runtime Exception / Stderr:\n{failed_s.stderr.strip()}")
+            feedback_lines.append(f"Exact Diagnostic:\n{diag}")
+
+            if d_cat == DiagnosticCategory.PARSER_ERROR:
+                feedback_lines.append(
+                    "CRITICAL FIX: Input parsing failed (e.g. NumberFormatException or NoSuchElementException). "
+                    "Multiple tokens may be on the same line. Do NOT call Integer.parseInt(br.readLine()) directly on lines; "
+                    "use the provided FastScanner with StringTokenizer to parse individual tokens."
+                )
+            else:
+                feedback_lines.append("Diagnose the algorithmic failure and output a corrected solution.")
+
+            last_feedback = "\n".join(feedback_lines)
             continue
 
         print("   ✅ Sample test cases PASSED!")
@@ -4689,6 +4964,14 @@ def verify_and_repair_java_pipeline(
         )
 
     # All repair attempts exhausted
+    last_cat = None
+    if last_sample_results:
+        f_s = next((s for s in last_sample_results if not s.passed), None)
+        if f_s:
+            last_cat = f_s.diagnostic_category
+    elif last_comp_res and not last_comp_res.success:
+        last_cat = DiagnosticCategory.COMPILATION_ERROR
+
     return VerificationPipelineResult(
         success=False,
         solution_code=solution_code,
@@ -4696,7 +4979,8 @@ def verify_and_repair_java_pipeline(
         compilation=last_comp_res,
         sample_results=last_sample_results,
         repair_attempts=max_repairs,
-        failure_reason=last_feedback or "Verification failed after maximum repair attempts"
+        failure_reason=last_feedback or "Verification failed after maximum repair attempts",
+        diagnostic_category=last_cat
     )
 
 async def capture_pre_submission_snapshot(
@@ -6562,13 +6846,22 @@ async def process_problem(
     # 8. Extract problem description
     print("[3/7] Extracting problem description...")
     problem_text = await extract_problem_text(page, config["question_selectors"])
-    if not problem_text:
-        print("⚠️  Waiting 4 more seconds for lazy-loaded elements...")
+    is_complete, comp_err = validate_problem_text_completeness(problem_text)
+    if not is_complete:
+        print(f"⚠️  Extracted text incomplete ({comp_err}). Waiting 4 more seconds for lazy-loaded elements...")
         await asyncio.sleep(4)
         problem_text = await extract_problem_text(page, config["question_selectors"])
-        if not problem_text:
-            print("❌ Unable to find problem description. Skipping.")
-            return ProcessResult(stage=ProcessStage.GENERATED, success=False, url=url, platform=platform_type, problem_id=prob_id, error="Unable to find problem description")
+        is_complete, comp_err = validate_problem_text_completeness(problem_text)
+        if not is_complete:
+            print(f"❌ Problem description incomplete ({comp_err}). Skipping candidate.")
+            return ProcessResult(
+                stage=ProcessStage.GENERATED,
+                success=False,
+                url=url,
+                platform=platform_type,
+                problem_id=prob_id,
+                error=f"Incomplete problem description: {comp_err}"
+            )
 
     print(f"   📄 Extracted problem description ({len(problem_text)} characters).")
 
@@ -7142,9 +7435,11 @@ async def solve_platform_quota(
     while accepted_count < target_accepted and attempt_count < max_attempts:
         if (time.time() - batch_start) >= max_duration:
             log_event("WARNING", f"Max execution duration of {max_duration}s exceeded. Gracefully ending {platform} quota run.")
+            set_platform_quota_diagnostic(platform, f"Max execution duration ({max_duration}s) exceeded")
             break
         if SHUTDOWN_REQUESTED:
             log_event("WARNING", f"SIGTERM/SIGINT received. Gracefully ending {platform} quota run.")
+            set_platform_quota_diagnostic(platform, "Process termination (SIGTERM/SIGINT) requested")
             break
 
         if page:
@@ -7163,6 +7458,7 @@ async def solve_platform_quota(
                     candidate_pool.append(c)
             if pool_idx >= len(candidate_pool):
                 print(f"❌ No further unsolved candidates available for {platform}.")
+                set_platform_quota_diagnostic(platform, f"Exhausted candidate pool after {attempt_count} attempts")
                 break
 
         url = candidate_pool[pool_idx]
@@ -7189,6 +7485,7 @@ async def solve_platform_quota(
         limiter = get_platform_limiter(platform)
         if limiter.is_paused():
             log_event("WARNING", f"Circuit breaker OPEN for {platform}. Platform is paused.", run_id=run_id, platform=platform, failure_code=FailureCode.RATE_LIMITED)
+            set_platform_quota_diagnostic(platform, f"Circuit breaker OPEN ({limiter.last_failure_reason or 'RATE_LIMITED cooldown'})")
             break
 
         prob_start = time.time()
@@ -7321,7 +7618,11 @@ async def solve_platform_quota(
                 failure_reason=err_msg,
                 is_transient=transient
             )
-            limiter.record_failure(is_rate_limit=(f_code == FailureCode.RATE_LIMITED), reason=err_msg or "")
+            is_ai_err = any(k in (err_msg or "").lower() for k in ["gemini", "ai generation", "all gemini models failed", "resource_exhausted", "generativeai"])
+            if not is_ai_err:
+                limiter.record_failure(is_rate_limit=(f_code == FailureCode.RATE_LIMITED), reason=err_msg or "")
+            else:
+                print(f"   ℹ️ AI generation transient error ({err_msg}). Not penalizing {platform} platform rate limiter.")
 
             # Requirement 5: Retry only transient failures automatically
             if transient:
@@ -7395,10 +7696,14 @@ async def solve_platform_quota(
 
     if SHUTDOWN_REQUESTED:
         run_status = "TERMINATED"
+        set_platform_quota_diagnostic(platform, "Process termination (SIGTERM/SIGINT) requested")
     elif accepted_count >= target_accepted:
         run_status = "COMPLETED"
+        set_platform_quota_diagnostic(platform, "Quota achieved")
     else:
         run_status = "SHORTFALL"
+        if not get_platform_quota_diagnostic(platform):
+            set_platform_quota_diagnostic(platform, f"Shortfall ({accepted_count}/{target_accepted} accepted after {attempt_count} attempts)")
         NOTIFICATION_MANAGER.send_notification(
             NotificationEvent.QUOTA_MISSED,
             f"Daily Quota Missed on {platform.upper()}",
@@ -7506,9 +7811,12 @@ async def execute_batch(
                 achieved = platform_results.get(p_name, 0)
                 targeted = platform_targets.get(p_name, count)
                 status_mark = "✅ Achieved" if achieved >= targeted else "❌ Deficit"
+                diag_msg = ""
                 if achieved < targeted:
                     all_satisfied = False
-                print(f"   {p_name.upper():<14}: {achieved}/{targeted} accepted [{status_mark}]")
+                    reason = get_platform_quota_diagnostic(p_name) or "Candidate verification shortfall"
+                    diag_msg = f" - Diagnostics: {reason}"
+                print(f"   {p_name.upper():<14}: {achieved}/{targeted} accepted [{status_mark}]{diag_msg}")
             print("=" * 70)
             print(f"\n📊 SUMMARY: {total_accepted}/{target_total} total problems verified Accepted across all platforms.")
             batch_success = all_satisfied
@@ -7670,9 +7978,12 @@ async def execute_batch(
                 achieved = platform_results.get(p_name, 0)
                 targeted = platform_targets.get(p_name, count)
                 status_mark = "✅ Achieved" if achieved >= targeted else "❌ Deficit"
+                diag_msg = ""
                 if achieved < targeted:
                     all_satisfied = False
-                print(f"   {p_name.upper():<14}: {achieved}/{targeted} accepted [{status_mark}]")
+                    reason = get_platform_quota_diagnostic(p_name) or "Candidate verification shortfall"
+                    diag_msg = f" - Diagnostics: {reason}"
+                print(f"   {p_name.upper():<14}: {achieved}/{targeted} accepted [{status_mark}]{diag_msg}")
             print("=" * 70)
             print(f"\n📊 SUMMARY: {total_accepted}/{target_total} total problems verified Accepted across all platforms.")
         else:
