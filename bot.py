@@ -20,9 +20,16 @@ try:
     import resource
 except ImportError:
     resource = None
+import signal
+import shutil
+try:
+    import psycopg2
+    import psycopg2.extras
+except ImportError:
+    psycopg2 = None
 from contextlib import contextmanager
 from zoneinfo import ZoneInfo
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Tuple, List, Set, Dict, Any, Union, Callable
 from enum import Enum
@@ -248,9 +255,12 @@ def redact_sensitive_data(text: Optional[str]) -> str:
     if not text:
         return ""
     text = re.sub(r"AIza[0-9A-Za-z-_]{30,45}", "[REDACTED_API_KEY]", str(text))
+    text = re.sub(r"(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{30,255}", "[REDACTED_GITHUB_TOKEN]", text)
+    text = re.sub(r"github_pat_[A-Za-z0-9_]{50,255}", "[REDACTED_GITHUB_TOKEN]", text)
     text = re.sub(r"(Bearer\s+)[A-Za-z0-9_\-\.]+", r"\1[REDACTED_TOKEN]", text, flags=re.IGNORECASE)
     text = re.sub(r"((?:sessionid|csrf(?:token|_token)?|phpsessid|jsessionid)=)[^;\s&]+", r"\1[REDACTED_COOKIE]", text, flags=re.IGNORECASE)
     text = re.sub(r'((?:password|passwd|pwd)[\s:=]+[\"\']?)[^\"\'\s;,\&]+([\"\']?)', r"\1[REDACTED_PASSWORD]\2", text, flags=re.IGNORECASE)
+    text = re.sub(r'((?:token|secret|access_key)[\s:=]+[\"\']?)[^\"\'\s;,\&]+([\"\']?)', r"\1[REDACTED_SECRET]\2", text, flags=re.IGNORECASE)
     return text
 
 class CircuitState(str, Enum):
@@ -663,15 +673,21 @@ async def poll_with_backoff(
 
 
 # ==============================================================================
-# Configuration & Environment Setup
+# Configuration & Environment Setup (Cloud-Native & Environment-Driven)
 # ==============================================================================
 BASE_DIR = Path(__file__).resolve().parent
+
+# Configurable writable data directory: defaults to /app/data in container, or BASE_DIR locally
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data" if Path("/app/data").exists() else BASE_DIR))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 CONFIG_DIR = Path.home() / ".autocoder"
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
-# Auto-load .env file from working directory, user config dir, or base dir
+# Auto-load .env file from working directory, user config dir, data dir, or base dir
 env_candidates = [
     Path.cwd() / ".env",
+    DATA_DIR / ".env",
     CONFIG_DIR / ".env",
     BASE_DIR / ".env",
 ]
@@ -687,9 +703,193 @@ for _env in env_candidates:
         except Exception:
             pass
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+SOLUTIONS_DIR = Path(os.environ.get("SOLUTIONS_DIR", DATA_DIR / "solutions"))
+SOLUTIONS_DIR.mkdir(parents=True, exist_ok=True)
+LOGS_DIR = Path(os.environ.get("LOGS_DIR", DATA_DIR / "logs"))
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
+REPOS_DIR = Path(os.environ.get("REPOS_DIR", DATA_DIR / "repos"))
+REPOS_DIR.mkdir(parents=True, exist_ok=True)
+CHROME_USER_DATA_DIR = Path(os.environ.get("CHROME_USER_DATA_DIR", DATA_DIR / "chrome_user_data"))
+DEFAULT_DB_FILE = Path(os.environ.get("DB_PATH", DATA_DIR / "autocoder.db"))
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+
+# Cloud Run / Container Execution Flags
+DRY_RUN = os.environ.get("DRY_RUN", "").lower() in ("true", "1", "yes")
+OFFLINE_MODE = os.environ.get("OFFLINE_MODE", "").lower() in ("true", "1", "yes")
+MAX_RUN_DURATION_SECONDS = int(os.environ.get("MAX_RUN_DURATION_SECONDS", "3600"))
+STRUCTURED_LOGGING = (
+    os.environ.get("STRUCTURED_LOGGING", "").lower() in ("true", "1", "yes")
+    or bool(os.environ.get("K_SERVICE") or os.environ.get("CLOUD_RUN_JOB"))
+)
+
+def log_event(level: str, message: str, **kwargs):
+    """Outputs structured JSON for Google Cloud Logging when enabled, else standard formatted print."""
+    level = level.upper()
+    redacted_msg = redact_sensitive_data(message)
+    if STRUCTURED_LOGGING:
+        payload = {
+            "severity": level,
+            "message": redacted_msg,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "component": "autocoder",
+        }
+        for k, v in kwargs.items():
+            payload[k] = redact_sensitive_data(str(v)) if isinstance(v, str) else v
+        out = sys.stdout if level in ["INFO", "DEBUG"] else sys.stderr
+        out.write(json.dumps(payload) + "\n")
+        out.flush()
+    else:
+        prefix = {
+            "INFO": "ℹ️ ",
+            "WARNING": "⚠️ ",
+            "ERROR": "❌",
+            "DEBUG": "🔍"
+        }.get(level, "")
+        print(f"{prefix} {redacted_msg}")
+
+def get_secret(secret_key: str, default: str = "") -> str:
+    """Retrieves secret from Secret Manager if running on GCP with project id or secret path, else environment."""
+    val = os.environ.get(secret_key, "").strip()
+    if val and not val.startswith("projects/"):
+        return val
+
+    secret_ref = val or os.environ.get(f"SECRET_{secret_key}", "").strip()
+    project_id = os.environ.get("GCP_PROJECT_ID") or os.environ.get("GOOGLE_CLOUD_PROJECT")
+
+    if secret_ref or (project_id and secret_key in ["GEMINI_API_KEY", "GITHUB_TOKEN"]):
+        try:
+            from google.cloud import secretmanager
+            client = secretmanager.SecretManagerServiceClient()
+            if secret_ref.startswith("projects/"):
+                name = secret_ref
+                if not name.endswith("/versions/latest") and "/versions/" not in name:
+                    name = f"{name}/versions/latest"
+            else:
+                s_name = secret_ref or secret_key
+                name = f"projects/{project_id}/secrets/{s_name}/versions/latest"
+
+            res = client.access_secret_version(request={"name": name})
+            retrieved = res.payload.data.decode("UTF-8").strip()
+            if retrieved:
+                log_event("INFO", f"Loaded secret for '{secret_key}' from Secret Manager ({name})")
+                return retrieved
+        except Exception as e:
+            log_event("WARNING", f"Secret Manager lookup for '{secret_key}' notice: {e}")
+
+    if DRY_RUN:
+        return f"dry_run_{secret_key.lower()}"
+    return default
+
+GEMINI_API_KEY = get_secret("GEMINI_API_KEY", "")
 GITHUB_USERNAME = os.environ.get("GITHUB_USERNAME", "").strip()
+GITHUB_TOKEN = get_secret("GITHUB_TOKEN", "")
 CODEFORCES_HANDLE = os.environ.get("CODEFORCES_HANDLE", "").strip()
+
+# Signal handling for Cloud Run Jobs SIGTERM
+SHUTDOWN_REQUESTED = False
+
+def handle_sigterm(signum, frame):
+    global SHUTDOWN_REQUESTED
+    SHUTDOWN_REQUESTED = True
+    sig_name = "SIGTERM" if signum == signal.SIGTERM else "SIGINT"
+    log_event("WARNING", f"Received {sig_name}. Initiating graceful shutdown and lease release...")
+    try:
+        if SolvedRegistry._db and getattr(SolvedRegistry, "_active_worker_id", None):
+            SolvedRegistry._db.recover_expired_leases(lease_timeout_sec=0)
+    except Exception:
+        pass
+
+try:
+    signal.signal(signal.SIGTERM, handle_sigterm)
+    signal.signal(signal.SIGINT, handle_sigterm)
+except (ValueError, AttributeError):
+    pass
+
+@dataclass
+class CloudWorkerConfig:
+    mode: str
+    platform: str
+    count: int
+    difficulty: str
+    dry_run: bool
+    offline_mode: bool
+    database_url: str
+    gemini_key_present: bool
+    github_auth_present: bool
+    max_duration: int
+
+def validate_startup_configuration(
+    mode: str = "both",
+    platform: str = "all",
+    count: int = 5,
+    difficulty: str = "medium-hard",
+    dry_run: bool = False,
+    offline_mode: bool = False,
+    timeout: Optional[int] = None
+) -> CloudWorkerConfig:
+    """Validates configuration at startup and fails fast with actionable errors."""
+    is_dry = dry_run or DRY_RUN
+    is_offline = offline_mode or OFFLINE_MODE
+    duration = timeout if timeout is not None else MAX_RUN_DURATION_SECONDS
+
+    gemini_present = bool(GEMINI_API_KEY) or is_dry
+    github_present = bool(GITHUB_USERNAME) and (bool(GITHUB_TOKEN) or os.environ.get("GITHUB_TOKEN"))
+
+    errors = []
+    if not is_dry and not gemini_present:
+        errors.append("GEMINI_API_KEY environment variable (or Secret Manager secret) is missing.")
+
+    if mode in ["submit", "both"] and not is_dry and not is_offline:
+        if not GITHUB_USERNAME:
+            log_event("WARNING", "GITHUB_USERNAME is not set. Publishing to GitHub will be skipped.")
+
+    if errors:
+        err_msg = "Startup configuration validation failed: " + "; ".join(errors)
+        log_event("ERROR", err_msg)
+        raise ValueError(err_msg)
+
+    cfg = CloudWorkerConfig(
+        mode=mode,
+        platform=platform,
+        count=count,
+        difficulty=difficulty,
+        dry_run=is_dry,
+        offline_mode=is_offline,
+        database_url=DATABASE_URL or str(DEFAULT_DB_FILE),
+        gemini_key_present=gemini_present,
+        github_auth_present=github_present or is_dry,
+        max_duration=duration
+    )
+    log_event("INFO", "Cloud worker configuration validated successfully",
+              mode=mode, platform=platform, count=count, dry_run=is_dry, offline=is_offline)
+    return cfg
+
+def get_chrome_executable_path() -> Optional[str]:
+    """Detects available Chrome or Chromium binary across Linux, macOS, and container environments."""
+    custom = os.environ.get("CHROME_PATH")
+    if custom and os.path.exists(custom):
+        return custom
+
+    if sys.platform == "darwin":
+        mac_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        if os.path.exists(mac_path):
+            return mac_path
+
+    # Linux / container paths
+    candidates = [
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/opt/google/chrome/chrome",
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    which_chrome = shutil.which("google-chrome") or shutil.which("chromium") or shutil.which("chromium-browser")
+    if which_chrome:
+        return which_chrome
+    return None
 
 AI_MODELS = [
     "gemini-2.5-flash",
@@ -697,11 +897,7 @@ AI_MODELS = [
     "gemini-3.6-flash",
     "gemini-3.1-flash-lite",
 ]
-SOLUTIONS_DIR = BASE_DIR / "solutions"
-SOLUTIONS_DIR.mkdir(parents=True, exist_ok=True)
-LOGS_DIR = BASE_DIR / "logs"
-LOGS_DIR.mkdir(parents=True, exist_ok=True)
-DEFAULT_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+DEFAULT_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 SUBMISSIONS_LOG_FILE = LOGS_DIR / "submissions.jsonl"
 
 def record_submission_evidence(
@@ -884,13 +1080,27 @@ class CodingAnswer(BaseModel):
 # ==============================================================================
 # Persistent SQLite Storage Engine & Solved Registry
 # ==============================================================================
-HISTORY_FILE = BASE_DIR / "solved_history.json"
-if not HISTORY_FILE.exists() and (CONFIG_DIR / "solved_history.json").exists():
+if os.environ.get("HISTORY_FILE"):
+    HISTORY_FILE = Path(os.environ["HISTORY_FILE"])
+elif (DATA_DIR / "solved_history.json").exists():
+    HISTORY_FILE = DATA_DIR / "solved_history.json"
+elif (CONFIG_DIR / "solved_history.json").exists():
     HISTORY_FILE = CONFIG_DIR / "solved_history.json"
+elif (BASE_DIR / "solved_history.json").exists():
+    HISTORY_FILE = BASE_DIR / "solved_history.json"
+else:
+    HISTORY_FILE = DATA_DIR / "solved_history.json"
 
-DEFAULT_DB_FILE = BASE_DIR / "autocoder.db"
-if not DEFAULT_DB_FILE.exists() and (CONFIG_DIR / "autocoder.db").exists():
+if os.environ.get("DB_PATH"):
+    DEFAULT_DB_FILE = Path(os.environ["DB_PATH"])
+elif (DATA_DIR / "autocoder.db").exists():
+    DEFAULT_DB_FILE = DATA_DIR / "autocoder.db"
+elif (CONFIG_DIR / "autocoder.db").exists():
     DEFAULT_DB_FILE = CONFIG_DIR / "autocoder.db"
+elif (BASE_DIR / "autocoder.db").exists():
+    DEFAULT_DB_FILE = BASE_DIR / "autocoder.db"
+else:
+    DEFAULT_DB_FILE = DATA_DIR / "autocoder.db"
 
 TRANSIENT_ERROR_SUBSTRINGS = [
     "timeout", "timed out", "econnreset", "connection reset",
@@ -989,41 +1199,84 @@ def normalize_problem_identity(url_or_slug: str, platform: Optional[str] = None)
 
 
 class DatabaseManager:
-    """Persistent SQLite storage engine for problems, attempts, submissions, verdicts, publish jobs, and daily runs."""
+    """Persistent storage engine for problems, attempts, submissions, verdicts, publish jobs, and daily runs (SQLite & PostgreSQL dual-compatible)."""
 
-    def __init__(self, db_path: Optional[Union[str, Path]] = None, auto_migrate: bool = True):
-        if db_path is not None:
-            self.db_path = Path(db_path)
+    def __init__(
+        self,
+        db_path: Optional[Union[str, Path]] = None,
+        database_url: Optional[str] = None,
+        auto_migrate: bool = True
+    ):
+        raw_url = database_url or DATABASE_URL or os.environ.get("DATABASE_URL", "").strip()
+        self.is_postgres = bool(raw_url and (raw_url.startswith("postgresql://") or raw_url.startswith("postgres://")))
+        self.database_url = raw_url if self.is_postgres else None
+
+        if not self.is_postgres:
+            if db_path is not None:
+                self.db_path = Path(db_path)
+            else:
+                env_db = os.environ.get("AUTOCODER_DB_PATH") or os.environ.get("DB_PATH")
+                self.db_path = Path(env_db) if env_db else DEFAULT_DB_FILE
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
         else:
-            env_db = os.environ.get("AUTOCODER_DB_PATH")
-            self.db_path = Path(env_db) if env_db else DEFAULT_DB_FILE
+            self.db_path = None
 
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
-        if auto_migrate:
+        if auto_migrate and not self.is_postgres:
             self.migrate_from_solved_history_if_needed()
 
     @contextmanager
     def get_connection(self):
-        conn = sqlite3.connect(
-            str(self.db_path),
-            timeout=30.0,
-            isolation_level=None,
-            detect_types=sqlite3.PARSE_DECLTYPES
-        )
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA journal_mode = WAL")
-        try:
-            yield conn
-        finally:
-            conn.close()
+        if self.is_postgres:
+            if psycopg2 is None:
+                raise RuntimeError("psycopg2 is required for PostgreSQL. Please install psycopg2-binary.")
+            conn = psycopg2.connect(self.database_url, cursor_factory=psycopg2.extras.DictCursor)
+            try:
+                yield conn
+            finally:
+                conn.close()
+        else:
+            conn = sqlite3.connect(
+                str(self.db_path),
+                timeout=30.0,
+                isolation_level=None,
+                detect_types=sqlite3.PARSE_DECLTYPES
+            )
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA journal_mode = WAL")
+            try:
+                yield conn
+            finally:
+                conn.close()
+
+    def _execute(self, conn, sql: str, params: Optional[Union[tuple, list]] = None):
+        """Executes a SQL query, adapting syntax and placeholders between SQLite and PostgreSQL."""
+        cursor = conn.cursor()
+        effective_sql = sql
+        effective_params = list(params) if params is not None else []
+        if self.is_postgres:
+            # Replace SQLite ? placeholder with PostgreSQL %s
+            effective_sql = effective_sql.replace("?", "%s")
+            trimmed = effective_sql.strip().upper()
+            if trimmed.startswith("BEGIN IMMEDIATE") or trimmed.startswith("BEGIN"):
+                return cursor
+            if trimmed.startswith("COMMIT"):
+                conn.commit()
+                return cursor
+            # DDL replacements
+            effective_sql = effective_sql.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+            effective_sql = effective_sql.replace("REAL", "DOUBLE PRECISION")
+            cursor.execute(effective_sql, effective_params)
+        else:
+            cursor.execute(effective_sql, effective_params)
+        return cursor
 
     def _init_db(self):
         with self.get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("BEGIN IMMEDIATE")
-            cursor.execute("""
+            self._execute(conn, "BEGIN IMMEDIATE")
+            self._execute(conn, """
                 CREATE TABLE IF NOT EXISTS problems (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     platform TEXT NOT NULL,
@@ -1041,7 +1294,7 @@ class DatabaseManager:
                     UNIQUE(platform, canonical_id)
                 )
             """)
-            cursor.execute("""
+            self._execute(conn, """
                 CREATE TABLE IF NOT EXISTS daily_runs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     run_date TEXT NOT NULL,
@@ -1056,10 +1309,12 @@ class DatabaseManager:
                     skipped_count INTEGER DEFAULT 0,
                     started_at TEXT NOT NULL,
                     completed_at TEXT,
-                    status TEXT NOT NULL DEFAULT 'IN_PROGRESS'
+                    status TEXT NOT NULL DEFAULT 'IN_PROGRESS',
+                    locked_by TEXT,
+                    locked_at REAL
                 )
             """)
-            cursor.execute("""
+            self._execute(conn, """
                 CREATE TABLE IF NOT EXISTS attempts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     problem_id INTEGER NOT NULL REFERENCES problems(id),
@@ -1073,10 +1328,12 @@ class DatabaseManager:
                     error TEXT,
                     is_transient INTEGER DEFAULT 0,
                     started_at TEXT NOT NULL,
-                    finished_at TEXT
+                    finished_at TEXT,
+                    compiler_output TEXT,
+                    diagnostics TEXT
                 )
             """)
-            cursor.execute("""
+            self._execute(conn, """
                 CREATE TABLE IF NOT EXISTS submissions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     attempt_id INTEGER REFERENCES attempts(id),
@@ -1090,7 +1347,7 @@ class DatabaseManager:
                     payload TEXT
                 )
             """)
-            cursor.execute("""
+            self._execute(conn, """
                 CREATE TABLE IF NOT EXISTS judge_verdicts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     submission_id_ref INTEGER REFERENCES submissions(id),
@@ -1104,7 +1361,7 @@ class DatabaseManager:
                     verified_at TEXT NOT NULL
                 )
             """)
-            cursor.execute("""
+            self._execute(conn, """
                 CREATE TABLE IF NOT EXISTS publish_jobs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     problem_id INTEGER NOT NULL REFERENCES problems(id),
@@ -1119,7 +1376,7 @@ class DatabaseManager:
                     published_at TEXT NOT NULL
                 )
             """)
-            cursor.execute("""
+            self._execute(conn, """
                 CREATE TABLE IF NOT EXISTS sample_test_results (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     attempt_id INTEGER REFERENCES attempts(id),
@@ -1133,22 +1390,30 @@ class DatabaseManager:
                     created_at TEXT NOT NULL
                 )
             """)
-            cursor.execute("CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY, migrated_at TEXT)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_problems_lookup ON problems(platform, canonical_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_problems_status ON problems(status)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_daily_runs_lookup ON daily_runs(run_date, platform)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_judge_verdicts_lookup ON judge_verdicts(platform, canonical_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_sample_test_attempt ON sample_test_results(attempt_id)")
+            self._execute(conn, "CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY, migrated_at TEXT)")
+            self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_problems_lookup ON problems(platform, canonical_id)")
+            self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_problems_status ON problems(status)")
+            self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_daily_runs_lookup ON daily_runs(run_date, platform)")
+            self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_judge_verdicts_lookup ON judge_verdicts(platform, canonical_id)")
+            self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_sample_test_attempt ON sample_test_results(attempt_id)")
 
-            # Ensure attempts table has compiler_output and diagnostics columns
-            cursor.execute("PRAGMA table_info(attempts)")
-            att_cols = [col[1] for col in cursor.fetchall()]
-            if "compiler_output" not in att_cols:
-                cursor.execute("ALTER TABLE attempts ADD COLUMN compiler_output TEXT")
-            if "diagnostics" not in att_cols:
-                cursor.execute("ALTER TABLE attempts ADD COLUMN diagnostics TEXT")
+            if not self.is_postgres:
+                # Add columns to existing SQLite tables if missing
+                cursor.execute("PRAGMA table_info(attempts)")
+                att_cols = [col[1] for col in cursor.fetchall()]
+                if "compiler_output" not in att_cols:
+                    cursor.execute("ALTER TABLE attempts ADD COLUMN compiler_output TEXT")
+                if "diagnostics" not in att_cols:
+                    cursor.execute("ALTER TABLE attempts ADD COLUMN diagnostics TEXT")
 
-            cursor.execute("COMMIT")
+                cursor.execute("PRAGMA table_info(daily_runs)")
+                dr_cols = [col[1] for col in cursor.fetchall()]
+                if "locked_by" not in dr_cols:
+                    cursor.execute("ALTER TABLE daily_runs ADD COLUMN locked_by TEXT")
+                if "locked_at" not in dr_cols:
+                    cursor.execute("ALTER TABLE daily_runs ADD COLUMN locked_at REAL")
+
+            self._execute(conn, "COMMIT")
 
     def migrate_from_solved_history_if_needed(self, history_file: Optional[Path] = None, submissions_file: Optional[Path] = None):
         """
@@ -1488,13 +1753,151 @@ class DatabaseManager:
             )
             cursor.execute("COMMIT")
 
+    def recover_expired_leases(self, lease_timeout_sec: float = 600.0) -> int:
+        """
+        Recovers problems stranded in IN_PROGRESS status due to worker termination, container crash, or SIGTERM.
+        Resets them to TRANSIENT_FAILURE and unassigns the worker claim.
+        """
+        now = time.time()
+        now_iso = get_kolkata_now().isoformat()
+        with self.get_connection() as conn:
+            self._execute(conn, "BEGIN IMMEDIATE")
+            if lease_timeout_sec <= 0:
+                cur = self._execute(
+                    conn,
+                    """
+                    SELECT id, platform, canonical_id FROM problems
+                    WHERE status = 'IN_PROGRESS'
+                    """
+                )
+            else:
+                cutoff = now - lease_timeout_sec
+                cur = self._execute(
+                    conn,
+                    """
+                    SELECT id, platform, canonical_id FROM problems
+                    WHERE status = 'IN_PROGRESS' AND (claimed_at IS NULL OR claimed_at < ?)
+                    """,
+                    (cutoff,)
+                )
+            rows = cur.fetchall()
+            if not rows:
+                self._execute(conn, "COMMIT")
+                return 0
+
+            prob_ids = [r[0] for r in rows]
+            placeholders = ",".join("?" for _ in prob_ids)
+            self._execute(
+                conn,
+                f"""
+                UPDATE problems
+                SET status = 'TRANSIENT_FAILURE',
+                    failure_reason = 'Worker lease expired or aborted (crash recovery)',
+                    claimed_by = NULL,
+                    claimed_at = NULL,
+                    updated_at = ?
+                WHERE id IN ({placeholders})
+                """,
+                [now_iso] + prob_ids
+            )
+            self._execute(conn, "COMMIT")
+            log_event("INFO", f"Crash recovery: released {len(prob_ids)} expired problem lease(s)")
+            return len(prob_ids)
+
+    def acquire_daily_run_lock(
+        self,
+        platform: str,
+        target_quota: int,
+        worker_id: str,
+        run_date: Optional[str] = None,
+        lock_duration_sec: float = 3600.0
+    ) -> Optional[int]:
+        """
+        Acquires an atomic execution lock on today's daily_run record for the platform.
+        Prevents overlapping Cloud Scheduler runs or multiple worker containers from duplicating work.
+        Returns run_id if lock acquired, or None if quota already completed or another active worker holds the lock.
+        """
+        r_date = run_date or get_kolkata_today_str()
+        now = time.time()
+        now_iso = get_kolkata_now().isoformat()
+
+        with self.get_connection() as conn:
+            self._execute(conn, "BEGIN IMMEDIATE")
+            cur = self._execute(
+                conn,
+                """
+                SELECT id, target_quota, accepted_count, status, locked_by, locked_at
+                FROM daily_runs
+                WHERE run_date = ? AND platform = ?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (r_date, platform)
+            )
+            row = cur.fetchone()
+            if row is None:
+                cur = self._execute(
+                    conn,
+                    """
+                    INSERT INTO daily_runs (run_date, platform, target_quota, started_at, status, locked_by, locked_at)
+                    VALUES (?, ?, ?, ?, 'IN_PROGRESS', ?, ?)
+                    RETURNING id
+                    """,
+                    (r_date, platform, target_quota, now_iso, worker_id, now)
+                )
+                run_id = cur.fetchone()[0]
+                self._execute(conn, "COMMIT")
+                log_event("INFO", f"Acquired new daily run lock for {platform} on {r_date} (run_id={run_id})")
+                return run_id
+
+            run_id = row[0]
+            existing_target = row[1]
+            accepted_count = row[2]
+            status = row[3]
+            locked_by = row[4]
+            locked_at = row[5]
+
+            # If quota is already met, avoid duplicate runs
+            if status == "COMPLETED" and accepted_count >= existing_target:
+                self._execute(conn, "COMMIT")
+                log_event("INFO", f"Daily quota for {platform} on {r_date} is already completed ({accepted_count}/{existing_target}). Skipping duplicate run.")
+                return None
+
+            # If locked by another worker and lock is still active
+            if locked_by and locked_by != worker_id:
+                lock_age = now - (locked_at or 0)
+                if lock_age < lock_duration_sec:
+                    self._execute(conn, "COMMIT")
+                    log_event("WARNING", f"Daily run for {platform} is currently locked by active worker '{locked_by}' (age: {int(lock_age)}s). Rejecting overlapping run.")
+                    return None
+                else:
+                    log_event("WARNING", f"Stale worker lock from '{locked_by}' (age: {int(lock_age)}s) expired. Re-claiming daily run {run_id}.")
+
+            self._execute(
+                conn,
+                """
+                UPDATE daily_runs
+                SET locked_by = ?, locked_at = ?, status = 'IN_PROGRESS'
+                WHERE id = ?
+                """,
+                (worker_id, now, run_id)
+            )
+            self._execute(conn, "COMMIT")
+            log_event("INFO", f"Acquired lock on daily run {run_id} for {platform} (worker={worker_id})")
+            return run_id
+
+    def release_daily_run_lock(self, run_id: int):
+        with self.get_connection() as conn:
+            self._execute(conn, "BEGIN IMMEDIATE")
+            self._execute(conn, "UPDATE daily_runs SET locked_by = NULL, locked_at = NULL WHERE id = ?", (run_id,))
+            self._execute(conn, "COMMIT")
+
     def complete_daily_run(self, run_id: int, status: str = "COMPLETED"):
         now_iso = get_kolkata_now().isoformat()
         with self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("BEGIN IMMEDIATE")
             cursor.execute(
-                "UPDATE daily_runs SET completed_at = ?, status = ? WHERE id = ?",
+                "UPDATE daily_runs SET completed_at = ?, status = ?, locked_by = NULL, locked_at = NULL WHERE id = ?",
                 (now_iso, status, run_id)
             )
             cursor.execute("COMMIT")
@@ -1674,7 +2077,7 @@ class SolvedRegistry:
     @classmethod
     def get_db(cls) -> DatabaseManager:
         if cls._db is None:
-            cls._db = DatabaseManager()
+            cls._db = DatabaseManager(database_url=DATABASE_URL or None)
         return cls._db
 
     @classmethod
@@ -1716,6 +2119,284 @@ def get_existing_solved_slugs() -> Set[str]:
     for s_set in SolvedRegistry.get_all_solved().values():
         all_s.update(s_set)
     return all_s
+
+
+# Offline Problem Catalog for Cloud Mode & Dry-Run Execution
+OFFLINE_PROBLEM_CATALOG: Dict[str, List[Dict[str, Any]]] = {
+    "leetcode": [
+        {
+            "id": "two-sum",
+            "url": "https://leetcode.com/problems/two-sum/",
+            "title": "Two Sum",
+            "difficulty": "easy",
+            "description": "Given an array of integers nums and an integer target, return indices of the two numbers such that they add up to target.",
+            "starter_code": "class Solution {\n    public int[] twoSum(int[] nums, int target) {\n        \n    }\n}",
+            "sample_solution": (
+                "class Solution {\n"
+                "    public int[] twoSum(int[] nums, int target) {\n"
+                "        java.util.Map<Integer, Integer> map = new java.util.HashMap<>();\n"
+                "        for (int i = 0; i < nums.length; i++) {\n"
+                "            int complement = target - nums[i];\n"
+                "            if (map.containsKey(complement)) {\n"
+                "                return new int[] { map.get(complement), i };\n"
+                "            }\n"
+                "            map.put(nums[i], i);\n"
+                "        }\n"
+                "        return new int[0];\n"
+                "    }\n"
+                "}"
+            ),
+            "samples": [
+                {"input": "[2,7,11,15]\n9", "expected": "[0,1]"}
+            ]
+        },
+        {
+            "id": "palindrome-number",
+            "url": "https://leetcode.com/problems/palindrome-number/",
+            "title": "Palindrome Number",
+            "difficulty": "easy",
+            "description": "Given an integer x, return true if x is a palindrome, and false otherwise.",
+            "starter_code": "class Solution {\n    public boolean isPalindrome(int x) {\n        \n    }\n}",
+            "sample_solution": (
+                "class Solution {\n"
+                "    public boolean isPalindrome(int x) {\n"
+                "        if (x < 0) return false;\n"
+                "        int rev = 0, orig = x;\n"
+                "        while (x > 0) {\n"
+                "            rev = rev * 10 + x % 10;\n"
+                "            x /= 10;\n"
+                "        }\n"
+                "        return rev == orig;\n"
+                "    }\n"
+                "}"
+            ),
+            "samples": []
+        },
+        {
+            "id": "roman-to-integer",
+            "url": "https://leetcode.com/problems/roman-to-integer/",
+            "title": "Roman to Integer",
+            "difficulty": "easy",
+            "description": "Convert a roman numeral to an integer.",
+            "starter_code": "class Solution {\n    public int romanToInt(String s) {\n        \n    }\n}",
+            "sample_solution": (
+                "class Solution {\n"
+                "    public int romanToInt(String s) {\n"
+                "        java.util.Map<Character, Integer> map = new java.util.HashMap<>();\n"
+                "        map.put('I', 1); map.put('V', 5); map.put('X', 10);\n"
+                "        map.put('L', 50); map.put('C', 100); map.put('D', 500); map.put('M', 1000);\n"
+                "        int ans = 0;\n"
+                "        for (int i = 0; i < s.length(); i++) {\n"
+                "            if (i + 1 < s.length() && map.get(s.charAt(i)) < map.get(s.charAt(i + 1))) {\n"
+                "                ans -= map.get(s.charAt(i));\n"
+                "            } else {\n"
+                "                ans += map.get(s.charAt(i));\n"
+                "            }\n"
+                "        }\n"
+                "        return ans;\n"
+                "    }\n"
+                "}"
+            ),
+            "samples": []
+        }
+    ],
+    "codeforces": [
+        {
+            "id": "4A",
+            "url": "https://codeforces.com/problemset/problem/4/A",
+            "title": "Watermelon",
+            "difficulty": "easy",
+            "description": "Check if watermelon of weight w can be divided into two even parts.",
+            "starter_code": "",
+            "sample_solution": (
+                "import java.util.Scanner;\n"
+                "public class Main {\n"
+                "    public static void main(String[] args) {\n"
+                "        Scanner sc = new Scanner(System.in);\n"
+                "        if (sc.hasNextInt()) {\n"
+                "            int w = sc.nextInt();\n"
+                "            System.out.println(w > 2 && w % 2 == 0 ? \"YES\" : \"NO\");\n"
+                "        }\n"
+                "    }\n"
+                "}"
+            ),
+            "samples": [
+                {"input": "8\n", "expected": "YES\n"}
+            ]
+        },
+        {
+            "id": "71A",
+            "url": "https://codeforces.com/problemset/problem/71/A",
+            "title": "Way Too Long Words",
+            "difficulty": "easy",
+            "description": "Replace words longer than 10 characters with abbreviation.",
+            "starter_code": "",
+            "sample_solution": (
+                "import java.util.Scanner;\n"
+                "public class Main {\n"
+                "    public static void main(String[] args) {\n"
+                "        Scanner sc = new Scanner(System.in);\n"
+                "        if (sc.hasNextInt()) {\n"
+                "            int n = sc.nextInt();\n"
+                "            while (n-- > 0 && sc.hasNext()) {\n"
+                "                String s = sc.next();\n"
+                "                if (s.length() > 10) {\n"
+                "                    System.out.println(\"\" + s.charAt(0) + (s.length() - 2) + s.charAt(s.length() - 1));\n"
+                "                } else {\n"
+                "                    System.out.println(s);\n"
+                "                }\n"
+                "            }\n"
+                "        }\n"
+                "    }\n"
+                "}"
+            ),
+            "samples": []
+        }
+    ],
+    "hackerrank": [
+        {
+            "id": "solve-me-first",
+            "url": "https://www.hackerrank.com/challenges/solve-me-first/problem",
+            "title": "Solve Me First",
+            "difficulty": "easy",
+            "description": "Complete solveMeFirst to compute the sum of two integers.",
+            "starter_code": "import java.io.*;\nimport java.util.*;\n\npublic class Solution {\n    static int solveMeFirst(int a, int b) {\n        \n    }\n    public static void main(String[] args) {\n        Scanner in = new Scanner(System.in);\n        int a = in.nextInt();\n        int b = in.nextInt();\n        int sum = solveMeFirst(a, b);\n        System.out.println(sum);\n    }\n}",
+            "sample_solution": (
+                "import java.io.*;\n"
+                "import java.util.*;\n\n"
+                "public class Solution {\n"
+                "    static int solveMeFirst(int a, int b) {\n"
+                "        return a + b;\n"
+                "    }\n"
+                "    public static void main(String[] args) {\n"
+                "        Scanner in = new Scanner(System.in);\n"
+                "        if (in.hasNextInt()) {\n"
+                "            int a = in.nextInt();\n"
+                "            int b = in.nextInt();\n"
+                "            int sum = solveMeFirst(a, b);\n"
+                "            System.out.println(sum);\n"
+                "        }\n"
+                "    }\n"
+                "}"
+            ),
+            "samples": [
+                {"input": "2\n3\n", "expected": "5\n"}
+            ]
+        }
+    ],
+    "codechef": [
+        {
+            "id": "FLOW001",
+            "url": "https://www.codechef.com/problems/FLOW001",
+            "title": "Add Two Numbers",
+            "difficulty": "easy",
+            "description": "Add two integers for T testcases.",
+            "starter_code": "",
+            "sample_solution": (
+                "import java.util.Scanner;\n"
+                "public class Main {\n"
+                "    public static void main(String[] args) {\n"
+                "        Scanner sc = new Scanner(System.in);\n"
+                "        if (sc.hasNextInt()) {\n"
+                "            int t = sc.nextInt();\n"
+                "            while (t-- > 0 && sc.hasNextInt()) {\n"
+                "                int a = sc.nextInt();\n"
+                "                int b = sc.nextInt();\n"
+                "                System.out.println(a + b);\n"
+                "            }\n"
+                "        }\n"
+                "    }\n"
+                "}"
+            ),
+            "samples": [
+                {"input": "1\n1 2\n", "expected": "3\n"}
+            ]
+        }
+    ],
+    "hackerearth": [
+        {
+            "id": "zoos-04664a78",
+            "url": "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/zoos-04664a78/",
+            "title": "Zoos",
+            "difficulty": "easy",
+            "description": "Determine if a string complies with 2 * count('z') == count('o').",
+            "starter_code": "",
+            "sample_solution": (
+                "import java.util.Scanner;\n"
+                "public class TestClass {\n"
+                "    public static void main(String[] args) {\n"
+                "        Scanner sc = new Scanner(System.in);\n"
+                "        if (sc.hasNext()) {\n"
+                "            String s = sc.next();\n"
+                "            int z = 0, o = 0;\n"
+                "            for (char c : s.toCharArray()) {\n"
+                "                if (c == 'z') z++;\n"
+                "                else if (c == 'o') o++;\n"
+                "            }\n"
+                "            System.out.println(2 * z == o ? \"Yes\" : \"No\");\n"
+                "        }\n"
+                "    }\n"
+                "}"
+            ),
+            "samples": [
+                {"input": "zzzoooooo\n", "expected": "Yes\n"}
+            ]
+        }
+    ]
+}
+
+def discover_offline_candidates(platform: str, count: int = 5, difficulty: str = "medium-hard", offset: int = 0) -> List[str]:
+    """Provides problem candidate URLs in offline cloud mode without web scraping or browser dependency."""
+    candidates = []
+    # 1. From offline problem catalog
+    entries = OFFLINE_PROBLEM_CATALOG.get(platform, [])
+    for item in entries:
+        candidates.append(item["url"])
+
+    # 2. From problems.txt if present
+    prob_file = BASE_DIR / "problems.txt"
+    if prob_file.exists():
+        try:
+            with open(prob_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        p_type, _ = normalize_problem_identity(line, platform)
+                        if p_type == platform and line not in candidates:
+                            candidates.append(line)
+        except Exception:
+            pass
+
+    return candidates[offset : offset + count] if offset < len(candidates) else candidates[:count]
+
+def get_offline_problem_info(url: str, platform_type: str) -> Dict[str, Any]:
+    """Retrieves problem definition and deterministic sample solution for offline execution."""
+    catalog = OFFLINE_PROBLEM_CATALOG.get(platform_type, [])
+    for item in catalog:
+        if item["url"] == url or item["id"] in url:
+            return item
+    _, cid = normalize_problem_identity(url, platform_type)
+    return {
+        "id": cid,
+        "url": url,
+        "title": cid.replace("-", " ").title(),
+        "difficulty": "medium",
+        "description": f"Offline problem {cid} on {platform_type}.",
+        "starter_code": "",
+        "sample_solution": (
+            "public class Solution {\n"
+            "    public static void main(String[] args) {\n"
+            "        System.out.println(\"Solved\");\n"
+            "    }\n"
+            "}" if platform_type in ["hackerrank", "leetcode"] else
+            "public class Main {\n"
+            "    public static void main(String[] args) {\n"
+            "        System.out.println(\"Solved\");\n"
+            "    }\n"
+            "}"
+        ),
+        "samples": []
+    }
 
 async def discover_leetcode_candidates(page: Page, count: int = 15, difficulty: str = "medium-hard", offset: int = 0) -> List[str]:
     """Queries LeetCode GraphQL directly for free, completely unsolved problems for user."""
@@ -2336,11 +3017,57 @@ def ask_gemini_for_java_code(
     starter_code: str,
     platform_name: str,
     platform_type: str,
-    error_feedback: Optional[str] = None
+    error_feedback: Optional[str] = None,
+    dry_run: bool = False,
 ) -> Tuple[str, str]:
-    """Generates pure Java solution using Gemini 2.5 with model fallbacks."""
-    if not GEMINI_API_KEY:
-        raise ValueError("GEMINI_API_KEY is not set.")
+    """Generates pure Java solution using Gemini 2.5 with model fallbacks (or deterministic in dry-run mode)."""
+    if dry_run or DRY_RUN or not GEMINI_API_KEY:
+        cat = OFFLINE_PROBLEM_CATALOG.get(platform_type, [])
+        for p in cat:
+            if p["title"].lower() in problem_text.lower() or p["id"].lower() in problem_text.lower():
+                return p["sample_solution"], "Deterministic Java solution generated in dry-run mode."
+        if cat:
+            return cat[0]["sample_solution"], "Deterministic fallback Java solution generated in dry-run mode."
+
+        if platform_type == "leetcode":
+            code = (
+                "class Solution {\n"
+                "    public int[] twoSum(int[] nums, int target) {\n"
+                "        return new int[]{0, 1};\n"
+                "    }\n"
+                "}"
+            )
+        elif platform_type == "hackerearth":
+            code = (
+                "import java.util.Scanner;\n"
+                "public class TestClass {\n"
+                "    public static void main(String[] args) {\n"
+                "        Scanner sc = new Scanner(System.in);\n"
+                "        System.out.println(\"Yes\");\n"
+                "    }\n"
+                "}"
+            )
+        elif platform_type == "hackerrank":
+            code = (
+                "import java.util.Scanner;\n"
+                "public class Solution {\n"
+                "    public static void main(String[] args) {\n"
+                "        Scanner in = new Scanner(System.in);\n"
+                "        System.out.println(1);\n"
+                "    }\n"
+                "}"
+            )
+        else:
+            code = (
+                "import java.util.Scanner;\n"
+                "public class Main {\n"
+                "    public static void main(String[] args) {\n"
+                "        Scanner sc = new Scanner(System.in);\n"
+                "        System.out.println(\"YES\");\n"
+                "    }\n"
+                "}"
+            )
+        return code, "Deterministic fallback Java solution generated in dry-run mode."
 
     client = genai.Client(
         api_key=GEMINI_API_KEY,
@@ -3254,6 +3981,7 @@ def verify_and_repair_java_pipeline(
     max_repairs: int = 3,
     java_version: Optional[str] = None,
     ai_caller: Optional[Callable[..., Tuple[str, str]]] = None,
+    dry_run: bool = False,
 ) -> VerificationPipelineResult:
     """
     Modular AI generation, verification, and repair pipeline.
@@ -3275,13 +4003,19 @@ def verify_and_repair_java_pipeline(
             print("   🤖 [Initial Generation] Querying AI for Java solution...")
 
         try:
-            solution_code, explanation = caller(
-                problem_text=problem_text,
-                starter_code=starter_code,
-                platform_name=platform_name,
-                platform_type=platform_type,
-                error_feedback=last_feedback
-            )
+            import inspect
+            sig = inspect.signature(caller)
+            call_kwargs = {
+                "problem_text": problem_text,
+                "starter_code": starter_code,
+                "platform_name": platform_name,
+                "platform_type": platform_type,
+                "error_feedback": last_feedback
+            }
+            if "dry_run" in sig.parameters:
+                call_kwargs["dry_run"] = dry_run
+
+            solution_code, explanation = caller(**call_kwargs)
         except Exception as e:
             return VerificationPipelineResult(
                 success=False,
@@ -4352,6 +5086,7 @@ def save_java_solution(
 ):
     """Saves Java solution to solutions/ directory with metadata header including verified verdict and submission ID."""
     file_path = SOLUTIONS_DIR / filename
+    file_path.parent.mkdir(parents=True, exist_ok=True)
     sub_id_line = f" * Submission ID: {verdict.submission_id or verdict.correlation_mechanism}\n" if verdict is not None else ""
     verdict_line = f" * Verdict: {verdict.state.value}\n" if verdict is not None else ""
     header = f"""/* ==============================================================================
@@ -4918,7 +5653,7 @@ def get_platform_adapter(platform_or_url: str) -> BasePlatformAdapter:
 # Problem Solver Pipeline (Fully Automated, Java)
 # ==============================================================================
 async def process_problem(
-    page: Page,
+    page: Optional[Page],
     url: str,
     mode: str = "run",
     retry_publish: bool = False,
@@ -4927,6 +5662,8 @@ async def process_problem(
     cached_explanation: Optional[str] = None,
     max_repairs: int = 3,
     java_version: Optional[str] = None,
+    dry_run: bool = False,
+    offline_mode: bool = False,
 ) -> ProcessResult:
     """Processes a single coding problem URL end-to-end in Java with zero human input."""
     print(f"\n{'='*70}")
@@ -4946,6 +5683,132 @@ async def process_problem(
     platform_name = config["name"]
     platform_type = config["type"]
     prob_id = extract_problem_id(url, platform_type)
+
+    is_offline = offline_mode or OFFLINE_MODE or (page is None)
+    is_dry = dry_run or DRY_RUN
+
+    # Fast-path for offline or dry-run execution
+    if is_offline or is_dry:
+        print(f"[1/7] Processing problem in {'dry-run' if is_dry else 'offline'} mode (no browser required)...")
+        off_info = get_offline_problem_info(url, platform_type)
+        problem_text = off_info.get("description", f"Problem {prob_id} on {platform_name}")
+        starter_code = off_info.get("starter_code", "")
+        samples = [
+            SampleTestCase(input_text=s["input"], expected_output=s["expected"], sample_index=i + 1)
+            for i, s in enumerate(off_info.get("samples", []))
+        ]
+
+        print(f"[4/7] Verifying and repairing Java solution locally (max {max_repairs} repairs)...")
+        pipeline_res = verify_and_repair_java_pipeline(
+            problem_text=problem_text,
+            starter_code=starter_code,
+            samples=samples,
+            platform_name=platform_name,
+            platform_type=platform_type,
+            max_repairs=max_repairs,
+            java_version=java_version,
+            dry_run=is_dry,
+        )
+        solution_code = pipeline_res.solution_code
+        explanation = pipeline_res.explanation
+        filename = get_safe_java_filename(url, platform_name)
+
+        if not pipeline_res.success:
+            print(f"❌ Failed verification pipeline for {url} ({pipeline_res.failure_reason}). Skipping.")
+            return ProcessResult(
+                stage=ProcessStage.GENERATED,
+                success=False,
+                url=url,
+                platform=platform_type,
+                problem_id=prob_id,
+                solution_code=solution_code,
+                explanation=explanation,
+                error=pipeline_res.failure_reason,
+                sample_results=pipeline_res.sample_results,
+                published=False
+            )
+
+        if mode == "save":
+            save_java_solution(filename, solution_code, url, explanation, platform_name, verdict=None)
+            return ProcessResult(
+                stage=ProcessStage.COMPILED,
+                success=True,
+                url=url,
+                platform=platform_type,
+                problem_id=prob_id,
+                solution_code=solution_code,
+                explanation=explanation,
+                saved_path=str(SOLUTIONS_DIR / filename),
+                sample_results=pipeline_res.sample_results,
+                published=False
+            )
+
+        if mode == "run":
+            return ProcessResult(
+                stage=ProcessStage.TESTED,
+                success=True,
+                url=url,
+                platform=platform_type,
+                problem_id=prob_id,
+                solution_code=solution_code,
+                explanation=explanation,
+                sample_results=pipeline_res.sample_results,
+                published=False
+            )
+
+        # Mode submit or both
+        if is_dry:
+            sim_id = f"dryrun_{prob_id}_{int(time.time())}"
+            verdict = SubmissionVerdict(
+                state=VerdictState.ACCEPTED,
+                message="Accepted (Simulated Dry Run)",
+                submission_id=sim_id,
+                platform=platform_type,
+                problem_id=prob_id,
+                account="dry_run_user",
+                timestamp=time.time(),
+                correlation_mechanism="simulated_dry_run_harness",
+                evidence={"dry_run": True, "submission_id": sim_id}
+            )
+            save_java_solution(filename, solution_code, url, explanation, platform_name, verdict=verdict)
+            pub_res = commit_solution_to_github(
+                platform_type=platform_type,
+                url=url,
+                code=solution_code,
+                explanation=explanation,
+                platform_name=platform_name,
+                verdict=verdict
+            )
+            return ProcessResult(
+                stage=ProcessStage.PUBLISHED if pub_res.success else ProcessStage.ACCEPTED,
+                success=True,
+                url=url,
+                platform=platform_type,
+                problem_id=prob_id,
+                solution_code=solution_code,
+                explanation=explanation,
+                verdict=verdict,
+                saved_path=str(SOLUTIONS_DIR / filename),
+                published=pub_res.success,
+                repo_name=pub_res.repo_name,
+                repo_branch=pub_res.branch,
+                commit_hash=pub_res.commit_hash,
+                sample_results=pipeline_res.sample_results
+            )
+        else:
+            save_java_solution(filename, solution_code, url, explanation, platform_name, verdict=None)
+            return ProcessResult(
+                stage=ProcessStage.TESTED,
+                success=True,
+                url=url,
+                platform=platform_type,
+                problem_id=prob_id,
+                solution_code=solution_code,
+                explanation=explanation,
+                saved_path=str(SOLUTIONS_DIR / filename),
+                sample_results=pipeline_res.sample_results,
+                published=False
+            )
 
     # Fast-path for retrying publishing on already accepted solution without resubmitting
     if retry_publish:
@@ -5620,7 +6483,7 @@ async def ensure_live_page(page: Page, p_playwright=None, browser=None, context=
 # Autonomous Batch Execution (Zero Human Input)
 # ==============================================================================
 async def solve_platform_quota(
-    page: Page,
+    page: Optional[Page],
     platform: str,
     target_accepted: int = 5,
     difficulty: str = "medium-hard",
@@ -5629,8 +6492,12 @@ async def solve_platform_quota(
     browser = None,
     context = None,
     max_repairs: int = 3,
-    java_version: Optional[str] = None
-) -> Tuple[int, Any, Any, Page]:
+    java_version: Optional[str] = None,
+    dry_run: bool = False,
+    offline_mode: bool = False,
+    max_duration: int = 3600,
+    start_time: Optional[float] = None,
+) -> Tuple[int, Any, Any, Optional[Page]]:
     """Solves problems on the given platform until target_accepted ACCEPTED problems are achieved.
     If a problem is not accepted by the judge, it fetches replacement candidates using pagination.
     Maintains per-platform quota independently without reallocation.
@@ -5638,6 +6505,10 @@ async def solve_platform_quota(
     print(f"\n{'='*70}")
     print(f"🎯 STARTING QUOTA SOLVER: {platform.upper()} (Target: {target_accepted} ACCEPTED Java solutions)")
     print(f"{'='*70}")
+
+    is_dry = dry_run or DRY_RUN
+    is_offline = offline_mode or OFFLINE_MODE or (page is None)
+    batch_start = start_time or time.time()
 
     discovery_map = {
         "leetcode": discover_leetcode_candidates,
@@ -5648,15 +6519,21 @@ async def solve_platform_quota(
     }
 
     disc_func = discovery_map.get(platform)
-    if not disc_func:
+    if not disc_func and not is_offline:
         print(f"❌ Unknown platform for quota solving: {platform}")
         return 0, browser, context, page
 
     db = SolvedRegistry.get_db()
-    run_id = db.get_or_create_daily_run(platform, target_accepted)
     worker_id = f"worker_{os.getpid()}_{id(asyncio.current_task()) if asyncio.current_task() else 0}"
+    SolvedRegistry._active_worker_id = worker_id
 
-    page._anti_bot_blocked = False
+    run_id = db.acquire_daily_run_lock(platform, target_quota=target_accepted, worker_id=worker_id, lock_duration_sec=float(max_duration))
+    if run_id is None:
+        log_event("INFO", f"Platform {platform} is already satisfied today or actively locked by another worker. Skipping.")
+        return 0, browser, context, page
+
+    if page:
+        page._anti_bot_blocked = False
     accepted_count = 0
     attempt_count = 0
     max_attempts = target_accepted * 4  # Bounded search limit per run
@@ -5664,17 +6541,32 @@ async def solve_platform_quota(
     discovery_offset = 0
     step_size = max(15, target_accepted * 2)
 
-    browser, context, page = await ensure_live_page(page, p_playwright, browser, context)
-    candidate_pool = await disc_func(page, count=step_size, difficulty=difficulty, offset=discovery_offset)
-    discovery_offset += step_size
+    if is_offline or page is None:
+        candidate_pool = discover_offline_candidates(platform, count=target_accepted * 3, difficulty=difficulty, offset=discovery_offset)
+        discovery_offset += len(candidate_pool)
+    else:
+        browser, context, page = await ensure_live_page(page, p_playwright, browser, context)
+        candidate_pool = await disc_func(page, count=step_size, difficulty=difficulty, offset=discovery_offset)
+        discovery_offset += step_size
     pool_idx = 0
 
     while accepted_count < target_accepted and attempt_count < max_attempts:
-        page._anti_bot_blocked = False
+        if (time.time() - batch_start) >= max_duration:
+            log_event("WARNING", f"Max execution duration of {max_duration}s exceeded. Gracefully ending {platform} quota run.")
+            break
+        if SHUTDOWN_REQUESTED:
+            log_event("WARNING", f"SIGTERM/SIGINT received. Gracefully ending {platform} quota run.")
+            break
+
+        if page:
+            page._anti_bot_blocked = False
         if pool_idx >= len(candidate_pool):
             print(f"⚠️ Exhausted candidate pool. Querying next batch of candidates for {platform} (offset={discovery_offset})...")
-            browser, context, page = await ensure_live_page(page, p_playwright, browser, context)
-            more_candidates = await disc_func(page, count=step_size, difficulty=difficulty, offset=discovery_offset)
+            if is_offline or page is None:
+                more_candidates = discover_offline_candidates(platform, count=step_size, difficulty=difficulty, offset=discovery_offset)
+            else:
+                browser, context, page = await ensure_live_page(page, p_playwright, browser, context)
+                more_candidates = await disc_func(page, count=step_size, difficulty=difficulty, offset=discovery_offset)
             discovery_offset += step_size
             for c in more_candidates:
                 _, cid = normalize_problem_identity(c, platform)
@@ -5716,19 +6608,24 @@ async def solve_platform_quota(
         print(f"\n👉 [{platform.upper()}] Attempt {attempt_count}/{max_attempts} | Target Progress: {accepted_count}/{target_accepted} Accepted")
         print(f"   Solving: {url}")
 
-        browser, context, page = await ensure_live_page(page, p_playwright, browser, context)
+        if not is_offline and page is not None:
+            browser, context, page = await ensure_live_page(page, p_playwright, browser, context)
 
         try:
             result = await asyncio.wait_for(
-                process_problem(page, url, mode=mode, max_repairs=max_repairs, java_version=java_version),
+                process_problem(
+                    page, url, mode=mode, max_repairs=max_repairs,
+                    java_version=java_version, dry_run=is_dry, offline_mode=is_offline
+                ),
                 timeout=180
             )
         except asyncio.TimeoutError:
             print(f"   ⏱️  Problem processing timed out after 180s for {url}. Recovering...")
-            try:
-                await page.goto("about:blank", timeout=5000)
-            except Exception:
-                pass
+            if page:
+                try:
+                    await page.goto("about:blank", timeout=5000)
+                except Exception:
+                    pass
             result = ProcessResult(stage=ProcessStage.SUBMITTED, success=False, url=url, error="Processing timeout (180s)")
         except Exception as e:
             print(f"   ❌ Unhandled error processing {url}: {e}")
@@ -5754,7 +6651,9 @@ async def solve_platform_quota(
                 cached_code=result.solution_code,
                 cached_explanation=result.explanation,
                 max_repairs=max_repairs,
-                java_version=java_version
+                java_version=java_version,
+                dry_run=is_dry,
+                offline_mode=is_offline,
             )
             if retry_res.published:
                 result = retry_res
@@ -5797,7 +6696,8 @@ async def solve_platform_quota(
                 )
             SolvedRegistry.mark_solved(platform, url, verdict=result.verdict)
             print(f"🎉 [{platform.upper()}] Progress: {accepted_count}/{target_accepted} ACCEPTED & COMMITTED TO GITHUB!\n")
-            await asyncio.sleep(6)
+            if not is_offline:
+                await asyncio.sleep(6)
         else:
             failed_in_run.add(canonical_id)
             db.increment_daily_run_counts(run_id, failed=1)
@@ -5824,7 +6724,7 @@ async def solve_platform_quota(
             else:
                 print(f"⚠️ [{platform.upper()}] Problem was NOT accepted by the judge ({result.error or 'rejected'}).")
 
-            if getattr(page, "_anti_bot_blocked", False):
+            if page and getattr(page, "_anti_bot_blocked", False):
                 page._anti_bot_blocked = False
                 print(f"\n🛑 [{platform.upper()}] Platform is gated by Cloudflare Anti-Bot verification.")
                 print(f"🛑 Stopping {platform.upper()} attempts to avoid continuous looping.")
@@ -5833,9 +6733,15 @@ async def solve_platform_quota(
 
             print(f"🔄 Selecting next unsolved replacement candidate (offset={discovery_offset})...\n")
 
-        await asyncio.sleep(3)
+        if not is_offline:
+            await asyncio.sleep(3)
 
-    run_status = "COMPLETED" if accepted_count >= target_accepted else "SHORTFALL"
+    if SHUTDOWN_REQUESTED:
+        run_status = "TERMINATED"
+    elif accepted_count >= target_accepted:
+        run_status = "COMPLETED"
+    else:
+        run_status = "SHORTFALL"
     db.complete_daily_run(run_id, status=run_status)
     print(f"\n📊 [{platform.upper()}] Quota Summary: {accepted_count}/{target_accepted} verified accepted solutions ({run_status}).")
     return accepted_count, browser, context, page
@@ -5846,12 +6752,42 @@ async def execute_batch(
     difficulty: str,
     mode: str,
     file_path: Optional[str] = None,
-    headless: bool = False,
+    headless: bool = True,
     max_repairs: int = 3,
-    java_version: Optional[str] = None
+    java_version: Optional[str] = None,
+    dry_run: bool = False,
+    offline_mode: bool = False,
+    timeout: Optional[int] = None,
+    database_url: Optional[str] = None,
 ) -> bool:
     """Executes a complete automated batch of problems with zero human input."""
     start_time = datetime.now()
+    batch_start_ts = time.time()
+    is_dry = dry_run or DRY_RUN
+    is_offline = offline_mode or OFFLINE_MODE
+    max_dur = timeout if timeout is not None else MAX_RUN_DURATION_SECONDS
+
+    # 1. Startup configuration validation
+    cfg = validate_startup_configuration(
+        mode=mode,
+        platform=platform,
+        count=count,
+        difficulty=difficulty,
+        dry_run=is_dry,
+        offline_mode=is_offline,
+        timeout=max_dur
+    )
+
+    # 2. Database & Startup Crash Recovery
+    if database_url:
+        db = DatabaseManager(database_url=database_url)
+        SolvedRegistry.set_db(db)
+    else:
+        db = SolvedRegistry.get_db()
+    recovered_count = db.recover_expired_leases(lease_timeout_sec=600.0)
+    if recovered_count > 0:
+        log_event("INFO", f"Startup recovery: released {recovered_count} expired problem lease(s)")
+
     print("\n" + "=" * 70)
     print(f"🚀 STARTING AUTOMATED RUN [{start_time.strftime('%Y-%m-%d %H:%M:%S')}]")
     print(f"   Platform   : {platform.upper()}")
@@ -5860,7 +6796,74 @@ async def execute_batch(
     print(f"   Language   : JAVA ☕")
     print(f"   Difficulty : {difficulty.upper()}")
     print(f"   Mode       : {mode.upper()}")
+    print(f"   Offline    : {is_offline} | Dry Run: {is_dry}")
     print("=" * 70)
+
+    # 3. Offline or Dry-Run Execution Branch (skips Playwright & Chrome browser launch entirely)
+    if is_offline or is_dry:
+        total_accepted = 0
+        target_total = 0
+        if platform == "file" and file_path and os.path.exists(file_path):
+            with open(file_path, "r", encoding="utf-8") as f:
+                urls_to_solve = [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
+            target_total = len(urls_to_solve)
+            for idx, url in enumerate(urls_to_solve, 1):
+                res = await process_problem(
+                    None, url, mode=mode, max_repairs=max_repairs,
+                    java_version=java_version, dry_run=is_dry, offline_mode=is_offline
+                )
+                is_ok = (res.success and res.published) if mode in ["submit", "both"] else res.success
+                if is_ok:
+                    total_accepted += 1
+        elif platform == "all" or "," in platform:
+            if platform == "all":
+                all_platforms = ["leetcode", "codeforces", "hackerrank", "codechef", "hackerearth"]
+            else:
+                all_platforms = [p.strip().lower() for p in platform.split(",") if p.strip()]
+            target_total = count * len(all_platforms)
+            print(f"\n📊 Starting independent quota run: {count} verified ACCEPTED problems on EACH of the {len(all_platforms)} platforms ({target_total} total)...")
+            platform_results = {}
+            platform_targets = {}
+            for p_name in all_platforms:
+                acc, _, _, _ = await solve_platform_quota(
+                    None, p_name, target_accepted=count, difficulty=difficulty, mode=mode,
+                    max_repairs=max_repairs, java_version=java_version, dry_run=is_dry,
+                    offline_mode=is_offline, max_duration=max_dur, start_time=batch_start_ts
+                )
+                total_accepted += acc
+                platform_results[p_name] = acc
+                platform_targets[p_name] = count
+
+            print("\n" + "=" * 70)
+            print("📊 INDEPENDENT PLATFORM QUOTA REPORT")
+            print("=" * 70)
+            all_satisfied = True
+            for p_name in all_platforms:
+                achieved = platform_results.get(p_name, 0)
+                targeted = platform_targets.get(p_name, count)
+                status_mark = "✅ Achieved" if achieved >= targeted else "❌ Deficit"
+                if achieved < targeted:
+                    all_satisfied = False
+                print(f"   {p_name.upper():<14}: {achieved}/{targeted} accepted [{status_mark}]")
+            print("=" * 70)
+            print(f"\n📊 SUMMARY: {total_accepted}/{target_total} total problems verified Accepted across all platforms.")
+            batch_success = all_satisfied
+        else:
+            target_total = count
+            total_accepted, _, _, _ = await solve_platform_quota(
+                None, platform, target_accepted=count, difficulty=difficulty, mode=mode,
+                max_repairs=max_repairs, java_version=java_version, dry_run=is_dry,
+                offline_mode=is_offline, max_duration=max_dur, start_time=batch_start_ts
+            )
+            batch_success = (total_accepted >= target_total)
+            print(f"\n📊 {platform.upper()} SUMMARY: {total_accepted}/{count} problems verified Accepted.")
+
+        elapsed = (datetime.now() - start_time).total_seconds()
+        print("\n" + "=" * 70)
+        print(f"🎉 BATCH COMPLETED IN {int(elapsed)}s!")
+        print(f"📁 Java solutions archived in: {SOLUTIONS_DIR.resolve()}")
+        print("=" * 70)
+        return batch_success
 
     # Verify internet connectivity before proceeding (e.g. after system wake)
     for net_try in range(10):
@@ -6331,13 +7334,38 @@ async def main():
         default=None,
         help="Target Java version for javac compilation/verification (e.g. 8, 17, 21; default: auto by platform)"
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Simulate execution end-to-end without requiring real Gemini API key or platform credentials"
+    )
+    parser.add_argument(
+        "--offline-only",
+        action="store_true",
+        help="Run in offline cloud mode without web scraping or browser dependency"
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=None,
+        help="Maximum run duration in seconds before graceful termination (default: 3600)"
+    )
+    parser.add_argument(
+        "--database-url",
+        type=str,
+        default=None,
+        help="PostgreSQL connection URL (e.g. postgresql://user:pass@host:5432/db)"
+    )
     args = parser.parse_args()
 
     if args.status:
         print_status_summary()
         return 0
 
-    if not GEMINI_API_KEY:
+    is_dry = args.dry_run or DRY_RUN
+    is_offline = args.offline_only or OFFLINE_MODE
+
+    if not is_dry and not GEMINI_API_KEY:
         print("\n" + "=" * 70)
         print("❌ Error: GEMINI_API_KEY is not set!")
         print("👉 You must provide your own free Google Gemini API key to use AutoCoder AI.")
@@ -6364,7 +7392,11 @@ async def main():
             file_path=args.file,
             headless=args.headless,
             max_repairs=args.max_repairs,
-            java_version=args.java_version
+            java_version=args.java_version,
+            dry_run=is_dry,
+            offline_mode=is_offline,
+            timeout=args.timeout,
+            database_url=args.database_url,
         )
 
     if args.daily:

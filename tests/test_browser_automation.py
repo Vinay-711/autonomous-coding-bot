@@ -241,6 +241,7 @@ async def test_failed_code_injection():
     with patch("bot.switch_editor_to_java"), \
          patch("bot.extract_problem_text", return_value="Given nums and target... Constraints: 2 <= nums.length <= 104"), \
          patch("bot.extract_editor_code", return_value="class Solution {}"), \
+         patch("bot.ask_gemini_for_java_code", return_value=("class Solution { public int[] twoSum(int[] nums, int target) { return new int[0]; } }", "test approach")), \
          patch("bot.inject_code_into_editor", return_value=InjectionResult(success=True, verified=False, error="Readback mismatch")), \
          patch("bot.verify_live_submission_verdict") as mock_judge:
         res = await process_problem(page, "https://leetcode.com/problems/two-sum", mode="submit")

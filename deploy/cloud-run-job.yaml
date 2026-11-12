@@ -1,0 +1,72 @@
+apiVersion: run.googleapis.com/v1
+kind: Job
+metadata:
+  name: autocoder-daily-worker
+  labels:
+    app: autocoder
+    component: batch-worker
+spec:
+  template:
+    spec:
+      taskCount: 1
+      parallelism: 1
+      template:
+        spec:
+          maxRetries: 1
+          timeoutSeconds: 3600
+          serviceAccountName: autocoder-runner-sa@${PROJECT_ID}.iam.gserviceaccount.com
+          containers:
+          - image: gcr.io/${PROJECT_ID}/autocoder-cloud-worker:latest
+            args:
+            - "--platform"
+            - "all"
+            - "--count"
+            - "5"
+            - "--difficulty"
+            - "medium-hard"
+            - "--mode"
+            - "both"
+            - "--headless"
+            resources:
+              limits:
+                cpu: "2000m"
+                memory: "2Gi"
+            env:
+            - name: PROJECT_ID
+              value: "${PROJECT_ID}"
+            - name: GCP_PROJECT_ID
+              value: "${PROJECT_ID}"
+            - name: DATA_DIR
+              value: "/app/data"
+            - name: SOLUTIONS_DIR
+              value: "/app/data/solutions"
+            - name: LOGS_DIR
+              value: "/app/data/logs"
+            - name: REPOS_DIR
+              value: "/app/data/repos"
+            - name: CHROME_USER_DATA_DIR
+              value: "/app/data/chrome_user_data"
+            - name: STRUCTURED_LOGGING
+              value: "true"
+            - name: MAX_RUN_DURATION_SECONDS
+              value: "3300"
+            - name: GITHUB_USERNAME
+              value: "${GITHUB_USERNAME}"
+            - name: CODEFORCES_HANDLE
+              value: "${CODEFORCES_HANDLE}"
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: GEMINI_API_KEY
+                  key: latest
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: GITHUB_TOKEN
+                  key: latest
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: DATABASE_URL
+                  key: latest
+
