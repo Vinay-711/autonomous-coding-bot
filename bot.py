@@ -4256,12 +4256,20 @@ def validate_code_security_and_dependencies(code: str) -> Tuple[bool, Optional[s
         (r"\bjava\.lang\.reflect\b|\bMethod\.invoke\b|\bField\.get\b", "Reflection operations are prohibited"),
         (r"\bjava\.io\.File\b|\bnew\s+File\s*\(", "Host file manipulation is prohibited"),
         (r"\bjava\.nio\.file\b", "Host filesystem manipulation is prohibited"),
-        (r"^\s*import\s+(?!java\.(?:util|io|math|text|lang)\b)[a-zA-Z0-9_\.]+", "Unsupported external package import"),
     ]
 
     for pattern, desc in prohibited:
         if re.search(pattern, cleaned, re.MULTILINE):
             return False, f"Security violation: {desc}"
+
+    # Verify imports: only java.util, java.io, java.math, java.text, java.lang are allowed
+    for line in cleaned.splitlines():
+        m_imp = re.match(r"^\s*import\s+(?:static\s+)?([a-zA-Z0-9_\.]+)", line)
+        if m_imp:
+            pkg = m_imp.group(1)
+            allowed = ("java.util", "java.io", "java.math", "java.text", "java.lang")
+            if not any(pkg.startswith(a) for a in allowed):
+                return False, f"Security violation: Unsupported external package import ({pkg})"
 
     return True, None
 
@@ -4559,6 +4567,20 @@ def execute_java_sandboxed(
             error_message=f"Execution failed: {e}"
         )
 
+def clean_hackerrank_stdin_format(raw: str) -> str:
+    """Strips HackerRank STDIN / Function tabular formatting to keep only standard input tokens."""
+    lines = raw.strip().splitlines()
+    if not lines:
+        return ""
+    if "STDIN" in lines[0] and "Function" in lines[0]:
+        clean_lines = []
+        for line in lines[2:]:
+            parts = re.split(r"\s{2,}|\t+", line.strip())
+            if parts:
+                clean_lines.append(parts[0].strip())
+        return "\n".join(clean_lines).strip()
+    return raw.strip()
+
 def extract_sample_test_cases_from_text(problem_text: str) -> List[SampleTestCase]:
     """
     Extracts sample inputs and outputs from problem descriptions.
@@ -4665,6 +4687,10 @@ def extract_sample_test_cases_from_text(problem_text: str) -> List[SampleTestCas
         if clean_inp or clean_out:
             samples.append(SampleTestCase(input_text=clean_inp, expected_output=clean_out, sample_index=sample_counter))
 
+    for s in samples:
+        if "STDIN" in s.input_text and "Function" in s.input_text:
+            s.input_text = clean_hackerrank_stdin_format(s.input_text)
+
     if samples:
         return samples
 
@@ -4677,6 +4703,8 @@ def extract_sample_test_cases_from_text(problem_text: str) -> List[SampleTestCas
         clean_inp = inp.strip()
         clean_out = out.strip()
         clean_out = re.split(r"\n\s*(?:Explanation|Note|Constraints)\b", clean_out, flags=re.IGNORECASE)[0].strip()
+        if "STDIN" in clean_inp and "Function" in clean_inp:
+            clean_inp = clean_hackerrank_stdin_format(clean_inp)
         if clean_inp or clean_out:
             samples.append(SampleTestCase(input_text=clean_inp, expected_output=clean_out, sample_index=i))
 
@@ -4691,26 +4719,25 @@ async def extract_sample_test_cases_from_page(page: Page, platform_type: str) ->
             outputs = await page.locator(".sample-test .output pre").all_inner_texts()
             for i, (inp, out) in enumerate(zip(inputs, outputs), 1):
                 samples.append(SampleTestCase(input_text=inp.strip(), expected_output=out.strip(), sample_index=i))
-        elif platform_type == "hackerrank":
-            inputs = await page.locator(".challenge_sample_input pre").all_inner_texts()
-            outputs = await page.locator(".challenge_sample_output pre").all_inner_texts()
-            for i, (inp, out) in enumerate(zip(inputs, outputs), 1):
-                samples.append(SampleTestCase(input_text=inp.strip(), expected_output=out.strip(), sample_index=i))
-        elif platform_type in ["codechef", "hackerearth"]:
-            container_pres = await page.locator("#problem-statement pre, ._problemBody_bh3c4_71 pre, .problem-description pre, .problem-statement pre, pre").all_inner_texts()
+        elif platform_type in ["hackerrank", "codechef", "hackerearth"]:
+            container_pres = await page.locator(".challenge-body-html pre, .problem-statement pre, #problem-statement pre, ._problemBody_bh3c4_71 pre, .problem-description pre, pre").all_inner_texts()
             clean_pres = [p.strip() for p in container_pres if p and p.strip() and not p.strip().startswith("//")]
             if len(clean_pres) >= 2 and len(clean_pres) % 2 == 0:
                 for idx in range(0, len(clean_pres) - 1, 2):
-                    clean_i = re.sub(r"^(?:Sample\s+Input\s*:?\s*|Input\s*:?\s*)", "", clean_pres[idx], flags=re.IGNORECASE).strip()
-                    clean_o = re.sub(r"^(?:Sample\s+Output\s*:?\s*|Output\s*:?\s*)", "", clean_pres[idx+1], flags=re.IGNORECASE).strip()
+                    clean_i = re.sub(r"^(?:Sample\s+Input\s*(?:\d+)?\s*:?\s*|Input\s*(?:\d+)?\s*:?\s*)", "", clean_pres[idx], flags=re.IGNORECASE).strip()
+                    clean_o = re.sub(r"^(?:Sample\s+Output\s*(?:\d+)?\s*:?\s*|Output\s*(?:\d+)?\s*:?\s*)", "", clean_pres[idx+1], flags=re.IGNORECASE).strip()
+                    if "STDIN" in clean_i and "Function" in clean_i:
+                        clean_i = clean_hackerrank_stdin_format(clean_i)
                     if clean_i or clean_o:
                         samples.append(SampleTestCase(input_text=clean_i, expected_output=clean_o, sample_index=(idx // 2) + 1))
             if not samples:
-                inputs = await page.locator(".problem-statement pre:has-text('Input'), .sample-input-box pre, .sample-test .input pre, .input-container pre").all_inner_texts()
-                outputs = await page.locator(".problem-statement pre:has-text('Output'), .sample-output-box pre, .sample-test .output pre, .output-container pre").all_inner_texts()
+                inputs = await page.locator(".challenge_sample_input pre, .problem-statement pre:has-text('Input'), .sample-input-box pre, .sample-test .input pre, .input-container pre").all_inner_texts()
+                outputs = await page.locator(".challenge_sample_output pre, .problem-statement pre:has-text('Output'), .sample-output-box pre, .sample-test .output pre, .output-container pre").all_inner_texts()
                 for i, (inp, out) in enumerate(zip(inputs, outputs), 1):
-                    clean_i = re.sub(r"^(?:Sample\s+Input\s*:?\s*|Input\s*:?\s*)", "", inp.strip(), flags=re.IGNORECASE).strip()
-                    clean_o = re.sub(r"^(?:Sample\s+Output\s*:?\s*|Output\s*:?\s*)", "", out.strip(), flags=re.IGNORECASE).strip()
+                    clean_i = re.sub(r"^(?:Sample\s+Input\s*(?:\d+)?\s*:?\s*|Input\s*(?:\d+)?\s*:?\s*)", "", inp.strip(), flags=re.IGNORECASE).strip()
+                    clean_o = re.sub(r"^(?:Sample\s+Output\s*(?:\d+)?\s*:?\s*|Output\s*(?:\d+)?\s*:?\s*)", "", out.strip(), flags=re.IGNORECASE).strip()
+                    if "STDIN" in clean_i and "Function" in clean_i:
+                        clean_i = clean_hackerrank_stdin_format(clean_i)
                     samples.append(SampleTestCase(input_text=clean_i, expected_output=clean_o, sample_index=i))
     except Exception:
         pass
