@@ -5593,6 +5593,8 @@ async def _verify_codechef(
             res = await page.evaluate(r"""() => {
                 // Scope STRICTLY to the submission status container only
                 const selectors = [
+                    'div[class*="submission__container"]',
+                    'div[class*="_submission__container_"]',
                     '#submission-status',
                     '[data-testid="submission-result"]',
                     'div[class*="submission-status"]',
@@ -5617,7 +5619,7 @@ async def _verify_codechef(
                     if (m) subId = m[1];
                 }
                 if (!subId) {
-                    const m = text.match(/Submission\s*#?(\d+)/i);
+                    const m = text.match(/Submission\s*(?:ID)?\s*#?:?\s*(\d+)/i);
                     if (m) subId = m[1];
                 }
 
@@ -5683,6 +5685,61 @@ async def _verify_codechef(
                     correlation_mechanism="codechef_dom_scoped_status_container",
                     evidence={"text": text[:150]},
                 )
+
+        # Check viewsolution page if sub_id is present but verdict not directly in problem page container
+        if sub_id and not any(a in text for a in ["Correct Answer", "100 pts", "100 / 100", "AC", "Accepted", "Wrong Answer", "WA"]):
+            try:
+                view_url = f"https://www.codechef.com/viewsolution/{sub_id}"
+                await page.goto(view_url, wait_until="domcontentloaded", timeout=12000)
+                await asyncio.sleep(1.2)
+                v_res = await page.evaluate(r"""() => {
+                    const text = (document.body ? document.body.innerText || '' : '').trim();
+                    const m = text.match(/Status:\s*\n*\s*([^\n]+)/i);
+                    const statusVal = m ? m[1].trim() : '';
+                    const isAccepted = /correct answer|accepted|100\s*pts/i.test(text);
+                    const isRejected = /wrong answer|wa\b|time limit|runtime error|compilation error/i.test(text);
+                    const isPending = /evaluating|running|judging|in queue|compiling|pending/i.test(text) && !isAccepted && !isRejected;
+                    return { status: statusVal, isAccepted: isAccepted, isRejected: isRejected, isPending: isPending };
+                }""")
+                if v_res and isinstance(v_res, dict):
+                    if v_res.get("isPending"):
+                        seen_pending = True
+                        continue
+                    if v_res.get("isAccepted"):
+                        corr_mechanism = "codechef_viewsolution_status"
+                        effective_id = str(sub_id)
+                        evidence = {
+                            "submission_id": effective_id,
+                            "problem_code": prob_code,
+                            "result_snippet": v_res.get("status") or "Correct Answer",
+                            "correlation_mechanism": corr_mechanism,
+                            "submission_start_time": submission_start_time,
+                        }
+                        return SubmissionVerdict(
+                            state=VerdictState.ACCEPTED,
+                            message="Accepted",
+                            submission_id=effective_id,
+                            platform="codechef",
+                            problem_id=prob_code,
+                            account=account,
+                            timestamp=time.time(),
+                            correlation_mechanism=corr_mechanism,
+                            evidence=evidence,
+                        )
+                    if v_res.get("isRejected"):
+                        return SubmissionVerdict(
+                            state=VerdictState.REJECTED,
+                            message=v_res.get("status") or "Rejected",
+                            submission_id=str(sub_id),
+                            platform="codechef",
+                            problem_id=prob_code,
+                            account=account,
+                            timestamp=time.time(),
+                            correlation_mechanism="codechef_viewsolution_status",
+                            evidence={"text": v_res.get("status") or "Rejected"},
+                        )
+            except Exception as e:
+                last_error = str(e)
 
     if seen_pending:
         return SubmissionVerdict(
