@@ -1225,11 +1225,11 @@ def get_chrome_executable_path() -> Optional[str]:
     return None
 
 AI_MODELS = [
+    "gemini-3.1-flash-lite",
     "gemini-3.5-flash-lite",
     "gemini-2.5-flash",
     "gemini-3.5-flash",
     "gemini-3.6-flash",
-    "gemini-3.1-flash-lite",
 ]
 DEFAULT_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 SUBMISSIONS_LOG_FILE = LOGS_DIR / "submissions.jsonl"
@@ -4696,20 +4696,22 @@ async def extract_sample_test_cases_from_page(page: Page, platform_type: str) ->
             outputs = await page.locator(".challenge_sample_output pre").all_inner_texts()
             for i, (inp, out) in enumerate(zip(inputs, outputs), 1):
                 samples.append(SampleTestCase(input_text=inp.strip(), expected_output=out.strip(), sample_index=i))
-        elif platform_type == "codechef":
-            inputs = await page.locator(".problem-statement pre:has-text('Input'), div[class*='_problem_description_'] pre:has-text('Input'), pre:has-text('Input')").all_inner_texts()
-            outputs = await page.locator(".problem-statement pre:has-text('Output'), div[class*='_problem_description_'] pre:has-text('Output'), pre:has-text('Output')").all_inner_texts()
-            for i, (inp, out) in enumerate(zip(inputs, outputs), 1):
-                clean_i = re.sub(r"^(?:Input\s*:?\s*)", "", inp.strip(), flags=re.IGNORECASE)
-                clean_o = re.sub(r"^(?:Output\s*:?\s*)", "", out.strip(), flags=re.IGNORECASE)
-                samples.append(SampleTestCase(input_text=clean_i.strip(), expected_output=clean_o.strip(), sample_index=i))
-        elif platform_type == "hackerearth":
-            inputs = await page.locator(".sample-input-box pre, .sample-test .input pre, .input-container pre, pre:has-text('Input')").all_inner_texts()
-            outputs = await page.locator(".sample-output-box pre, .sample-test .output pre, .output-container pre, pre:has-text('Output')").all_inner_texts()
-            for i, (inp, out) in enumerate(zip(inputs, outputs), 1):
-                clean_i = re.sub(r"^(?:Sample\s+Input\s*:?\s*|Input\s*:?\s*)", "", inp.strip(), flags=re.IGNORECASE)
-                clean_o = re.sub(r"^(?:Sample\s+Output\s*:?\s*|Output\s*:?\s*)", "", out.strip(), flags=re.IGNORECASE)
-                samples.append(SampleTestCase(input_text=clean_i.strip(), expected_output=clean_o.strip(), sample_index=i))
+        elif platform_type in ["codechef", "hackerearth"]:
+            container_pres = await page.locator("#problem-statement pre, ._problemBody_bh3c4_71 pre, .problem-description pre, .problem-statement pre, pre").all_inner_texts()
+            clean_pres = [p.strip() for p in container_pres if p and p.strip() and not p.strip().startswith("//")]
+            if len(clean_pres) >= 2 and len(clean_pres) % 2 == 0:
+                for idx in range(0, len(clean_pres) - 1, 2):
+                    clean_i = re.sub(r"^(?:Sample\s+Input\s*:?\s*|Input\s*:?\s*)", "", clean_pres[idx], flags=re.IGNORECASE).strip()
+                    clean_o = re.sub(r"^(?:Sample\s+Output\s*:?\s*|Output\s*:?\s*)", "", clean_pres[idx+1], flags=re.IGNORECASE).strip()
+                    if clean_i or clean_o:
+                        samples.append(SampleTestCase(input_text=clean_i, expected_output=clean_o, sample_index=(idx // 2) + 1))
+            if not samples:
+                inputs = await page.locator(".problem-statement pre:has-text('Input'), .sample-input-box pre, .sample-test .input pre, .input-container pre").all_inner_texts()
+                outputs = await page.locator(".problem-statement pre:has-text('Output'), .sample-output-box pre, .sample-test .output pre, .output-container pre").all_inner_texts()
+                for i, (inp, out) in enumerate(zip(inputs, outputs), 1):
+                    clean_i = re.sub(r"^(?:Sample\s+Input\s*:?\s*|Input\s*:?\s*)", "", inp.strip(), flags=re.IGNORECASE).strip()
+                    clean_o = re.sub(r"^(?:Sample\s+Output\s*:?\s*|Output\s*:?\s*)", "", out.strip(), flags=re.IGNORECASE).strip()
+                    samples.append(SampleTestCase(input_text=clean_i, expected_output=clean_o, sample_index=i))
     except Exception:
         pass
     return samples
