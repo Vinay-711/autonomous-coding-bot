@@ -38,3 +38,11 @@ autocoder = "bot:cli"
 Homepage = "https://github.com/Vinay-711/autonomous-coding-bot"
 Repository = "https://github.com/Vinay-711/autonomous-coding-bot.git"
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+norecursedirs = ["repos", "solutions", ".venv", "saved_chrome_login"]
+
+

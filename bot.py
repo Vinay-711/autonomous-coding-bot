@@ -17,7 +17,9 @@ import subprocess
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, Tuple, List, Set
+from typing import Optional, Tuple, List, Set, Dict, Any, Union
+from enum import Enum
+from dataclasses import dataclass, field
 
 import pyperclip
 from pydantic import BaseModel, Field
@@ -25,6 +27,83 @@ from google import genai
 from google.genai import types
 from google.genai.errors import APIError
 from playwright.async_api import async_playwright, Page, BrowserContext
+
+# ==============================================================================
+# Typed Verdict States & Data Models
+# ==============================================================================
+class VerdictState(str, Enum):
+    ACCEPTED = "ACCEPTED"
+    REJECTED = "REJECTED"
+    PENDING = "PENDING"
+    UNKNOWN = "UNKNOWN"
+    ERROR = "ERROR"
+
+    def __bool__(self) -> bool:
+        """Allow boolean evaluation for backward compatibility: ACCEPTED is True, all others are False."""
+        return self == VerdictState.ACCEPTED
+
+@dataclass
+class SubmissionVerdict:
+    state: VerdictState
+    message: str
+    submission_id: Optional[str] = None
+    platform: Optional[str] = None
+    problem_id: Optional[str] = None
+    account: Optional[str] = None
+    timestamp: Optional[float] = None
+    correlation_mechanism: Optional[str] = None
+    evidence: Dict[str, Any] = field(default_factory=dict)
+
+    def __bool__(self) -> bool:
+        return self.state == VerdictState.ACCEPTED
+
+    def __iter__(self):
+        """Allows unpacking as (verdict_state, verdict_message) for backward compatibility."""
+        return iter((self.state, self.message))
+
+@dataclass
+class PollingConfig:
+    max_timeout: float = 45.0
+    initial_interval: float = 1.0
+    max_interval: float = 5.0
+    backoff_factor: float = 1.4
+    max_polls: int = 25
+
+async def poll_with_backoff(
+    config: Optional[PollingConfig] = None,
+    timeout: Optional[float] = None,
+    max_polls: Optional[int] = None,
+    initial_interval: Optional[float] = None,
+    max_interval: Optional[float] = None,
+    backoff_factor: Optional[float] = None,
+):
+    """Async generator yielding (poll_number, elapsed_seconds) with exponential backoff bounded by max_timeout."""
+    cfg = config or PollingConfig()
+    max_to = timeout if timeout is not None else cfg.max_timeout
+    polls_limit = max_polls if max_polls is not None else cfg.max_polls
+    curr_interval = initial_interval if initial_interval is not None else cfg.initial_interval
+    max_int = max_interval if max_interval is not None else cfg.max_interval
+    b_factor = backoff_factor if backoff_factor is not None else cfg.backoff_factor
+
+    start_time = time.time()
+    poll_count = 0
+
+    while poll_count < polls_limit:
+        elapsed = time.time() - start_time
+        if elapsed >= max_to and poll_count > 0:
+            break
+
+        poll_count += 1
+        yield poll_count, elapsed
+
+        remaining = max_to - (time.time() - start_time)
+        if remaining <= 0:
+            break
+        sleep_dur = min(curr_interval, remaining)
+        if sleep_dur > 0:
+            await asyncio.sleep(sleep_dur)
+        curr_interval = min(curr_interval * b_factor, max_int)
+
 
 # ==============================================================================
 # Configuration & Environment Setup
@@ -66,6 +145,65 @@ SOLUTIONS_DIR.mkdir(parents=True, exist_ok=True)
 LOGS_DIR = BASE_DIR / "logs"
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+SUBMISSIONS_LOG_FILE = LOGS_DIR / "submissions.jsonl"
+
+def record_submission_evidence(
+    verdict: SubmissionVerdict,
+    url: str,
+    platform_type: str,
+    code: Optional[str] = None
+):
+    """Persists detailed submission evidence to logs/submissions.jsonl to guarantee auditability."""
+    try:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        record = {
+            "timestamp": datetime.now().isoformat(),
+            "epoch": time.time(),
+            "platform": platform_type,
+            "url": url,
+            "problem_id": verdict.problem_id,
+            "submission_id": verdict.submission_id,
+            "account": verdict.account,
+            "verdict": verdict.state.value,
+            "message": verdict.message,
+            "correlation_mechanism": verdict.correlation_mechanism,
+            "evidence": verdict.evidence,
+        }
+        with open(SUBMISSIONS_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception as e:
+        print(f"   ⚠️  Could not persist submission evidence: {e}")
+
+def extract_problem_id(url: str, platform_type: str) -> str:
+    """Extracts a normalized problem identifier from a platform URL."""
+    clean_url = url.strip().rstrip("/")
+    if platform_type == "codeforces":
+        m = re.search(r"/(?:problemset/problem|contest)/(\d+)/(?:problem/)?([A-Za-z0-9]+)", clean_url)
+        if m:
+            return f"{m.group(1)}{m.group(2).upper()}"
+        parts = clean_url.split("/")
+        if len(parts) >= 2:
+            return f"{parts[-2]}{parts[-1]}".upper()
+        return parts[-1].upper()
+    elif platform_type == "hackerrank":
+        m = re.search(r"/challenges/([^/]+)", clean_url)
+        return m.group(1) if m else clean_url.split("/")[-1]
+    elif platform_type == "leetcode":
+        m = re.search(r"/problems/([^/]+)", clean_url)
+        return m.group(1) if m else clean_url.split("/")[-1]
+    elif platform_type == "codechef":
+        m = re.search(r"/problems/([^/]+)", clean_url)
+        return m.group(1) if m else clean_url.split("/")[-1]
+    elif platform_type == "hackerearth":
+        m = re.search(r"/(?:algorithm|approximate)/([^/]+)", clean_url)
+        if m:
+            return m.group(1)
+        m2 = re.search(r"/practice-problems/(?:algorithm/)?([^/]+)", clean_url)
+        if m2:
+            return m2.group(1)
+        return clean_url.split("/")[-1]
+    return clean_url.split("/")[-1]
+
 
 # ==============================================================================
 # Platform Rules & Selectors
@@ -1215,13 +1353,35 @@ def compile_java_code_locally(code: str, platform_type: str) -> Tuple[bool, str,
         except Exception as e:
             return False, f"javac invocation failed: {e}", cleaned
 
-async def verify_live_submission_verdict(page: Page, platform_type: str, url: str) -> Tuple[bool, str]:
-    """Polls the judge / platform API to verify that the submission was genuinely Accepted."""
-    if platform_type == "hackerrank":
-        slug = url.split("/challenges/")[1].split("/")[0]
-        print(f"   ⏳ Polling HackerRank submission API for verdict ({slug})...")
-        for poll in range(15):
-            await asyncio.sleep(3)
+async def capture_pre_submission_snapshot(
+    page: Page,
+    platform_type: str,
+    url: str
+) -> Dict[str, Any]:
+    """Captures pre-submission metadata (latest submission ID, start timestamp, expected problem and account)
+    to prevent stale submission verdicts from being falsely attributed to the current attempt."""
+    start_time = time.time()
+    prob_id = extract_problem_id(url, platform_type)
+    account = None
+    pre_submission_id = None
+
+    if platform_type == "codeforces":
+        account = CODEFORCES_HANDLE
+        try:
+            if account:
+                api_url = f"https://codeforces.com/api/user.status?handle={account}&from=1&count=1"
+                req = urllib.request.Request(api_url, headers={"User-Agent": DEFAULT_USER_AGENT})
+                with urllib.request.urlopen(req, timeout=4) as resp:
+                    if resp.status == 200:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        if data.get("status") == "OK" and data.get("result"):
+                            pre_submission_id = str(data["result"][0].get("id"))
+        except Exception:
+            pass
+
+    elif platform_type == "hackerrank":
+        slug = prob_id
+        try:
             data = await page.evaluate(f"""async () => {{
                 try {{
                     const r = await fetch('https://www.hackerrank.com/rest/contests/master/challenges/{slug}/submissions');
@@ -1231,148 +1391,864 @@ async def verify_live_submission_verdict(page: Page, platform_type: str, url: st
                 }}
             }}""")
             if data and "models" in data and len(data["models"]) > 0:
-                latest = data["models"][0]
-                st = latest.get("status")
-                sc = latest.get("score")
-                print(f"      [HackerRank Poll {poll+1}/15] Status: {st}, Score: {sc}")
-                if st not in ["Processing", "Queued", "Evaluating", None]:
-                    if st == "Accepted":
-                        return True, f"Accepted (Score: {sc})"
-                    else:
-                        return False, f"{st} (Score: {sc})"
-        return False, "Evaluation timed out on HackerRank."
-
-    elif platform_type == "codeforces":
-        # Extract target contest ID and problem index from URL (e.g. .../problemset/problem/1294/C)
-        clean_url = url.rstrip("/")
-        parts = clean_url.split("/")
-        expected_contest = None
-        expected_index = None
-        if len(parts) >= 2:
-            try:
-                expected_contest = int(parts[-2])
-                expected_index = parts[-1].upper()
-            except ValueError:
-                pass
-
-        print(f"   ⏳ Polling Codeforces API for verdict (Target: {expected_contest}{expected_index})...")
-
-        # Check if page currently displays anti-bot or submission errors
-        try:
-            page_errs = await page.evaluate("""() => {
-                const els = Array.from(document.querySelectorAll('.error, .error__desc, span[class*="error"]'));
-                return els.map(e => (e.innerText || '').trim()).filter(t => t.length > 0);
-            }""")
-            for pe in page_errs:
-                if "anti-bot" in pe.lower() or "verification" in pe.lower():
-                    page._anti_bot_blocked = True
-                    return False, "Codeforces anti-bot verification (Cloudflare Turnstile) challenge required."
-                if len(pe) > 2:
-                    return False, f"Codeforces form error: {pe}"
+                pre_submission_id = str(data["models"][0].get("id"))
         except Exception:
             pass
 
-        now_ts = time.time()
-        seen_testing = False
-        for poll in range(25):
-            await asyncio.sleep(3)
-            try:
-                import urllib.request
-                import json
-                api_url = f"https://codeforces.com/api/user.status?handle={CODEFORCES_HANDLE}&from=1&count=5"
-                req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    if resp.status == 200:
-                        cf_data = json.loads(resp.read().decode("utf-8"))
-                        if cf_data.get("status") == "OK" and cf_data.get("result"):
-                            for sub in cf_data["result"]:
-                                p = sub.get("problem", {})
-                                c_id = p.get("contestId")
-                                idx = p.get("index", "").upper()
-                                creation = sub.get("creationTimeSeconds", 0)
-
-                                if expected_contest and (c_id != expected_contest or idx != expected_index):
-                                    continue
-                                if now_ts - creation > 300:
-                                    continue
-
-                                verdict = sub.get("verdict")
-                                print(f"      [Codeforces Poll {poll+1}/25] Match: {c_id}{idx} -> Verdict: {verdict}")
-                                if verdict == "TESTING":
-                                    seen_testing = True
-                                elif verdict and verdict != "TESTING":
-                                    if verdict == "OK":
-                                        return True, "Accepted (OK)"
-                                    else:
-                                        return False, verdict
-            except Exception:
-                pass
-
-        if seen_testing:
-            return True, "Accepted (Submission verified in judge queue)"
-
+    elif platform_type in ["leetcode", "codechef", "hackerearth"]:
+        # Capture any currently visible submission ID in DOM before new submission
         try:
-            if "/submit" in page.url:
-                page._anti_bot_blocked = True
-        except Exception:
-            pass
-        return False, "No recent matching submission registered on Codeforces (check anti-bot verification)."
-
-    elif platform_type == "leetcode":
-        print("   ⏳ Verifying LeetCode submission verdict...")
-        for poll in range(10):
-            await asyncio.sleep(2.5)
-            res = await page.evaluate("""() => {
-                const el = document.querySelector('[data-e2e-locator="submission-result"], .text-green-s, .text-red-s, div[class*="status"]');
-                return el ? el.innerText : '';
-            }""")
-            if "Accepted" in res:
-                return True, "Accepted"
-            elif any(err in res for err in ["Wrong Answer", "Time Limit Exceeded", "Runtime Error", "Compile Error"]):
-                return False, res.strip()
-        return True, "Submitted (No negative verdict detected)."
-
-    elif platform_type == "codechef":
-        print("   ⏳ Checking CodeChef submission result...")
-        for poll in range(10):
-            await asyncio.sleep(2.5)
-            res = await page.evaluate("""() => {
-                const el = document.querySelector('#submission-status, .submission-status, .status-label, div[class*="status"]');
-                return el ? el.innerText : '';
-            }""")
-            if "Correct" in res or "AC" in res or "Accepted" in res:
-                return True, "Accepted"
-            elif any(err in res for err in ["Wrong", "WA", "TLE", "Runtime Error"]):
-                return False, res.strip()
-        return True, "CodeChef submission sent."
-
-    elif platform_type == "hackerearth":
-        print("   ⏳ Checking HackerEarth submission verdict...")
-        for poll in range(15):
-            await asyncio.sleep(2.5)
-            verdict = await page.evaluate("""() => {
-                const els = Array.from(document.querySelectorAll("div, span, h2, h3, h4, p, button"))
-                    .map(e => (e.innerText || '').trim())
-                    .filter(t => t.length > 0 && t.length < 100);
-                for (const t of els) {
-                    if (t.includes('Accepted') || t.includes('Correct Answer')) return 'Accepted';
-                    if (t.includes('Wrong Answer')) return 'Wrong Answer';
-                    if (t.includes('Compilation Error')) return 'Compilation Error';
-                    if (t.includes('Time Limit Exceeded')) return 'Time Limit Exceeded';
-                    if (t.includes('Memory Limit Exceeded')) return 'Memory Limit Exceeded';
-                    if (t.includes('Runtime Error')) return 'Runtime Error';
+            pre_id = await page.evaluate(r"""() => {
+                const link = document.querySelector('a[href*="/submissions/detail/"], a[href*="/viewsolution/"], a[href*="/submission/"]');
+                if (link && link.href) {
+                    const m = link.href.match(/(?:detail\/|viewsolution\/|submission\/)(?:[a-zA-Z0-9_\-]+\/)?(\d+)/);
+                    if (m) return m[1];
                 }
-                return '';
+                const el = document.querySelector('[data-submission-id]');
+                return el ? el.getAttribute('data-submission-id') : null;
             }""")
-            if verdict:
-                print(f"      [HackerEarth Poll {poll+1}/15] Verdict: {verdict}")
-                if verdict == "Accepted":
-                    return True, "Accepted"
-                else:
-                    return False, verdict
-        return True, "HackerEarth submission sent (evaluation pending)."
+            if pre_id:
+                pre_submission_id = str(pre_id)
+        except Exception:
+            pass
 
-    return True, "Submitted successfully."
+    return {
+        "start_time": start_time,
+        "pre_submission_id": pre_submission_id,
+        "account": account,
+        "problem_id": prob_id,
+        "platform_type": platform_type,
+    }
+
+async def _verify_hackerrank(
+    page: Page,
+    url: str,
+    submission_start_time: float,
+    pre_submission_id: Optional[str] = None,
+    account: Optional[str] = None,
+    expected_problem_id: Optional[str] = None,
+    timeout: float = 45.0,
+    initial_interval: float = 1.5,
+) -> SubmissionVerdict:
+    slug = expected_problem_id or extract_problem_id(url, "hackerrank")
+    print(f"   ⏳ Polling HackerRank submission API for verdict ({slug})...")
+
+    last_error = None
+    seen_pending = False
+    pending_sub_id = None
+
+    async for poll, elapsed in poll_with_backoff(
+        timeout=timeout, initial_interval=initial_interval, max_interval=5.0, backoff_factor=1.4
+    ):
+        try:
+            data = await page.evaluate(f"""async () => {{
+                try {{
+                    const r = await fetch('https://www.hackerrank.com/rest/contests/master/challenges/{slug}/submissions');
+                    if (!r.ok) return {{ error: 'HTTP_' + r.status }};
+                    return await r.json();
+                }} catch(e) {{
+                    return {{ error: e.toString() }};
+                }}
+            }}""")
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+        if not data:
+            continue
+
+        if isinstance(data, dict) and "error" in data:
+            last_error = str(data["error"])
+            continue
+
+        models = data.get("models") if isinstance(data, dict) else None
+        if not models or not isinstance(models, list):
+            continue
+
+        # Find the submission corresponding strictly to the CURRENT attempt
+        matching_sub = None
+        for sub in models:
+            sub_id = str(sub.get("id", ""))
+            if not sub_id:
+                continue
+
+            # Check 1: Reject if same as pre-submission ID (Stale submission)
+            if pre_submission_id and sub_id == str(pre_submission_id):
+                continue
+
+            # Check 2: Submission time matching (reject stale verdicts created before submission)
+            created_at = sub.get("created_at")
+            sub_ts = None
+            if created_at:
+                try:
+                    if isinstance(created_at, (int, float)):
+                        sub_ts = float(created_at)
+                    else:
+                        sub_ts = datetime.fromisoformat(str(created_at).replace("Z", "+00:00")).timestamp()
+                except Exception:
+                    pass
+
+            if sub_ts is not None and sub_ts < (submission_start_time - 15.0):
+                # Stale submission from an earlier historical session
+                continue
+
+            # Check 3: Account matching if known
+            if account:
+                sub_user = sub.get("hacker_username") or sub.get("username")
+                if sub_user and sub_user.lower() != account.lower():
+                    continue
+
+            # Found candidate submission matching current attempt!
+            matching_sub = sub
+            break
+
+        if not matching_sub:
+            # Only stale or unmatching submissions exist currently
+            continue
+
+        sub_id = str(matching_sub.get("id"))
+        st = matching_sub.get("status")
+        sc = matching_sub.get("score")
+        print(f"      [HackerRank Poll {poll}] SubID: {sub_id}, Status: {st}, Score: {sc}")
+
+        if st in ["Processing", "Queued", "Evaluating", None]:
+            seen_pending = True
+            pending_sub_id = sub_id
+            continue
+
+        evidence = {
+            "submission_id": sub_id,
+            "status": st,
+            "score": sc,
+            "challenge_slug": slug,
+            "created_at": matching_sub.get("created_at"),
+            "account": matching_sub.get("hacker_username") or account,
+        }
+
+        if st == "Accepted":
+            return SubmissionVerdict(
+                state=VerdictState.ACCEPTED,
+                message=f"Accepted (Score: {sc})",
+                submission_id=sub_id,
+                platform="hackerrank",
+                problem_id=slug,
+                account=matching_sub.get("hacker_username") or account,
+                timestamp=sub_ts or time.time(),
+                correlation_mechanism="hackerrank_rest_api_submission_id",
+                evidence=evidence,
+            )
+        elif st in ["Wrong Answer", "Compilation Error", "Runtime Error", "Terminated due to timeout"] or st:
+            return SubmissionVerdict(
+                state=VerdictState.REJECTED,
+                message=f"{st} (Score: {sc})",
+                submission_id=sub_id,
+                platform="hackerrank",
+                problem_id=slug,
+                account=matching_sub.get("hacker_username") or account,
+                timestamp=sub_ts or time.time(),
+                correlation_mechanism="hackerrank_rest_api_submission_id",
+                evidence=evidence,
+            )
+
+    # Polling exhausted
+    if seen_pending:
+        return SubmissionVerdict(
+            state=VerdictState.PENDING,
+            message="Evaluation timed out on HackerRank (submission remains in evaluation).",
+            submission_id=pending_sub_id,
+            platform="hackerrank",
+            problem_id=slug,
+            account=account,
+        )
+
+    if last_error:
+        return SubmissionVerdict(
+            state=VerdictState.ERROR,
+            message=f"HackerRank API polling error: {last_error}",
+            platform="hackerrank",
+            problem_id=slug,
+            account=account,
+        )
+
+    return SubmissionVerdict(
+        state=VerdictState.UNKNOWN,
+        message="No new submission registered on HackerRank for current attempt within timeout window.",
+        platform="hackerrank",
+        problem_id=slug,
+        account=account,
+    )
+
+async def _verify_codeforces(
+    page: Page,
+    url: str,
+    submission_start_time: float,
+    pre_submission_id: Optional[str] = None,
+    account: Optional[str] = None,
+    expected_problem_id: Optional[str] = None,
+    timeout: float = 60.0,
+    initial_interval: float = 1.5,
+) -> SubmissionVerdict:
+    contest_id, index = None, None
+    m = re.search(r"/(?:problemset/problem|contest)/(\d+)/(?:problem/)?([A-Za-z0-9]+)", url.strip().rstrip("/"))
+    if m:
+        contest_id = int(m.group(1))
+        index = m.group(2).upper()
+    prob_id = f"{contest_id}{index}" if contest_id and index else (expected_problem_id or extract_problem_id(url, "codeforces"))
+
+    handle = account or CODEFORCES_HANDLE
+    print(f"   ⏳ Polling Codeforces API for verdict (Target: {prob_id}, Handle: {handle or 'None'})...")
+
+    # 1. Check for anti-bot or submission errors on page
+    try:
+        page_errs = await page.evaluate("""() => {
+            const els = Array.from(document.querySelectorAll('.error, .error__desc, span[class*="error"]'));
+            return els.map(e => (e.innerText || '').trim()).filter(t => t.length > 0);
+        }""")
+        for pe in page_errs:
+            if "anti-bot" in pe.lower() or "verification" in pe.lower():
+                page._anti_bot_blocked = True
+                return SubmissionVerdict(
+                    state=VerdictState.ERROR,
+                    message="Codeforces anti-bot verification (Cloudflare Turnstile) challenge required.",
+                    platform="codeforces",
+                    problem_id=prob_id,
+                    account=handle,
+                )
+            if len(pe) > 2:
+                return SubmissionVerdict(
+                    state=VerdictState.REJECTED,
+                    message=f"Codeforces form error: {pe}",
+                    platform="codeforces",
+                    problem_id=prob_id,
+                    account=handle,
+                )
+    except Exception:
+        pass
+
+    if not handle:
+        return SubmissionVerdict(
+            state=VerdictState.ERROR,
+            message="Codeforces verification requires CODEFORCES_HANDLE to query user submissions.",
+            platform="codeforces",
+            problem_id=prob_id,
+        )
+
+    last_error = None
+    seen_pending = False
+    pending_sub_id = None
+
+    async for poll, elapsed in poll_with_backoff(
+        timeout=timeout, initial_interval=initial_interval, max_interval=5.0, backoff_factor=1.4
+    ):
+        try:
+            api_url = f"https://codeforces.com/api/user.status?handle={handle}&from=1&count=10"
+            req = urllib.request.Request(api_url, headers={"User-Agent": DEFAULT_USER_AGENT})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status != 200:
+                    last_error = f"HTTP {resp.status}"
+                    continue
+                cf_data = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+        if not cf_data or cf_data.get("status") != "OK":
+            last_error = cf_data.get("comment", "API status not OK") if isinstance(cf_data, dict) else "Invalid response"
+            continue
+
+        results = cf_data.get("result", [])
+        matching_sub = None
+
+        for sub in results:
+            p = sub.get("problem", {})
+            c_id = p.get("contestId")
+            idx = p.get("index", "").upper()
+            creation = sub.get("creationTimeSeconds", 0)
+            sub_id = str(sub.get("id", ""))
+
+            # Check 1: Contest ID and Index must match target problem
+            if contest_id is not None and (c_id != contest_id or idx != index):
+                continue
+
+            # Check 2: Reject if same as pre-submission ID (Stale)
+            if pre_submission_id and sub_id == str(pre_submission_id):
+                continue
+
+            # Check 3: Creation time must be after submission start time (within 15s clock skew)
+            if creation < (submission_start_time - 15.0):
+                continue
+
+            # Check 4: Account verification
+            author_members = [m.get("handle", "").lower() for m in sub.get("author", {}).get("members", [])]
+            if handle.lower() not in author_members:
+                continue
+
+            matching_sub = sub
+            break
+
+        if not matching_sub:
+            continue
+
+        sub_id = str(matching_sub.get("id"))
+        verdict = matching_sub.get("verdict")
+        print(f"      [Codeforces Poll {poll}] SubID: {sub_id}, Verdict: {verdict}")
+
+        # REQUIREMENT 4: NEVER return ACCEPTED for TESTING
+        if verdict == "TESTING" or verdict is None or verdict == "SUBMITTED":
+            seen_pending = True
+            pending_sub_id = sub_id
+            continue
+
+        evidence = {
+            "submission_id": sub_id,
+            "contestId": matching_sub.get("problem", {}).get("contestId"),
+            "index": matching_sub.get("problem", {}).get("index"),
+            "creationTimeSeconds": matching_sub.get("creationTimeSeconds"),
+            "verdict": verdict,
+            "handle": handle,
+        }
+
+        # REQUIREMENT 4: Only verdict OK qualifies as ACCEPTED
+        if verdict == "OK":
+            return SubmissionVerdict(
+                state=VerdictState.ACCEPTED,
+                message="Accepted (OK)",
+                submission_id=sub_id,
+                platform="codeforces",
+                problem_id=prob_id,
+                account=handle,
+                timestamp=float(matching_sub.get("creationTimeSeconds", time.time())),
+                correlation_mechanism="codeforces_api_user_status_id",
+                evidence=evidence,
+            )
+        else:
+            return SubmissionVerdict(
+                state=VerdictState.REJECTED,
+                message=f"Codeforces verdict: {verdict}",
+                submission_id=sub_id,
+                platform="codeforces",
+                problem_id=prob_id,
+                account=handle,
+                timestamp=float(matching_sub.get("creationTimeSeconds", time.time())),
+                correlation_mechanism="codeforces_api_user_status_id",
+                evidence=evidence,
+            )
+
+    # Polling exhausted
+    if seen_pending:
+        return SubmissionVerdict(
+            state=VerdictState.PENDING,
+            message="Evaluation timed out on Codeforces (verdict remains TESTING).",
+            submission_id=pending_sub_id,
+            platform="codeforces",
+            problem_id=prob_id,
+            account=handle,
+        )
+
+    if last_error:
+        return SubmissionVerdict(
+            state=VerdictState.ERROR,
+            message=f"Codeforces API error: {last_error}",
+            platform="codeforces",
+            problem_id=prob_id,
+            account=handle,
+        )
+
+    return SubmissionVerdict(
+        state=VerdictState.UNKNOWN,
+        message="No recent matching submission registered on Codeforces for current attempt.",
+        platform="codeforces",
+        problem_id=prob_id,
+        account=handle,
+    )
+
+async def _verify_leetcode(
+    page: Page,
+    url: str,
+    submission_start_time: float,
+    pre_submission_id: Optional[str] = None,
+    account: Optional[str] = None,
+    expected_problem_id: Optional[str] = None,
+    timeout: float = 30.0,
+    initial_interval: float = 1.0,
+) -> SubmissionVerdict:
+    slug = expected_problem_id or extract_problem_id(url, "leetcode")
+    print(f"   ⏳ Verifying LeetCode submission verdict ({slug})...")
+
+    last_error = None
+    seen_pending = False
+
+    async for poll, elapsed in poll_with_backoff(
+        timeout=timeout, initial_interval=initial_interval, max_interval=4.0, backoff_factor=1.4
+    ):
+        try:
+            res = await page.evaluate(r"""() => {
+                // Scope STRICTLY to the submission result container only
+                const selectors = [
+                    '[data-e2e-locator="submission-result"]',
+                    '[data-cypress="SubmissionResult"]',
+                    'div[class*="result-container"]',
+                    'div[class*="result-state"]',
+                    'div[class*="submission-result"]'
+                ];
+                let container = null;
+                for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    if (el) { container = el; break; }
+                }
+                if (!container) return null;
+
+                const text = (container.innerText || '').trim();
+                let subId = null;
+                const link = container.querySelector('a[href*="/submissions/detail/"], a[href*="/submissions/"]') ||
+                             document.querySelector('a[href*="/submissions/detail/"]');
+                if (link && link.href) {
+                    const m = link.href.match(/submissions\/(?:detail\/)?(\d+)/);
+                    if (m) subId = m[1];
+                }
+                if (!subId && container.getAttribute('data-submission-id')) {
+                    subId = container.getAttribute('data-submission-id');
+                }
+
+                return {
+                    text: text,
+                    submissionId: subId
+                };
+            }""")
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+        if not res or not isinstance(res, dict):
+            continue
+
+        text = res.get("text", "")
+        sub_id = res.get("submissionId")
+
+        # Stale check: if sub_id matches pre_submission_id, ignore
+        if sub_id and pre_submission_id and str(sub_id) == str(pre_submission_id):
+            continue
+
+        # Check pending states
+        if any(p in text for p in ["Pending", "Judging", "Compiling", "Evaluating", "In Queue"]):
+            seen_pending = True
+            continue
+
+        # Check verdict
+        if "Accepted" in text:
+            corr_mechanism = "leetcode_dom_submission_detail_link" if sub_id else "leetcode_dom_scoped_result_container"
+            effective_id = str(sub_id) if sub_id else f"leetcode_{slug}_{int(submission_start_time)}"
+            evidence = {
+                "submission_id": effective_id,
+                "problem_slug": slug,
+                "result_snippet": text[:150],
+                "correlation_mechanism": corr_mechanism,
+                "submission_start_time": submission_start_time,
+            }
+            return SubmissionVerdict(
+                state=VerdictState.ACCEPTED,
+                message="Accepted",
+                submission_id=effective_id,
+                platform="leetcode",
+                problem_id=slug,
+                account=account,
+                timestamp=time.time(),
+                correlation_mechanism=corr_mechanism,
+                evidence=evidence,
+            )
+
+        rejected_indicators = ["Wrong Answer", "Time Limit Exceeded", "Runtime Error", "Compile Error", "Memory Limit Exceeded", "Output Limit Exceeded"]
+        for rej in rejected_indicators:
+            if rej in text:
+                return SubmissionVerdict(
+                    state=VerdictState.REJECTED,
+                    message=rej,
+                    submission_id=str(sub_id) if sub_id else None,
+                    platform="leetcode",
+                    problem_id=slug,
+                    account=account,
+                    timestamp=time.time(),
+                    correlation_mechanism="leetcode_dom_scoped_result_container",
+                    evidence={"text": text[:150]},
+                )
+
+    if seen_pending:
+        return SubmissionVerdict(
+            state=VerdictState.PENDING,
+            message="Evaluation timed out on LeetCode (evaluation remains pending).",
+            platform="leetcode",
+            problem_id=slug,
+            account=account,
+        )
+
+    if last_error:
+        return SubmissionVerdict(
+            state=VerdictState.ERROR,
+            message=f"LeetCode DOM inspection error: {last_error}",
+            platform="leetcode",
+            problem_id=slug,
+            account=account,
+        )
+
+    # REQUIREMENT 3: Remove 'Submitted (No negative verdict detected)' fallback
+    return SubmissionVerdict(
+        state=VerdictState.UNKNOWN,
+        message="No submission result container detected on LeetCode within timeout window.",
+        platform="leetcode",
+        problem_id=slug,
+        account=account,
+    )
+
+async def _verify_codechef(
+    page: Page,
+    url: str,
+    submission_start_time: float,
+    pre_submission_id: Optional[str] = None,
+    account: Optional[str] = None,
+    expected_problem_id: Optional[str] = None,
+    timeout: float = 30.0,
+    initial_interval: float = 1.0,
+) -> SubmissionVerdict:
+    prob_code = expected_problem_id or extract_problem_id(url, "codechef")
+    print(f"   ⏳ Checking CodeChef submission result ({prob_code})...")
+
+    last_error = None
+    seen_pending = False
+
+    async for poll, elapsed in poll_with_backoff(
+        timeout=timeout, initial_interval=initial_interval, max_interval=4.0, backoff_factor=1.4
+    ):
+        try:
+            res = await page.evaluate(r"""() => {
+                // Scope STRICTLY to the submission status container only
+                const selectors = [
+                    '#submission-status',
+                    '[data-testid="submission-result"]',
+                    'div[class*="submission-status"]',
+                    'div[class*="Verdict_verdict"]',
+                    '.submission-result',
+                    '.status-label',
+                    'div[class*="verdict_container"]'
+                ];
+                let container = null;
+                for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    if (el) { container = el; break; }
+                }
+                if (!container) return null;
+
+                const text = (container.innerText || '').trim();
+                let subId = null;
+                const link = container.querySelector('a[href*="/viewsolution/"], a[href*="/status/"]') ||
+                             document.querySelector('a[href*="/viewsolution/"]');
+                if (link && link.href) {
+                    const m = link.href.match(/(?:viewsolution|status)\/(\d+)/);
+                    if (m) subId = m[1];
+                }
+                if (!subId) {
+                    const m = text.match(/Submission\s*#?(\d+)/i);
+                    if (m) subId = m[1];
+                }
+
+                return {
+                    text: text,
+                    submissionId: subId
+                };
+            }""")
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+        if not res or not isinstance(res, dict):
+            continue
+
+        text = res.get("text", "")
+        sub_id = res.get("submissionId")
+
+        # Stale check
+        if sub_id and pre_submission_id and str(sub_id) == str(pre_submission_id):
+            continue
+
+        # Pending check
+        if any(p in text for p in ["Running", "Judging", "In Queue", "Compiling", "Evaluating", "Pending"]):
+            seen_pending = True
+            continue
+
+        # Accepted check
+        if any(a in text for a in ["Correct Answer", "100 pts", "100 / 100", "AC", "Accepted"]):
+            corr_mechanism = "codechef_dom_submission_id" if sub_id else "codechef_dom_scoped_status_container"
+            effective_id = str(sub_id) if sub_id else f"codechef_{prob_code}_{int(submission_start_time)}"
+            evidence = {
+                "submission_id": effective_id,
+                "problem_code": prob_code,
+                "result_snippet": text[:150],
+                "correlation_mechanism": corr_mechanism,
+                "submission_start_time": submission_start_time,
+            }
+            return SubmissionVerdict(
+                state=VerdictState.ACCEPTED,
+                message="Accepted",
+                submission_id=effective_id,
+                platform="codechef",
+                problem_id=prob_code,
+                account=account,
+                timestamp=time.time(),
+                correlation_mechanism=corr_mechanism,
+                evidence=evidence,
+            )
+
+        # Rejected check
+        rejected_indicators = ["Wrong Answer", "WA", "Partially Solved", "Compilation Error", "Time Limit Exceeded", "TLE", "Runtime Error", "SIGSEGV"]
+        for rej in rejected_indicators:
+            if rej in text:
+                return SubmissionVerdict(
+                    state=VerdictState.REJECTED,
+                    message=rej,
+                    submission_id=str(sub_id) if sub_id else None,
+                    platform="codechef",
+                    problem_id=prob_code,
+                    account=account,
+                    timestamp=time.time(),
+                    correlation_mechanism="codechef_dom_scoped_status_container",
+                    evidence={"text": text[:150]},
+                )
+
+    if seen_pending:
+        return SubmissionVerdict(
+            state=VerdictState.PENDING,
+            message="Evaluation timed out on CodeChef (submission still evaluating).",
+            platform="codechef",
+            problem_id=prob_code,
+            account=account,
+        )
+
+    if last_error:
+        return SubmissionVerdict(
+            state=VerdictState.ERROR,
+            message=f"CodeChef DOM inspection error: {last_error}",
+            platform="codechef",
+            problem_id=prob_code,
+            account=account,
+        )
+
+    # REQUIREMENT 5: Remove 'submission sent' success fallback
+    return SubmissionVerdict(
+        state=VerdictState.UNKNOWN,
+        message="No submission status container detected on CodeChef within timeout window.",
+        platform="codechef",
+        problem_id=prob_code,
+        account=account,
+    )
+
+async def _verify_hackerearth(
+    page: Page,
+    url: str,
+    submission_start_time: float,
+    pre_submission_id: Optional[str] = None,
+    account: Optional[str] = None,
+    expected_problem_id: Optional[str] = None,
+    timeout: float = 35.0,
+    initial_interval: float = 1.0,
+) -> SubmissionVerdict:
+    slug = expected_problem_id or extract_problem_id(url, "hackerearth")
+    print(f"   ⏳ Checking HackerEarth submission verdict ({slug})...")
+
+    last_error = None
+    seen_pending = False
+
+    async for poll, elapsed in poll_with_backoff(
+        timeout=timeout, initial_interval=initial_interval, max_interval=4.0, backoff_factor=1.4
+    ):
+        try:
+            res = await page.evaluate(r"""() => {
+                // Scope STRICTLY to the submission result / modal container
+                const selectors = [
+                    'div[class*="submission-result"]',
+                    '.submission-result',
+                    'div[class*="track-submission"]',
+                    'div[id*="submission-result"]',
+                    'div[class*="result-status"]',
+                    'div[class*="verdict-wrapper"]',
+                    'div.modal-content .verdict',
+                    'div[class*="submission-overview"]',
+                    '.status-description'
+                ];
+                let container = null;
+                for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    if (el) { container = el; break; }
+                }
+                if (!container) return null;
+
+                const text = (container.innerText || '').trim();
+                let subId = null;
+                const link = container.querySelector('a[href*="/submission/"]') ||
+                             document.querySelector('a[href*="/submission/"]');
+                if (link && link.href) {
+                    const m = link.href.match(/submission\/(?:[a-zA-Z0-9_\-]+\/)?(\d+)/);
+                    if (m) subId = m[1];
+                }
+                if (!subId && container.getAttribute('data-submission-id')) {
+                    subId = container.getAttribute('data-submission-id');
+                }
+
+                return {
+                    text: text,
+                    submissionId: subId
+                };
+            }""")
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+        if not res or not isinstance(res, dict):
+            continue
+
+        text = res.get("text", "")
+        sub_id = res.get("submissionId")
+
+        # Stale check
+        if sub_id and pre_submission_id and str(sub_id) == str(pre_submission_id):
+            continue
+
+        # Pending check
+        if any(p in text for p in ["Queued", "Running test cases", "Evaluating", "Compiling", "In Queue"]):
+            seen_pending = True
+            continue
+
+        # Accepted check
+        if any(a in text for a in ["Accepted", "Correct Answer", "Score: 100"]):
+            corr_mechanism = "hackerearth_dom_modal_submission_id" if sub_id else "hackerearth_dom_scoped_modal_container"
+            effective_id = str(sub_id) if sub_id else f"hackerearth_{slug}_{int(submission_start_time)}"
+            evidence = {
+                "submission_id": effective_id,
+                "problem_slug": slug,
+                "result_snippet": text[:150],
+                "correlation_mechanism": corr_mechanism,
+                "submission_start_time": submission_start_time,
+            }
+            return SubmissionVerdict(
+                state=VerdictState.ACCEPTED,
+                message="Accepted",
+                submission_id=effective_id,
+                platform="hackerearth",
+                problem_id=slug,
+                account=account,
+                timestamp=time.time(),
+                correlation_mechanism=corr_mechanism,
+                evidence=evidence,
+            )
+
+        # Rejected check
+        rejected_indicators = ["Wrong Answer", "Compilation Error", "Time Limit Exceeded", "Memory Limit Exceeded", "Runtime Error"]
+        for rej in rejected_indicators:
+            if rej in text:
+                return SubmissionVerdict(
+                    state=VerdictState.REJECTED,
+                    message=rej,
+                    submission_id=str(sub_id) if sub_id else None,
+                    platform="hackerearth",
+                    problem_id=slug,
+                    account=account,
+                    timestamp=time.time(),
+                    correlation_mechanism="hackerearth_dom_scoped_modal_container",
+                    evidence={"text": text[:150]},
+                )
+
+    if seen_pending:
+        return SubmissionVerdict(
+            state=VerdictState.PENDING,
+            message="Evaluation timed out on HackerEarth (evaluation pending).",
+            platform="hackerearth",
+            problem_id=slug,
+            account=account,
+        )
+
+    if last_error:
+        return SubmissionVerdict(
+            state=VerdictState.ERROR,
+            message=f"HackerEarth DOM inspection error: {last_error}",
+            platform="hackerearth",
+            problem_id=slug,
+            account=account,
+        )
+
+    # REQUIREMENT 6: Remove 'evaluation pending' success fallback
+    return SubmissionVerdict(
+        state=VerdictState.UNKNOWN,
+        message="No submission result container detected on HackerEarth within timeout window.",
+        platform="hackerearth",
+        problem_id=slug,
+        account=account,
+    )
+
+async def verify_live_submission_verdict(
+    page: Page,
+    platform_type: str,
+    url: str,
+    submission_start_time: Optional[float] = None,
+    pre_submission_id: Optional[str] = None,
+    account: Optional[str] = None,
+    expected_problem_id: Optional[str] = None,
+    timeout: Optional[float] = None,
+    initial_interval: Optional[float] = None,
+) -> SubmissionVerdict:
+    """Polls the judge / platform API to verify that the submission was genuinely Accepted.
+    
+    Guarantees verdict integrity:
+    1. Returns typed verdict states: ACCEPTED, REJECTED, PENDING, UNKNOWN, ERROR.
+    2. Never returns ACCEPTED merely because no error was observed or evaluation is pending.
+    3. Matches problem ID, account, submission time, and submission ID to reject stale verdicts.
+    4. Scopes DOM extraction strictly to current submission results.
+    5. Implements bounded polling with timeouts and exponential backoff.
+    """
+    start_ts = submission_start_time if submission_start_time is not None else time.time()
+    prob_id = expected_problem_id or extract_problem_id(url, platform_type)
+
+    if platform_type == "hackerrank":
+        return await _verify_hackerrank(
+            page, url, submission_start_time=start_ts, pre_submission_id=pre_submission_id,
+            account=account, expected_problem_id=prob_id,
+            timeout=timeout if timeout is not None else 45.0,
+            initial_interval=initial_interval if initial_interval is not None else 1.5
+        )
+    elif platform_type == "codeforces":
+        return await _verify_codeforces(
+            page, url, submission_start_time=start_ts, pre_submission_id=pre_submission_id,
+            account=account, expected_problem_id=prob_id,
+            timeout=timeout if timeout is not None else 60.0,
+            initial_interval=initial_interval if initial_interval is not None else 1.5
+        )
+    elif platform_type == "leetcode":
+        return await _verify_leetcode(
+            page, url, submission_start_time=start_ts, pre_submission_id=pre_submission_id,
+            account=account, expected_problem_id=prob_id,
+            timeout=timeout if timeout is not None else 30.0,
+            initial_interval=initial_interval if initial_interval is not None else 1.0
+        )
+    elif platform_type == "codechef":
+        return await _verify_codechef(
+            page, url, submission_start_time=start_ts, pre_submission_id=pre_submission_id,
+            account=account, expected_problem_id=prob_id,
+            timeout=timeout if timeout is not None else 30.0,
+            initial_interval=initial_interval if initial_interval is not None else 1.0
+        )
+    elif platform_type == "hackerearth":
+        return await _verify_hackerearth(
+            page, url, submission_start_time=start_ts, pre_submission_id=pre_submission_id,
+            account=account, expected_problem_id=prob_id,
+            timeout=timeout if timeout is not None else 35.0,
+            initial_interval=initial_interval if initial_interval is not None else 1.0
+        )
+
+    # Universal fallback: NEVER return ACCEPTED
+    return SubmissionVerdict(
+        state=VerdictState.UNKNOWN,
+        message=f"Unsupported platform type: {platform_type}",
+        platform=platform_type,
+        problem_id=prob_id,
+    )
+
 
 async def verify_codeforces_samples_java(page: Page, code: str) -> Tuple[bool, str]:
     """Compiles Java solution using javac and runs against sample test cases locally."""
@@ -1468,15 +2344,24 @@ def get_safe_java_filename(url: str, platform_name: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9_\-]", "_", slug)
     return f"{platform_name.lower()}_{slug}.java"
 
-def save_java_solution(filename: str, code: str, url: str, explanation: str, platform_name: str):
-    """Saves Java solution to solutions/ directory with metadata header."""
+def save_java_solution(
+    filename: str,
+    code: str,
+    url: str,
+    explanation: str,
+    platform_name: str,
+    verdict: Optional[SubmissionVerdict] = None
+):
+    """Saves Java solution to solutions/ directory with metadata header including verified verdict and submission ID."""
     file_path = SOLUTIONS_DIR / filename
+    sub_id_line = f" * Submission ID: {verdict.submission_id or verdict.correlation_mechanism}\n" if verdict else ""
+    verdict_line = f" * Verdict: {verdict.state.value}\n" if verdict else ""
     header = f"""/* ==============================================================================
  * Platform: {platform_name}
  * Language: Java
  * URL: {url}
  * Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
- *
+{sub_id_line}{verdict_line} *
  * Approach:
  * {explanation}
  * ==============================================================================
@@ -1487,7 +2372,14 @@ def save_java_solution(filename: str, code: str, url: str, explanation: str, pla
         f.write(header + code + "\n")
     print(f"   💾 Saved Java solution to '{file_path}'")
 
-def commit_solution_to_github(platform_type: str, url: str, code: str, explanation: str, platform_name: str) -> bool:
+def commit_solution_to_github(
+    platform_type: str,
+    url: str,
+    code: str,
+    explanation: str,
+    platform_name: str,
+    verdict: Optional[SubmissionVerdict] = None
+) -> bool:
     """Commits and pushes the solution to the user's dedicated GitHub repository for that platform."""
     if not GITHUB_USERNAME:
         return False
@@ -1528,13 +2420,14 @@ def commit_solution_to_github(platform_type: str, url: str, code: str, explanati
     src_filename = repo_info["class_filename"]
     (prob_dir / src_filename).write_text(code, encoding="utf-8")
 
-    # Write README.md
+    # Write README.md with verifiable submission evidence
     readme_path = prob_dir / "README.md"
+    sub_id_text = f"\nSubmission ID: `{verdict.submission_id or verdict.correlation_mechanism}`" if verdict else ""
     readme_content = f"""# {clean_slug}
 
 [Original practice problem]({url})
 
-Date: {today_str} (Asia/Kolkata). Status: **Accepted**. Platform: **{platform_name}**.
+Date: {today_str} (Asia/Kolkata). Status: **Accepted**. Platform: **{platform_name}**.{sub_id_text}
 
 ## Approach
 
@@ -1685,6 +2578,14 @@ async def process_problem(
                 pass
 
     # 6. Inject code into webpage editor & 7. Execute action
+    submission_snapshot = {
+        "start_time": time.time(),
+        "pre_submission_id": None,
+        "account": CODEFORCES_HANDLE if platform_type == "codeforces" else None,
+        "problem_id": extract_problem_id(url, platform_type),
+    }
+    submit_clicked = False
+
     if platform_type == "codeforces":
         if mode in ["submit", "both"]:
             print("[5/7 & 6/7] Navigating to Codeforces submit page & submitting...")
@@ -1807,6 +2708,10 @@ async def process_problem(
                         save_java_solution(filename, solution_code, url, explanation, platform_name)
                         return False
 
+                # Capture pre-submission snapshot to anchor submission time and detect stale submissions
+                submission_snapshot = await capture_pre_submission_snapshot(page, platform_type, url)
+                submit_clicked = True
+
                 # Click submit
                 await page.locator('input.submit').click()
                 print("   🚀 Clicked Codeforces Submit! Waiting for judge verdict...")
@@ -1870,6 +2775,7 @@ async def process_problem(
                 await asyncio.sleep(wait_time)
 
         if mode in ["submit", "both"] and config.get("submit_selectors"):
+            submission_snapshot = await capture_pre_submission_snapshot(page, platform_type, url)
             submit_clicked = False
             for selector in config["submit_selectors"]:
                 btn = page.locator(selector).first
@@ -1883,22 +2789,45 @@ async def process_problem(
                     continue
 
     # 7. POST-SUBMISSION JUDGE VERIFICATION
+    verdict = None
     if mode in ["submit", "both"]:
         print("[7/7] Verifying live judge submission verdict...")
-        is_accepted, verdict_msg = await verify_live_submission_verdict(page, platform_type, url)
-        print(f"   🎯 Live verdict: {verdict_msg}")
+        if platform_type != "codeforces" and not submit_clicked:
+            print(f"   ❌ No submit button could be clicked on {platform_name}.")
+            return False
 
-        if not is_accepted:
-            print(f"   ❌ Problem {url} NOT accepted by judge ({verdict_msg}).")
+        verdict = await verify_live_submission_verdict(
+            page,
+            platform_type,
+            url,
+            submission_start_time=submission_snapshot.get("start_time"),
+            pre_submission_id=submission_snapshot.get("pre_submission_id"),
+            account=submission_snapshot.get("account"),
+            expected_problem_id=submission_snapshot.get("problem_id"),
+        )
+        verdict_state, verdict_msg = verdict
+        print(f"   🎯 Live verdict: {verdict_state.value} - {verdict_msg}")
+
+        # Persist submission evidence
+        record_submission_evidence(verdict, url, platform_type, solution_code)
+
+        if verdict_state != VerdictState.ACCEPTED:
+            print(f"   ❌ Problem {url} NOT accepted by judge ({verdict_msg}) [State: {verdict_state.value}].")
             print(f"   🛑 SKIPPING GitHub commit to guarantee ZERO broken solutions in repository!")
             return False
+    else:
+        # In RUN mode, no submission was made to the judge
+        print(f"   ℹ️  Mode '{mode.upper()}': solution tested locally without judge submission. Skipping GitHub commit.")
+        filename = get_safe_java_filename(url, platform_name)
+        save_java_solution(filename, solution_code, url, explanation, platform_name)
+        return True
 
     # 8. ONLY COMMIT TO GITHUB IF GENUINELY VERIFIED & ACCEPTED
     filename = get_safe_java_filename(url, platform_name)
-    save_java_solution(filename, solution_code, url, explanation, platform_name)
+    save_java_solution(filename, solution_code, url, explanation, platform_name, verdict=verdict)
 
     print("   🐙 Committing verified solution to GitHub repo...")
-    commit_solution_to_github(platform_type, url, solution_code, explanation, platform_name)
+    commit_solution_to_github(platform_type, url, solution_code, explanation, platform_name, verdict=verdict)
 
     print(f"✅ Completed processing: {url} (VERIFIED ACCEPTED & COMMITTED)\n")
     return True
