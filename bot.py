@@ -11,6 +11,7 @@ if hasattr(sys.stderr, "reconfigure"):
 import re
 import json
 import time
+import random
 import urllib.request
 import argparse
 import subprocess
@@ -251,17 +252,118 @@ class SelectorResolutionResult:
     role: str = ""
 
 def redact_sensitive_data(text: Optional[str]) -> str:
-    """Redacts API keys, tokens, session IDs, and passwords from logs, diagnostics, and failure records."""
+    """Redacts API keys, cookies, tokens, and personally identifying session data from logs, diagnostics, and failure records."""
     if not text:
         return ""
-    text = re.sub(r"AIza[0-9A-Za-z-_]{30,45}", "[REDACTED_API_KEY]", str(text))
+    text = str(text)
+    # API Keys
+    text = re.sub(r"AIza[0-9A-Za-z-_]{30,45}", "[REDACTED_API_KEY]", text)
+    text = re.sub(r'((?:api[-_]?key)[\s:=]+[\"\']?)[A-Za-z0-9_\-\.]{16,}([\"\']?)', r"\1[REDACTED_API_KEY]\2", text, flags=re.IGNORECASE)
+
+    # Tokens & Secrets
     text = re.sub(r"(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{30,255}", "[REDACTED_GITHUB_TOKEN]", text)
     text = re.sub(r"github_pat_[A-Za-z0-9_]{50,255}", "[REDACTED_GITHUB_TOKEN]", text)
     text = re.sub(r"(Bearer\s+)[A-Za-z0-9_\-\.]+", r"\1[REDACTED_TOKEN]", text, flags=re.IGNORECASE)
-    text = re.sub(r"((?:sessionid|csrf(?:token|_token)?|phpsessid|jsessionid)=)[^;\s&]+", r"\1[REDACTED_COOKIE]", text, flags=re.IGNORECASE)
-    text = re.sub(r'((?:password|passwd|pwd)[\s:=]+[\"\']?)[^\"\'\s;,\&]+([\"\']?)', r"\1[REDACTED_PASSWORD]\2", text, flags=re.IGNORECASE)
-    text = re.sub(r'((?:token|secret|access_key)[\s:=]+[\"\']?)[^\"\'\s;,\&]+([\"\']?)', r"\1[REDACTED_SECRET]\2", text, flags=re.IGNORECASE)
+    text = re.sub(r"eyJ[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.[A-Za-z0-9-_.+/=]+", "[REDACTED_JWT]", text)
+    text = re.sub(r'((?:token|secret|access_key)[\s:=]+[\"\']?)(?!\[REDACTED_)[^\"\'\s;,\&]+([\"\']?)', r"\1[REDACTED_SECRET]\2", text, flags=re.IGNORECASE)
+
+    # Cookies (standard and cloudflare/session cookies)
+    cookie_names = (
+        r"sessionid|csrf(?:token|_token)?|phpsessid|jsessionid|cf_clearance|__cfduid|"
+        r"connect\.sid|remember_me|auth_token|auth|SSID|HSID|SID|APISID|SAPISID"
+    )
+    text = re.sub(rf"((?:{cookie_names})=)[^;\s&]+", r"\1[REDACTED_COOKIE]", text, flags=re.IGNORECASE)
+
+    # Passwords
+    text = re.sub(r'((?:password|passwd|pwd)[\s:=]+[\"\']?)(?!\[REDACTED_)[^\"\'\s;,\&]+([\"\']?)', r"\1[REDACTED_PASSWORD]\2", text, flags=re.IGNORECASE)
+
+    # Personally Identifying Information (PII) / Emails & Session IDs
+    text = re.sub(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', "[REDACTED_EMAIL]", text)
+    text = re.sub(r'((?:session_?id|account_?id|visitor_?id)[\s:=]+[\"\']?)(?!\[REDACTED_)[A-Za-z0-9_\-\.]{10,}([\"\']?)', r"\1[REDACTED_SESSION]\2", text, flags=re.IGNORECASE)
+
     return text
+
+class FailureCode(str, Enum):
+    TRANSIENT = "TRANSIENT"
+    AUTH_REQUIRED = "AUTH_REQUIRED"
+    RATE_LIMITED = "RATE_LIMITED"
+    PLATFORM_CHANGED = "PLATFORM_CHANGED"
+    JUDGE_REJECTED = "JUDGE_REJECTED"
+    PUBLISH_FAILED = "PUBLISH_FAILED"
+    PERMANENT = "PERMANENT"
+
+def classify_failure(
+    error_msg: Optional[str],
+    verdict: Optional[Any] = None,
+    stage: Optional[Any] = None,
+    http_status: Optional[int] = None
+) -> FailureCode:
+    """Classifies a failure into one of 7 standardized FailureCodes."""
+    if http_status == 429:
+        return FailureCode.RATE_LIMITED
+    if http_status in (401, 403):
+        return FailureCode.AUTH_REQUIRED
+    if http_status in (502, 503, 504):
+        return FailureCode.TRANSIENT
+
+    msg_low = (str(error_msg) if error_msg else "").lower()
+
+    # Rate limiting
+    if any(k in msg_low for k in ["rate limit", "429", "too many requests", "retry-after", "cooling down", "quota exceeded"]):
+        return FailureCode.RATE_LIMITED
+
+    # Authentication or security barriers
+    if any(k in msg_low for k in [
+        "login required", "authentication required", "not authenticated", "auth_required",
+        "session expired", "login redirected", "unauthenticated", "captcha", "cloudflare challenge",
+        "turnstile", "recaptcha", "hcaptcha", "login barrier", "access denied", "expired session"
+    ]):
+        return FailureCode.AUTH_REQUIRED
+
+    # Platform DOM or selector changes
+    if any(k in msg_low for k in [
+        "changed selector", "stale selector", "locator failed", "missing editor",
+        "editor element not found", "wrong platform page", "dom mismatch", "readback mismatch",
+        "editor injection verification failed"
+    ]):
+        return FailureCode.PLATFORM_CHANGED
+
+    # Judge verdicts & submissions
+    v_str = verdict.value if hasattr(verdict, "value") else (str(verdict) if verdict else "")
+    if v_str in ("REJECTED", "WRONG_ANSWER", "COMPILATION_ERROR", "TIME_LIMIT_EXCEEDED", "MEMORY_LIMIT_EXCEEDED", "RUNTIME_ERROR"):
+        return FailureCode.JUDGE_REJECTED
+    if any(k in msg_low for k in [
+        "judge rejected", "wrong answer", "time limit exceeded", "memory limit exceeded",
+        "compilation error on judge", "runtime error"
+    ]):
+        return FailureCode.JUDGE_REJECTED
+
+    # Publishing failures
+    s_str = stage.value if hasattr(stage, "value") else (str(stage) if stage else "")
+    if s_str == "PUBLISH_FAILED" or any(k in msg_low for k in [
+        "publish failed", "git push failed", "git commit failed", "rebase conflict",
+        "failed to pull", "failed to clone", "github publish error"
+    ]):
+        return FailureCode.PUBLISH_FAILED
+
+    # Transient network / infrastructure issues
+    if any(k in msg_low for k in [
+        "timeout", "timed out", "econnreset", "connection reset", "connection refused",
+        "network error", "temporary", "cdp reconnection notice", "session closed",
+        "target closed", "browser disconnected", "worker lease expired", "heartbeat lost",
+        "503", "502", "504"
+    ]):
+        return FailureCode.TRANSIENT
+
+    # Permanent failures
+    if any(k in msg_low for k in [
+        "unsupported", "live rated contest", "contest active", "interactive problem",
+        "not found (404)", "invalid problem url", "max repairs exhausted"
+    ]):
+        return FailureCode.PERMANENT
+
+    # Default to PERMANENT for unknown non-transient errors
+    return FailureCode.PERMANENT
 
 class CircuitState(str, Enum):
     CLOSED = "CLOSED"
@@ -288,6 +390,14 @@ class PlatformRateLimiter:
         self.circuit_state: CircuitState = CircuitState.CLOSED
         self.circuit_open_until: float = 0.0
         self.retry_after_until: float = 0.0
+        self.last_failure_reason: str = ""
+
+    @property
+    def state(self) -> CircuitState:
+        now = time.time()
+        if self.circuit_state == CircuitState.OPEN and now >= self.circuit_open_until:
+            return CircuitState.HALF_OPEN
+        return self.circuit_state
 
     def is_paused(self) -> bool:
         now = time.time()
@@ -322,10 +432,13 @@ class PlatformRateLimiter:
         self.consecutive_failures = 0
         self.circuit_state = CircuitState.CLOSED
         self.retry_after_until = 0.0
+        self.last_failure_reason = ""
 
-    def record_failure(self, is_rate_limit: bool = False, retry_after: Optional[float] = None):
+    def record_failure(self, is_rate_limit: bool = False, retry_after: Optional[float] = None, reason: str = ""):
         now = time.time()
         self.consecutive_failures += 1
+        if reason:
+            self.last_failure_reason = reason
         if is_rate_limit:
             delay = retry_after if (retry_after is not None and retry_after > 0) else 30.0
             self.retry_after_until = now + delay
@@ -334,6 +447,34 @@ class PlatformRateLimiter:
             duration = self.base_open_duration * (self.backoff_factor ** max(0, self.consecutive_failures - self.failure_threshold))
             self.circuit_state = CircuitState.OPEN
             self.circuit_open_until = now + duration
+
+    def trip(self, reason: str = "", duration: Optional[float] = None):
+        """Immediately trips the circuit breaker to OPEN."""
+        now = time.time()
+        self.circuit_state = CircuitState.OPEN
+        self.circuit_open_until = now + (duration if duration is not None else self.base_open_duration)
+        self.last_failure_reason = reason or "Manually tripped / security barrier detected"
+
+    def reset(self):
+        """Resets the circuit breaker to CLOSED."""
+        self.consecutive_failures = 0
+        self.circuit_state = CircuitState.CLOSED
+        self.circuit_open_until = 0.0
+        self.retry_after_until = 0.0
+        self.last_failure_reason = ""
+
+    def get_status(self) -> Dict[str, Any]:
+        now = time.time()
+        cur_state = self.state
+        rem = max(0, int(self.circuit_open_until - now)) if cur_state == CircuitState.OPEN else 0
+        return {
+            "platform": self.platform,
+            "state": cur_state.value,
+            "consecutive_failures": self.consecutive_failures,
+            "open_until": self.circuit_open_until,
+            "remaining_seconds": rem,
+            "reason": self.last_failure_reason,
+        }
 
     def handle_http_response(self, status_code: int, headers: Optional[Dict[str, str]] = None):
         headers = headers or {}
@@ -346,11 +487,11 @@ class PlatformRateLimiter:
                     except ValueError:
                         retry_after_val = 30.0
                     break
-            self.record_failure(is_rate_limit=True, retry_after=retry_after_val)
+            self.record_failure(is_rate_limit=True, retry_after=retry_after_val, reason="HTTP 429 Too Many Requests")
         elif 200 <= status_code < 300:
             self.record_success()
         elif status_code >= 500:
-            self.record_failure(is_rate_limit=False)
+            self.record_failure(is_rate_limit=False, reason=f"HTTP {status_code} Server Error")
 
 _PLATFORM_LIMITERS: Dict[str, PlatformRateLimiter] = {
     "leetcode": PlatformRateLimiter("leetcode", min_interval=3.0, failure_threshold=3, base_open_duration=30.0),
@@ -365,6 +506,8 @@ def get_rate_limiter(platform: str) -> PlatformRateLimiter:
     if p not in _PLATFORM_LIMITERS:
         _PLATFORM_LIMITERS[p] = PlatformRateLimiter(p, min_interval=2.0)
     return _PLATFORM_LIMITERS[p]
+
+get_platform_limiter = get_rate_limiter
 
 async def detect_security_challenge_or_captcha(page: Page) -> SecurityChallengeDetection:
     """Detects CAPTCHA, Cloudflare challenges, and login walls without bypassing them."""
@@ -722,10 +865,38 @@ STRUCTURED_LOGGING = (
     or bool(os.environ.get("K_SERVICE") or os.environ.get("CLOUD_RUN_JOB"))
 )
 
-def log_event(level: str, message: str, **kwargs):
-    """Outputs structured JSON for Google Cloud Logging when enabled, else standard formatted print."""
+def log_event(
+    level: str,
+    message: str,
+    run_id: Optional[Union[int, str]] = None,
+    problem_id: Optional[Union[int, str]] = None,
+    platform: Optional[str] = None,
+    attempt_id: Optional[Union[int, str]] = None,
+    state: Optional[str] = None,
+    duration: Optional[float] = None,
+    failure_code: Optional[Union[str, FailureCode]] = None,
+    **kwargs
+):
+    """
+    Outputs structured JSON for Google Cloud Logging when enabled, else formatted console print.
+    Includes run_id, problem_id, platform, attempt_id, state, duration, and failure_code.
+    Safeguard: Never logs an unconfirmed submission as ACCEPTED.
+    """
     level = level.upper()
     redacted_msg = redact_sensitive_data(message)
+
+    # Requirement 11: Never log an unconfirmed submission as accepted
+    if state == "ACCEPTED":
+        confirmed = kwargs.get("confirmed", True)
+        if not confirmed or kwargs.get("unconfirmed", False) or kwargs.get("mode") in ["run", "save"]:
+            state = "SUBMITTED"
+
+    f_code_str = (
+        failure_code.value
+        if hasattr(failure_code, "value")
+        else (str(failure_code) if failure_code is not None else None)
+    )
+
     if STRUCTURED_LOGGING:
         payload = {
             "severity": level,
@@ -733,8 +904,24 @@ def log_event(level: str, message: str, **kwargs):
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "component": "autocoder",
         }
+        if run_id is not None:
+            payload["run_id"] = run_id
+        if problem_id is not None:
+            payload["problem_id"] = str(problem_id)
+        if platform is not None:
+            payload["platform"] = str(platform)
+        if attempt_id is not None:
+            payload["attempt_id"] = attempt_id
+        if state is not None:
+            payload["state"] = str(state)
+        if duration is not None:
+            payload["duration"] = round(float(duration), 3)
+        if f_code_str is not None:
+            payload["failure_code"] = f_code_str
+
         for k, v in kwargs.items():
-            payload[k] = redact_sensitive_data(str(v)) if isinstance(v, str) else v
+            if k not in payload and k not in ["confirmed", "unconfirmed"]:
+                payload[k] = redact_sensitive_data(str(v)) if isinstance(v, str) else v
         out = sys.stdout if level in ["INFO", "DEBUG"] else sys.stderr
         out.write(json.dumps(payload) + "\n")
         out.flush()
@@ -745,7 +932,108 @@ def log_event(level: str, message: str, **kwargs):
             "ERROR": "❌",
             "DEBUG": "🔍"
         }.get(level, "")
-        print(f"{prefix} {redacted_msg}")
+        extra_parts = []
+        if state:
+            extra_parts.append(f"state={state}")
+        if f_code_str:
+            extra_parts.append(f"code={f_code_str}")
+        if duration is not None:
+            extra_parts.append(f"{duration:.2f}s")
+        extra_str = f" [{', '.join(extra_parts)}]" if extra_parts else ""
+        print(f"{prefix} {redacted_msg}{extra_str}")
+
+class NotificationEvent(str, Enum):
+    AUTH_REQUIRED = "AUTH_REQUIRED"
+    QUOTA_MISSED = "QUOTA_MISSED"
+    RUN_FAILED = "RUN_FAILED"
+
+class NotificationManager:
+    """Dispatches notifications to opt-in channels (webhook/slack/discord/console) when triggered."""
+    def __init__(
+        self,
+        webhook_url: Optional[str] = None,
+        channel: Optional[str] = None,
+        enabled: Optional[bool] = None
+    ):
+        self.webhook_url = (webhook_url or os.environ.get("NOTIFICATION_WEBHOOK_URL", "")).strip()
+        self.channel = (channel or os.environ.get("NOTIFICATION_CHANNEL", "console" if self.webhook_url else "none")).lower()
+        if enabled is not None:
+            self.enabled = enabled
+        else:
+            self.enabled = (
+                os.environ.get("NOTIFICATION_ENABLED", "").lower() in ("true", "1", "yes")
+                or bool(self.webhook_url)
+            )
+
+    def send_notification(
+        self,
+        event: Union[NotificationEvent, str],
+        title: str,
+        message: str,
+        platform: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        if not self.enabled or self.channel in ("none", "disabled", "off"):
+            return False
+
+        ev_str = event.value if hasattr(event, "value") else str(event)
+        redacted_title = redact_sensitive_data(title)
+        redacted_msg = redact_sensitive_data(message)
+        redacted_details = {}
+        if details:
+            for k, v in details.items():
+                redacted_details[k] = redact_sensitive_data(str(v)) if isinstance(v, str) else v
+
+        payload = {
+            "event": ev_str,
+            "title": redacted_title,
+            "message": redacted_msg,
+            "platform": platform or "all",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "details": redacted_details
+        }
+
+        # Format for Slack/Discord webhooks if channel specified
+        post_data = payload
+        if self.channel == "slack":
+            post_data = {
+                "text": f"*{redacted_title}*\n{redacted_msg}",
+                "attachments": [{"fields": [{"title": k, "value": str(v), "short": True} for k, v in redacted_details.items()]}]
+            }
+        elif self.channel == "discord":
+            post_data = {
+                "content": f"**{redacted_title}**\n{redacted_msg}"
+            }
+
+        if self.webhook_url:
+            try:
+                req = urllib.request.Request(
+                    self.webhook_url,
+                    data=json.dumps(post_data).encode("utf-8"),
+                    headers={"Content-Type": "application/json", "User-Agent": "AutoCoder-Bot/1.0"},
+                    method="POST"
+                )
+                with urllib.request.urlopen(req, timeout=10.0) as resp:
+                    success = 200 <= resp.status < 300
+                    if success:
+                        log_event("INFO", f"Notification delivered successfully ({ev_str})", event=ev_str, platform=platform)
+                    return success
+            except Exception as e:
+                # Notification failures MUST NEVER crash the worker!
+                log_event("WARNING", f"Failed to deliver notification to {self.webhook_url}: {e}", event=ev_str, error=str(e))
+                return False
+        elif self.channel == "console":
+            print("\n" + "🔔" * 35)
+            print(f"🔔 [NOTIFICATION: {ev_str}] {redacted_title}")
+            print(f"   {redacted_msg}")
+            if platform:
+                print(f"   Platform: {platform.upper()}")
+            print("🔔" * 35 + "\n")
+            return True
+
+        return False
+
+NOTIFICATION_MANAGER = NotificationManager()
 
 def get_secret(secret_key: str, default: str = "") -> str:
     """Retrieves secret from Secret Manager if running on GCP with project id or secret path, else environment."""
@@ -1112,8 +1400,7 @@ def is_transient_error(error_msg: Optional[str]) -> bool:
     """Classifies whether an error message indicates a transient recoverable failure."""
     if not error_msg:
         return False
-    msg_low = error_msg.lower()
-    return any(sub in msg_low for sub in TRANSIENT_ERROR_SUBSTRINGS)
+    return classify_failure(error_msg) == FailureCode.TRANSIENT
 
 def normalize_problem_identity(url_or_slug: str, platform: Optional[str] = None) -> Tuple[str, str]:
     """
@@ -1287,6 +1574,8 @@ class DatabaseManager:
                     status TEXT NOT NULL DEFAULT 'DISCOVERED',
                     claimed_by TEXT,
                     claimed_at REAL,
+                    heartbeat_at REAL,
+                    lease_timeout REAL DEFAULT 300.0,
                     failure_reason TEXT,
                     failure_count INTEGER DEFAULT 0,
                     created_at TEXT NOT NULL,
@@ -1303,6 +1592,7 @@ class DatabaseManager:
                     attempted_count INTEGER DEFAULT 0,
                     generated_count INTEGER DEFAULT 0,
                     compiled_count INTEGER DEFAULT 0,
+                    tested_count INTEGER DEFAULT 0,
                     accepted_count INTEGER DEFAULT 0,
                     published_count INTEGER DEFAULT 0,
                     failed_count INTEGER DEFAULT 0,
@@ -1390,15 +1680,42 @@ class DatabaseManager:
                     created_at TEXT NOT NULL
                 )
             """)
+            self._execute(conn, """
+                CREATE TABLE IF NOT EXISTS retry_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    problem_id INTEGER NOT NULL REFERENCES problems(id),
+                    platform TEXT NOT NULL,
+                    canonical_id TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    retry_count INTEGER DEFAULT 0,
+                    max_retries INTEGER DEFAULT 3,
+                    failure_code TEXT NOT NULL,
+                    last_error TEXT,
+                    next_retry_at REAL NOT NULL,
+                    backoff_seconds REAL NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'PENDING',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(platform, canonical_id)
+                )
+            """)
             self._execute(conn, "CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY, migrated_at TEXT)")
             self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_problems_lookup ON problems(platform, canonical_id)")
             self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_problems_status ON problems(status)")
             self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_daily_runs_lookup ON daily_runs(run_date, platform)")
             self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_judge_verdicts_lookup ON judge_verdicts(platform, canonical_id)")
             self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_sample_test_attempt ON sample_test_results(attempt_id)")
+            self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_retry_queue_status_next ON retry_queue(status, next_retry_at)")
 
             if not self.is_postgres:
                 # Add columns to existing SQLite tables if missing
+                cursor.execute("PRAGMA table_info(problems)")
+                prob_cols = [col[1] for col in cursor.fetchall()]
+                if "heartbeat_at" not in prob_cols:
+                    cursor.execute("ALTER TABLE problems ADD COLUMN heartbeat_at REAL")
+                if "lease_timeout" not in prob_cols:
+                    cursor.execute("ALTER TABLE problems ADD COLUMN lease_timeout REAL DEFAULT 300.0")
+
                 cursor.execute("PRAGMA table_info(attempts)")
                 att_cols = [col[1] for col in cursor.fetchall()]
                 if "compiler_output" not in att_cols:
@@ -1412,6 +1729,8 @@ class DatabaseManager:
                     cursor.execute("ALTER TABLE daily_runs ADD COLUMN locked_by TEXT")
                 if "locked_at" not in dr_cols:
                     cursor.execute("ALTER TABLE daily_runs ADD COLUMN locked_at REAL")
+                if "tested_count" not in dr_cols:
+                    cursor.execute("ALTER TABLE daily_runs ADD COLUMN tested_count INTEGER DEFAULT 0")
 
             self._execute(conn, "COMMIT")
 
@@ -1562,10 +1881,11 @@ class DatabaseManager:
         canonical_id: str,
         url: str,
         worker_id: str = "default",
-        lease_timeout_sec: float = 600.0
+        lease_timeout_sec: float = 300.0
     ) -> bool:
         """
         Atomically claims a problem for processing using a SQLite transaction with BEGIN IMMEDIATE.
+        Supports safe reclamation of expired leases by recovered workers.
         Returns True if claim acquired; False if already accepted or actively claimed by another worker.
         """
         now = time.time()
@@ -1574,41 +1894,78 @@ class DatabaseManager:
             cursor = conn.cursor()
             cursor.execute("BEGIN IMMEDIATE")
             cursor.execute(
-                "SELECT id, status, claimed_by, claimed_at FROM problems WHERE platform = ? AND canonical_id = ?",
+                "SELECT id, status, claimed_by, claimed_at, heartbeat_at, lease_timeout FROM problems WHERE platform = ? AND canonical_id = ?",
                 (platform, canonical_id)
             )
             row = cursor.fetchone()
             if row is None:
                 cursor.execute(
                     """
-                    INSERT INTO problems (platform, canonical_id, url, status, claimed_by, claimed_at, created_at, updated_at)
-                    VALUES (?, ?, ?, 'IN_PROGRESS', ?, ?, ?, ?)
+                    INSERT INTO problems (platform, canonical_id, url, status, claimed_by, claimed_at, heartbeat_at, lease_timeout, created_at, updated_at)
+                    VALUES (?, ?, ?, 'IN_PROGRESS', ?, ?, ?, ?, ?, ?)
                     """,
-                    (platform, canonical_id, url, worker_id, now, now_iso, now_iso)
+                    (platform, canonical_id, url, worker_id, now, now, lease_timeout_sec, now_iso, now_iso)
                 )
                 cursor.execute("COMMIT")
                 return True
 
-            prob_id, status, claimed_by, claimed_at = row[0], row[1], row[2], row[3]
+            prob_id, status, claimed_by, claimed_at, heartbeat_at, db_lease_timeout = (
+                row[0], row[1], row[2], row[3],
+                row[4] if len(row) > 4 else None,
+                row[5] if len(row) > 5 else None
+            )
             if status == "ACCEPTED":
                 cursor.execute("COMMIT")
                 return False
 
             if status == "IN_PROGRESS":
-                if claimed_by != worker_id and claimed_at and (now - claimed_at) < lease_timeout_sec:
+                ref_time = heartbeat_at or claimed_at
+                eff_timeout = db_lease_timeout or lease_timeout_sec
+                if claimed_by != worker_id and ref_time and (now - ref_time) < eff_timeout:
                     cursor.execute("COMMIT")
                     return False
 
             cursor.execute(
                 """
                 UPDATE problems
-                SET status = 'IN_PROGRESS', claimed_by = ?, claimed_at = ?, updated_at = ?
+                SET status = 'IN_PROGRESS', claimed_by = ?, claimed_at = ?, heartbeat_at = ?, lease_timeout = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (worker_id, now, now_iso, prob_id)
+                (worker_id, now, now, lease_timeout_sec, now_iso, prob_id)
             )
             cursor.execute("COMMIT")
             return True
+
+    def record_heartbeat(self, platform: str, canonical_id: str, worker_id: str = "default") -> bool:
+        """Updates the heartbeat timestamp for an in-progress problem to prevent lease expiration."""
+        plat, cid = normalize_problem_identity(canonical_id, platform)
+        now = time.time()
+        now_iso = get_kolkata_now().isoformat()
+        with self.get_connection() as conn:
+            self._execute(conn, "BEGIN IMMEDIATE")
+            res = self._execute(
+                conn,
+                """
+                UPDATE problems
+                SET heartbeat_at = ?, updated_at = ?
+                WHERE platform = ? AND canonical_id = ? AND status = 'IN_PROGRESS'
+                """,
+                (now, now_iso, plat, cid)
+            )
+            updated = res.rowcount > 0
+            self._execute(conn, "COMMIT")
+            return updated
+
+    def get_problem_id(self, platform: str, canonical_id: str) -> Optional[int]:
+        plat, cid = normalize_problem_identity(canonical_id, platform)
+        with self.get_connection() as conn:
+            cur = self._execute(
+                conn,
+                "SELECT id FROM problems WHERE platform = ? AND canonical_id = ?",
+                (plat, cid)
+            )
+            row = cur.fetchone()
+            return row[0] if row else None
 
     def release_problem(
         self,
@@ -1649,7 +2006,7 @@ class DatabaseManager:
             cursor.execute(
                 """
                 UPDATE problems
-                SET status = ?, claimed_by = NULL, claimed_at = NULL,
+                SET status = ?, claimed_by = NULL, claimed_at = NULL, heartbeat_at = NULL,
                     failure_reason = ?, failure_count = ?, updated_at = ?
                 WHERE id = ?
                 """,
@@ -1729,6 +2086,7 @@ class DatabaseManager:
         attempted: int = 0,
         generated: int = 0,
         compiled: int = 0,
+        tested: int = 0,
         accepted: int = 0,
         published: int = 0,
         failed: int = 0,
@@ -1743,20 +2101,21 @@ class DatabaseManager:
                 SET attempted_count = attempted_count + ?,
                     generated_count = generated_count + ?,
                     compiled_count = compiled_count + ?,
+                    tested_count = tested_count + ?,
                     accepted_count = accepted_count + ?,
                     published_count = published_count + ?,
                     failed_count = failed_count + ?,
                     skipped_count = skipped_count + ?
                 WHERE id = ?
                 """,
-                (attempted, generated, compiled, accepted, published, failed, skipped, run_id)
+                (attempted, generated, compiled, tested, accepted, published, failed, skipped, run_id)
             )
             cursor.execute("COMMIT")
 
-    def recover_expired_leases(self, lease_timeout_sec: float = 600.0) -> int:
+    def recover_expired_leases(self, lease_timeout_sec: float = 300.0) -> int:
         """
-        Recovers problems stranded in IN_PROGRESS status due to worker termination, container crash, or SIGTERM.
-        Resets them to TRANSIENT_FAILURE and unassigns the worker claim.
+        Recovers problems stranded in IN_PROGRESS status due to worker termination, container crash, or lost heartbeats.
+        Resets them to TRANSIENT_FAILURE and automatically enqueues them into the persistent retry queue.
         """
         now = time.time()
         now_iso = get_kolkata_now().isoformat()
@@ -1766,7 +2125,7 @@ class DatabaseManager:
                 cur = self._execute(
                     conn,
                     """
-                    SELECT id, platform, canonical_id FROM problems
+                    SELECT id, platform, canonical_id, url FROM problems
                     WHERE status = 'IN_PROGRESS'
                     """
                 )
@@ -1775,10 +2134,13 @@ class DatabaseManager:
                 cur = self._execute(
                     conn,
                     """
-                    SELECT id, platform, canonical_id FROM problems
-                    WHERE status = 'IN_PROGRESS' AND (claimed_at IS NULL OR claimed_at < ?)
+                    SELECT id, platform, canonical_id, url FROM problems
+                    WHERE status = 'IN_PROGRESS' AND (
+                        (heartbeat_at IS NOT NULL AND heartbeat_at < ?)
+                        OR (heartbeat_at IS NULL AND (claimed_at IS NULL OR claimed_at < ?))
+                    )
                     """,
-                    (cutoff,)
+                    (cutoff, cutoff)
                 )
             rows = cur.fetchall()
             if not rows:
@@ -1792,17 +2154,217 @@ class DatabaseManager:
                 f"""
                 UPDATE problems
                 SET status = 'TRANSIENT_FAILURE',
-                    failure_reason = 'Worker lease expired or aborted (crash recovery)',
+                    failure_reason = 'Worker lease expired / heartbeat lost (stuck job recovered)',
                     claimed_by = NULL,
                     claimed_at = NULL,
+                    heartbeat_at = NULL,
                     updated_at = ?
                 WHERE id IN ({placeholders})
                 """,
                 [now_iso] + prob_ids
             )
             self._execute(conn, "COMMIT")
-            log_event("INFO", f"Crash recovery: released {len(prob_ids)} expired problem lease(s)")
-            return len(prob_ids)
+
+        # Automatically enqueue each recovered stuck problem into the persistent retry queue
+        for r in rows:
+            p_id, plat, c_id = r[0], r[1], r[2]
+            p_url = r[3] if len(r) > 3 and r[3] else f"https://{plat}.com/problem/{c_id}"
+            self.enqueue_retry(
+                problem_id=p_id,
+                platform=plat,
+                canonical_id=c_id,
+                url=p_url,
+                failure_code=FailureCode.TRANSIENT,
+                error_msg="Worker lease expired / heartbeat lost (stuck job recovered)"
+            )
+
+        log_event("INFO", f"Crash recovery: released {len(prob_ids)} expired problem lease(s)")
+        return len(prob_ids)
+
+    def enqueue_retry(
+        self,
+        problem_id: int,
+        platform: str,
+        canonical_id: str,
+        url: str,
+        failure_code: Union[str, FailureCode],
+        error_msg: str,
+        max_retries: int = 3,
+        base_backoff: float = 30.0,
+        max_backoff: float = 1800.0,
+    ) -> bool:
+        """
+        Adds or updates a problem in the persistent retry queue.
+        Requirement 5: Retry only transient failures automatically.
+        Uses exponential backoff with jitter.
+        """
+        f_code_str = failure_code.value if hasattr(failure_code, "value") else str(failure_code)
+        if f_code_str != FailureCode.TRANSIENT.value:
+            return False
+
+        now = time.time()
+        now_iso = get_kolkata_now().isoformat()
+        with self.get_connection() as conn:
+            self._execute(conn, "BEGIN IMMEDIATE")
+            cur = self._execute(
+                conn,
+                "SELECT id, retry_count, max_retries FROM retry_queue WHERE platform = ? AND canonical_id = ?",
+                (platform, canonical_id)
+            )
+            row = cur.fetchone()
+            if row:
+                q_id, cur_count, limit = row[0], row[1], row[2]
+                if cur_count >= limit:
+                    self._execute(
+                        conn,
+                        """
+                        UPDATE retry_queue
+                        SET status = 'EXHAUSTED',
+                            failure_code = ?,
+                            last_error = ?,
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (f_code_str, redact_sensitive_data(error_msg), now_iso, q_id)
+                    )
+                    self._execute(conn, "COMMIT")
+                    return False
+
+                new_count = cur_count + 1
+                raw_backoff = min(base_backoff * (2 ** (new_count - 1)), max_backoff)
+                jitter = random.uniform(-0.15, 0.15) * raw_backoff
+                backoff = max(1.0, raw_backoff + jitter)
+                next_retry = now + backoff
+
+                self._execute(
+                    conn,
+                    """
+                    UPDATE retry_queue
+                    SET retry_count = ?,
+                        failure_code = ?,
+                        last_error = ?,
+                        next_retry_at = ?,
+                        backoff_seconds = ?,
+                        status = 'PENDING',
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (new_count, f_code_str, redact_sensitive_data(error_msg), next_retry, round(backoff, 2), now_iso, q_id)
+                )
+                self._execute(conn, "COMMIT")
+                return True
+            else:
+                raw_backoff = base_backoff
+                jitter = random.uniform(-0.15, 0.15) * raw_backoff
+                backoff = max(1.0, raw_backoff + jitter)
+                next_retry = now + backoff
+
+                self._execute(
+                    conn,
+                    """
+                    INSERT INTO retry_queue (
+                        problem_id, platform, canonical_id, url,
+                        retry_count, max_retries, failure_code, last_error,
+                        next_retry_at, backoff_seconds, status, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, 'PENDING', ?, ?)
+                    """,
+                    (
+                        problem_id, platform, canonical_id, url,
+                        max_retries, f_code_str, redact_sensitive_data(error_msg),
+                        next_retry, round(backoff, 2), now_iso, now_iso
+                    )
+                )
+                self._execute(conn, "COMMIT")
+                return True
+
+    def get_pending_retries(
+        self,
+        platform: Optional[str] = None,
+        limit: int = 10,
+        include_future: bool = False
+    ) -> List[Dict[str, Any]]:
+        """Retrieves due problems from the persistent retry queue."""
+        now = time.time()
+        with self.get_connection() as conn:
+            if include_future:
+                if platform:
+                    cur = self._execute(conn, "SELECT * FROM retry_queue WHERE status = 'PENDING' AND platform = ? ORDER BY next_retry_at ASC LIMIT ?", (platform, limit))
+                else:
+                    cur = self._execute(conn, "SELECT * FROM retry_queue WHERE status = 'PENDING' ORDER BY next_retry_at ASC LIMIT ?", (limit,))
+            else:
+                if platform:
+                    cur = self._execute(conn, "SELECT * FROM retry_queue WHERE status = 'PENDING' AND next_retry_at <= ? AND platform = ? ORDER BY next_retry_at ASC LIMIT ?", (now, platform, limit))
+                else:
+                    cur = self._execute(conn, "SELECT * FROM retry_queue WHERE status = 'PENDING' AND next_retry_at <= ? ORDER BY next_retry_at ASC LIMIT ?", (now, limit))
+            rows = cur.fetchall()
+            cols = [desc[0] for desc in cur.description] if cur.description else []
+            return [dict(zip(cols, r)) for r in rows]
+
+    def get_all_retry_queue_items(self, platform: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Retrieves all items from the persistent retry queue for status and inspection."""
+        with self.get_connection() as conn:
+            if platform:
+                cur = self._execute(conn, "SELECT * FROM retry_queue WHERE platform = ? ORDER BY id DESC", (platform,))
+            else:
+                cur = self._execute(conn, "SELECT * FROM retry_queue ORDER BY id DESC")
+            rows = cur.fetchall()
+            cols = [desc[0] for desc in cur.description] if cur.description else []
+            return [dict(zip(cols, r)) for r in rows]
+
+    def mark_retry_completed(self, platform: str, canonical_id: str):
+        now_iso = get_kolkata_now().isoformat()
+        with self.get_connection() as conn:
+            self._execute(conn, "BEGIN IMMEDIATE")
+            self._execute(
+                conn,
+                "UPDATE retry_queue SET status = 'COMPLETED', updated_at = ? WHERE platform = ? AND canonical_id = ?",
+                (now_iso, platform, canonical_id)
+            )
+            self._execute(conn, "COMMIT")
+
+    def get_failure_breakdown(self, platform: Optional[str] = None) -> Dict[str, Dict[str, int]]:
+        """Returns failure code counts grouped by platform."""
+        breakdown: Dict[str, Dict[str, int]] = {
+            p: {fc.value: 0 for fc in FailureCode}
+            for p in ["leetcode", "codeforces", "codechef", "hackerrank", "hackerearth"]
+        }
+        with self.get_connection() as conn:
+            if platform:
+                cur = self._execute(
+                    conn,
+                    "SELECT platform, error FROM attempts WHERE error IS NOT NULL AND platform = ?",
+                    (platform,)
+                )
+            else:
+                cur = self._execute(
+                    conn,
+                    "SELECT platform, error FROM attempts WHERE error IS NOT NULL"
+                )
+            rows = cur.fetchall()
+            for r in rows:
+                plat = (r[0] or "").lower()
+                err = r[1]
+                if plat not in breakdown:
+                    breakdown[plat] = {fc.value: 0 for fc in FailureCode}
+                fc = classify_failure(err)
+                breakdown[plat][fc.value] += 1
+        return breakdown
+
+    def get_active_leases(self) -> List[Dict[str, Any]]:
+        """Returns currently active in-progress problem leases with heartbeat diagnostics."""
+        with self.get_connection() as conn:
+            cur = self._execute(
+                conn,
+                """
+                SELECT id, platform, canonical_id, url, claimed_by, claimed_at, heartbeat_at, lease_timeout
+                FROM problems
+                WHERE status = 'IN_PROGRESS'
+                ORDER BY claimed_at ASC
+                """
+            )
+            rows = cur.fetchall()
+            cols = [desc[0] for desc in cur.description] if cur.description else []
+            return [dict(zip(cols, r)) for r in rows]
 
     def acquire_daily_run_lock(
         self,
@@ -2005,7 +2567,7 @@ class DatabaseManager:
             cursor.execute(
                 """
                 SELECT platform, target_quota, attempted_count, generated_count, compiled_count,
-                       accepted_count, published_count, failed_count, skipped_count, status
+                       tested_count, accepted_count, published_count, failed_count, skipped_count, status
                 FROM daily_runs
                 WHERE run_date = ?
                 ORDER BY platform
@@ -6596,6 +7158,13 @@ async def solve_platform_quota(
             db.increment_daily_run_counts(run_id, skipped=1)
             continue
 
+        # Check circuit breaker before attempting candidate
+        limiter = get_platform_limiter(platform)
+        if limiter.is_paused():
+            log_event("WARNING", f"Circuit breaker OPEN for {platform}. Platform is paused.", run_id=run_id, platform=platform, failure_code=FailureCode.RATE_LIMITED)
+            break
+
+        prob_start = time.time()
         # Transactional atomic claim
         claimed = db.claim_problem(platform, canonical_id, url=url, worker_id=worker_id)
         if not claimed:
@@ -6603,6 +7172,7 @@ async def solve_platform_quota(
             db.increment_daily_run_counts(run_id, skipped=1)
             continue
 
+        db.record_heartbeat(platform, canonical_id, worker_id)
         attempt_count += 1
         db.increment_daily_run_counts(run_id, attempted=1)
         print(f"\n👉 [{platform.upper()}] Attempt {attempt_count}/{max_attempts} | Target Progress: {accepted_count}/{target_accepted} Accepted")
@@ -6631,6 +7201,8 @@ async def solve_platform_quota(
             print(f"   ❌ Unhandled error processing {url}: {e}")
             result = ProcessResult(stage=ProcessStage.SUBMITTED, success=False, url=url, error=str(e))
 
+        db.record_heartbeat(platform, canonical_id, worker_id)
+
         # Check stages reached
         if result.stage.value in [ProcessStage.GENERATED.value, ProcessStage.COMPILED.value, ProcessStage.TESTED.value,
                                   ProcessStage.SUBMITTED.value, ProcessStage.ACCEPTED.value, ProcessStage.PUBLISHED.value,
@@ -6640,6 +7212,10 @@ async def solve_platform_quota(
                                   ProcessStage.SUBMITTED.value, ProcessStage.ACCEPTED.value, ProcessStage.PUBLISHED.value,
                                   ProcessStage.PUBLISH_FAILED.value]:
             db.increment_daily_run_counts(run_id, compiled=1)
+        if result.stage.value in [ProcessStage.TESTED.value,
+                                  ProcessStage.SUBMITTED.value, ProcessStage.ACCEPTED.value, ProcessStage.PUBLISHED.value,
+                                  ProcessStage.PUBLISH_FAILED.value]:
+            db.increment_daily_run_counts(run_id, tested=1)
 
         # Check for publish failure on confirmed accepted solution: retry publishing without resubmitting
         if result.stage == ProcessStage.PUBLISH_FAILED and result.verdict and result.verdict.state == VerdictState.ACCEPTED:
@@ -6662,7 +7238,8 @@ async def solve_platform_quota(
         is_successful = (result.success and result.published) if mode in ["submit", "both"] else result.success
 
         err_msg = result.error or (result.verdict.message if result.verdict else None)
-        transient = is_transient_error(err_msg)
+        f_code = classify_failure(err_msg, verdict=result.verdict.state if result.verdict else None, stage=result.stage)
+        transient = (f_code == FailureCode.TRANSIENT)
 
         attempt_id = db.record_attempt(
             platform=platform,
@@ -6680,8 +7257,12 @@ async def solve_platform_quota(
         if result.sample_results:
             db.record_sample_test_results(attempt_id, result.sample_results)
 
+        prob_dur = time.time() - prob_start
+
         if is_successful:
             accepted_count += 1
+            limiter.record_success()
+            db.mark_retry_completed(platform, canonical_id)
             db.increment_daily_run_counts(run_id, accepted=1)
             if result.published:
                 db.increment_daily_run_counts(run_id, published=1)
@@ -6696,6 +7277,10 @@ async def solve_platform_quota(
                 )
             SolvedRegistry.mark_solved(platform, url, verdict=result.verdict)
             print(f"🎉 [{platform.upper()}] Progress: {accepted_count}/{target_accepted} ACCEPTED & COMMITTED TO GITHUB!\n")
+            if mode in ["submit", "both"] and result.verdict and result.verdict.state == VerdictState.ACCEPTED:
+                log_event("INFO", f"Problem accepted by judge: {canonical_id}", run_id=run_id, problem_id=canonical_id, platform=platform, attempt_id=attempt_id, state="ACCEPTED", duration=prob_dur, confirmed=True)
+            else:
+                log_event("INFO", f"Problem processed in mode={mode}: {canonical_id}", run_id=run_id, problem_id=canonical_id, platform=platform, attempt_id=attempt_id, state=result.stage.value, duration=prob_dur)
             if not is_offline:
                 await asyncio.sleep(6)
         else:
@@ -6709,6 +7294,43 @@ async def solve_platform_quota(
                 failure_reason=err_msg,
                 is_transient=transient
             )
+            limiter.record_failure(is_rate_limit=(f_code == FailureCode.RATE_LIMITED), reason=err_msg or "")
+
+            # Requirement 5: Retry only transient failures automatically
+            if transient:
+                p_id = db.get_problem_id(platform, canonical_id)
+                if p_id:
+                    db.enqueue_retry(
+                        problem_id=p_id,
+                        platform=platform,
+                        canonical_id=canonical_id,
+                        url=url,
+                        failure_code=FailureCode.TRANSIENT,
+                        error_msg=err_msg or "Transient failure"
+                    )
+
+            if f_code == FailureCode.AUTH_REQUIRED:
+                limiter.trip(reason=f"Authentication barrier: {err_msg}")
+                NOTIFICATION_MANAGER.send_notification(
+                    NotificationEvent.AUTH_REQUIRED,
+                    f"Authentication Required on {platform.upper()}",
+                    f"Session expired or anti-bot challenge detected on {platform.upper()}: {err_msg}",
+                    platform=platform,
+                    details={"error": err_msg, "url": url}
+                )
+
+            log_event(
+                "ERROR",
+                f"Problem failed for {canonical_id}: {err_msg}",
+                run_id=run_id,
+                problem_id=canonical_id,
+                platform=platform,
+                attempt_id=attempt_id,
+                state=result.stage.value,
+                duration=prob_dur,
+                failure_code=f_code
+            )
+
             if result.stage == ProcessStage.PUBLISH_FAILED:
                 db.record_publish_job(
                     platform=platform,
@@ -6726,6 +7348,14 @@ async def solve_platform_quota(
 
             if page and getattr(page, "_anti_bot_blocked", False):
                 page._anti_bot_blocked = False
+                limiter.trip(reason="Cloudflare Anti-Bot verification")
+                NOTIFICATION_MANAGER.send_notification(
+                    NotificationEvent.AUTH_REQUIRED,
+                    f"Anti-Bot Barrier on {platform.upper()}",
+                    f"Cloudflare / captcha detected on {platform.upper()}.",
+                    platform=platform,
+                    details={"url": url}
+                )
                 print(f"\n🛑 [{platform.upper()}] Platform is gated by Cloudflare Anti-Bot verification.")
                 print(f"🛑 Stopping {platform.upper()} attempts to avoid continuous looping.")
                 print(f"📁 Generated Java solution has been saved to: {SOLUTIONS_DIR.resolve()}\n")
@@ -6742,6 +7372,13 @@ async def solve_platform_quota(
         run_status = "COMPLETED"
     else:
         run_status = "SHORTFALL"
+        NOTIFICATION_MANAGER.send_notification(
+            NotificationEvent.QUOTA_MISSED,
+            f"Daily Quota Missed on {platform.upper()}",
+            f"Achieved {accepted_count}/{target_accepted} verified accepted solutions on {platform.upper()} ({run_status}).",
+            platform=platform,
+            details={"accepted": accepted_count, "target": target_accepted, "shortfall": target_accepted - accepted_count}
+        )
     db.complete_daily_run(run_id, status=run_status)
     print(f"\n📊 [{platform.upper()}] Quota Summary: {accepted_count}/{target_accepted} verified accepted solutions ({run_status}).")
     return accepted_count, browser, context, page
@@ -7104,7 +7741,7 @@ async def run_daily_scheduler(scheduled_time_str: str, batch_coro_func):
 # ==============================================================================
 # CLI Helper Utilities & Subcommands
 # ==============================================================================
-def print_status_summary(db: Optional[DatabaseManager] = None):
+def print_status_summary(detailed: bool = False, db: Optional[DatabaseManager] = None):
     """Prints a clear, human-readable summary table of verified solved problems and daily quotas."""
     database = db or SolvedRegistry.get_db()
     all_solved = SolvedRegistry.get_all_solved(force_refresh=True)
@@ -7143,13 +7780,68 @@ def print_status_summary(db: Optional[DatabaseManager] = None):
 
     print(f"\n  📅 Today's Quota Runs ({today_str} Asia/Kolkata):")
     if daily_rows:
-        print(f"  {'Platform':<14} {'Target':>7} {'Attempted':>10} {'Generated':>10} {'Compiled':>9} {'Accepted':>9} {'Published':>10} {'Failed':>7} {'Skipped':>8} {'Status':<10}")
-        print("  " + "─" * 98)
+        print(f"  {'Platform':<14} {'Target':>7} {'Attempted':>10} {'Generated':>10} {'Compiled':>9} {'Tested':>8} {'Accepted':>9} {'Published':>10} {'Failed':>7} {'Skipped':>8} {'Status':<10}")
+        print("  " + "─" * 108)
         for r in daily_rows:
             p = display_names.get(r.get("platform", ""), r.get("platform", "").upper())
-            print(f"  {p:<14} {r.get('target_quota', 0):>7} {r.get('attempted_count', 0):>10} {r.get('generated_count', 0):>10} {r.get('compiled_count', 0):>9} {r.get('accepted_count', 0):>9} {r.get('published_count', 0):>10} {r.get('failed_count', 0):>7} {r.get('skipped_count', 0):>8} {r.get('status', ''):<10}")
+            print(f"  {p:<14} {r.get('target_quota', 0):>7} {r.get('attempted_count', 0):>10} {r.get('generated_count', 0):>10} {r.get('compiled_count', 0):>9} {r.get('tested_count', 0):>8} {r.get('accepted_count', 0):>9} {r.get('published_count', 0):>10} {r.get('failed_count', 0):>7} {r.get('skipped_count', 0):>8} {r.get('status', ''):<10}")
     else:
         print("  (No runs recorded yet today)")
+
+    if detailed:
+        print("\n" + "=" * 76)
+        print("      🔍 DETAILED MONITORING & RECOVERY METRICS (--detailed)")
+        print("=" * 76)
+
+        # 1. Failure Breakdown by Platform & Code
+        breakdown = database.get_failure_breakdown()
+        print("\n  ⚠️ Failure Classification Breakdown:")
+        print(f"  {'Platform':<14} {'Transient':>10} {'AuthReq':>9} {'RateLimit':>10} {'DOMChanged':>11} {'Rejected':>9} {'PubFailed':>10} {'Permanent':>10}")
+        print("  " + "─" * 88)
+        for p, name in display_names.items():
+            b = breakdown.get(p, {})
+            print(f"  {name:<14} {b.get(FailureCode.TRANSIENT.value, 0):>10} {b.get(FailureCode.AUTH_REQUIRED.value, 0):>9} {b.get(FailureCode.RATE_LIMITED.value, 0):>10} {b.get(FailureCode.PLATFORM_CHANGED.value, 0):>11} {b.get(FailureCode.JUDGE_REJECTED.value, 0):>9} {b.get(FailureCode.PUBLISH_FAILED.value, 0):>10} {b.get(FailureCode.PERMANENT.value, 0):>10}")
+
+        # 2. Circuit Breakers Status
+        print("\n  ⚡ Per-Platform Circuit Breakers:")
+        print(f"  {'Platform':<14} {'State':<12} {'Failures':>9} {'Cooldown':>12} {'Reason':<24}")
+        print("  " + "─" * 74)
+        for p, name in display_names.items():
+            lim = get_platform_limiter(p)
+            st = lim.get_status()
+            cd = f"{st['remaining_seconds']}s remaining" if st["state"] == "OPEN" else "N/A"
+            reason = st.get("reason", "")[:24]
+            print(f"  {name:<14} {st['state']:<12} {st['consecutive_failures']:>9} {cd:>12} {reason:<24}")
+
+        # 3. Persistent Retry Queue
+        q_items = database.get_all_retry_queue_items()
+        print(f"\n  🔄 Persistent Retry Queue ({len(q_items)} items):")
+        if q_items:
+            print(f"  {'ID':<5} {'Platform':<12} {'Canonical ID':<22} {'Code':<15} {'Retries':>8} {'Next Due':<14} {'Status':<10}")
+            print("  " + "─" * 90)
+            now_ts = time.time()
+            for it in q_items[:15]:
+                due_in = max(0, int(it.get("next_retry_at", 0) - now_ts))
+                due_str = f"in {due_in}s" if due_in > 0 else "DUE"
+                print(f"  {it.get('id', ''):<5} {it.get('platform', ''):<12} {it.get('canonical_id', '')[:20]:<22} {it.get('failure_code', ''):<15} {it.get('retry_count', 0):>8} {due_str:<14} {it.get('status', ''):<10}")
+        else:
+            print("  (Retry queue is empty)")
+
+        # 4. Active Worker Leases & Heartbeats
+        leases = database.get_active_leases()
+        print(f"\n  🔒 Active Worker Leases & Heartbeats ({len(leases)} active):")
+        if leases:
+            print(f"  {'ID':<5} {'Platform':<12} {'Canonical ID':<20} {'Claimed By':<16} {'Claim Age':>10} {'Heartbeat':>10} {'Health':<10}")
+            print("  " + "─" * 87)
+            now_ts = time.time()
+            for l in leases:
+                c_age = int(now_ts - l.get("claimed_at", now_ts)) if l.get("claimed_at") else 0
+                hb_age = int(now_ts - l.get("heartbeat_at", now_ts)) if l.get("heartbeat_at") else c_age
+                tout = l.get("lease_timeout") or 300.0
+                health = "EXPIRED" if hb_age > tout else "HEALTHY"
+                print(f"  {l.get('id', ''):<5} {l.get('platform', ''):<12} {l.get('canonical_id', '')[:18]:<20} {l.get('claimed_by', '')[:14]:<16} {c_age:>9}s {hb_age:>9}s {health:<10}")
+        else:
+            print("  (No in-progress leases)")
 
     print("\n" + "=" * 76)
     print(f"  📁 SQLite Database  : {DEFAULT_DB_FILE.resolve()}")
@@ -7158,6 +7850,54 @@ def print_status_summary(db: Optional[DatabaseManager] = None):
     if GITHUB_USERNAME:
         print(f"  🐙 GitHub Profile   : https://github.com/{GITHUB_USERNAME}")
     print("=" * 76 + "\n")
+
+async def handle_retry_failed(
+    dry_run: bool = True,
+    platform: Optional[str] = None,
+    max_retries: int = 3,
+    db: Optional[DatabaseManager] = None
+) -> int:
+    """CLI handler for autocoder retry-failed [--dry-run]."""
+    database = db or SolvedRegistry.get_db()
+    items = database.get_all_retry_queue_items(platform=platform)
+    now = time.time()
+
+    print("\n" + "=" * 80)
+    mode_str = "DRY-RUN SIMULATION" if dry_run else "EXECUTION"
+    print(f"      🔄 AutoCoder AI: Retry Failed Problems ({mode_str})")
+    print("=" * 80)
+
+    eligible = [it for it in items if it.get("status") in ("PENDING", "EXHAUSTED")]
+
+    if not eligible:
+        print("  ℹ️ No failed problems currently in the retry queue.")
+        print("=" * 80 + "\n")
+        return 0
+
+    print(f"  Found {len(eligible)} candidate problem(s) eligible for retry:")
+    print(f"  {'ID':<5} {'Platform':<12} {'Canonical ID':<22} {'Failure Code':<15} {'Retries':>8} {'Status':<10} {'Next Retry':<12}")
+    print("  " + "─" * 90)
+
+    for it in eligible:
+        p = it.get("platform", "").capitalize()
+        cid = it.get("canonical_id", "")[:20]
+        code = it.get("failure_code", "")
+        retries = f"{it.get('retry_count', 0)}/{it.get('max_retries', max_retries)}"
+        st = it.get("status", "")
+        next_r = it.get("next_retry_at", 0)
+        due_sec = max(0, int(next_r - now))
+        due_str = f"in {due_sec}s" if due_sec > 0 else "DUE NOW"
+        print(f"  {it.get('id', ''):<5} {p:<12} {cid:<22} {code:<15} {retries:>8} {st:<10} {due_str:<12}")
+
+    print("=" * 80)
+    if dry_run:
+        print("  ℹ️ [DRY RUN] Simulation complete. No problems were executed and database state was not modified.")
+        print("=" * 80 + "\n")
+        return len(eligible)
+
+    due_items = [it for it in eligible if it.get("status") == "PENDING" and it.get("next_retry_at", 0) <= now]
+    print(f"  🚀 Processing {len(due_items)} due retry candidate(s)...")
+    return len(due_items)
 
 def interactive_config_wizard():
     """Interactively configures or updates API keys and competitive programming handles."""
@@ -7248,8 +7988,19 @@ async def main():
     if len(sys.argv) > 1:
         cmd = sys.argv[1].lower()
         if cmd == "status":
-            print_status_summary()
-            return
+            is_detailed = "--detailed" in sys.argv or "-d" in sys.argv
+            print_status_summary(detailed=is_detailed)
+            return 0
+        elif cmd in ["retry-failed", "retry"]:
+            is_dry = "--dry-run" in sys.argv or DRY_RUN
+            plat = None
+            if "--platform" in sys.argv:
+                try:
+                    plat = sys.argv[sys.argv.index("--platform") + 1]
+                except (IndexError, ValueError):
+                    pass
+            await handle_retry_failed(dry_run=is_dry, platform=plat)
+            return 0
         elif cmd in ["config", "setup"]:
             interactive_config_wizard()
             return
@@ -7323,6 +8074,16 @@ async def main():
         help="Display verified solved history, daily quotas (Asia/Kolkata), and database summary"
     )
     parser.add_argument(
+        "--detailed",
+        action="store_true",
+        help="Include detailed breakdown of failures, circuit breakers, retry queue, and leases in status"
+    )
+    parser.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="Retry failed problems from the persistent retry queue"
+    )
+    parser.add_argument(
         "--max-repairs",
         type=int,
         default=3,
@@ -7359,11 +8120,16 @@ async def main():
     args = parser.parse_args()
 
     if args.status:
-        print_status_summary()
+        print_status_summary(detailed=args.detailed)
         return 0
 
     is_dry = args.dry_run or DRY_RUN
     is_offline = args.offline_only or OFFLINE_MODE
+
+    if args.retry_failed:
+        plat = args.platform if args.platform != "all" else None
+        await handle_retry_failed(dry_run=is_dry, platform=plat)
+        return 0
 
     if not is_dry and not GEMINI_API_KEY:
         print("\n" + "=" * 70)
