@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Optional, Tuple, List, Set, Dict, Any, Union, Callable
 from enum import Enum
 from dataclasses import dataclass, field
+from abc import ABC, abstractmethod
 
 KOLKATA_TZ = ZoneInfo("Asia/Kolkata")
 
@@ -190,6 +191,382 @@ class PublishResult:
     def __iter__(self):
         yield self.success
         yield self.error
+
+# ==============================================================================
+# Browser Automation & Security Data Models
+# ==============================================================================
+class AuthState(str, Enum):
+    LOGGED_IN = "LOGGED_IN"
+    LOGGED_OUT = "LOGGED_OUT"
+    CHALLENGE = "CHALLENGE"
+    EXPIRED = "EXPIRED"
+    UNKNOWN = "UNKNOWN"
+
+@dataclass
+class AuthStateResult:
+    state: AuthState
+    username: Optional[str] = None
+    details: Optional[str] = None
+    requires_human: bool = False
+
+@dataclass
+class SecurityChallengeDetection:
+    detected: bool
+    challenge_type: Optional[str] = None
+    details: Optional[str] = None
+    url: str = ""
+
+@dataclass
+class InjectionResult:
+    success: bool
+    verified: bool
+    editor_type: str = "unknown"
+    readback_snippet: str = ""
+    error: Optional[str] = None
+
+    def __bool__(self) -> bool:
+        return self.success and self.verified
+
+@dataclass
+class ProblemExtractionResult:
+    success: bool
+    problem_text: str = ""
+    starter_code: str = ""
+    samples: List[SampleTestCase] = field(default_factory=list)
+    error: Optional[str] = None
+
+@dataclass
+class SelectorResolutionResult:
+    success: bool
+    matched_selector: Optional[str] = None
+    element: Optional[Any] = None
+    failed_selectors: List[Tuple[str, str]] = field(default_factory=list)
+    role: str = ""
+
+def redact_sensitive_data(text: Optional[str]) -> str:
+    """Redacts API keys, tokens, session IDs, and passwords from logs, diagnostics, and failure records."""
+    if not text:
+        return ""
+    text = re.sub(r"AIza[0-9A-Za-z-_]{30,45}", "[REDACTED_API_KEY]", str(text))
+    text = re.sub(r"(Bearer\s+)[A-Za-z0-9_\-\.]+", r"\1[REDACTED_TOKEN]", text, flags=re.IGNORECASE)
+    text = re.sub(r"((?:sessionid|csrf(?:token|_token)?|phpsessid|jsessionid)=)[^;\s&]+", r"\1[REDACTED_COOKIE]", text, flags=re.IGNORECASE)
+    text = re.sub(r'((?:password|passwd|pwd)[\s:=]+[\"\']?)[^\"\'\s;,\&]+([\"\']?)', r"\1[REDACTED_PASSWORD]\2", text, flags=re.IGNORECASE)
+    return text
+
+class CircuitState(str, Enum):
+    CLOSED = "CLOSED"
+    OPEN = "OPEN"
+    HALF_OPEN = "HALF_OPEN"
+
+class PlatformRateLimiter:
+    """Enforces per-platform rate limits, Retry-After compliance, backoff, and circuit breaking."""
+    def __init__(
+        self,
+        platform: str,
+        min_interval: float = 2.0,
+        failure_threshold: int = 3,
+        base_open_duration: float = 30.0,
+        backoff_factor: float = 2.0,
+    ):
+        self.platform = platform
+        self.min_interval = min_interval
+        self.failure_threshold = failure_threshold
+        self.base_open_duration = base_open_duration
+        self.backoff_factor = backoff_factor
+        self.last_request_time: float = 0.0
+        self.consecutive_failures: int = 0
+        self.circuit_state: CircuitState = CircuitState.CLOSED
+        self.circuit_open_until: float = 0.0
+        self.retry_after_until: float = 0.0
+
+    def is_paused(self) -> bool:
+        now = time.time()
+        if self.circuit_state == CircuitState.OPEN:
+            if now < self.circuit_open_until:
+                return True
+            self.circuit_state = CircuitState.HALF_OPEN
+        if now < self.retry_after_until:
+            return True
+        return False
+
+    async def acquire(self) -> Tuple[bool, Optional[str]]:
+        now = time.time()
+        if self.circuit_state == CircuitState.OPEN:
+            if now < self.circuit_open_until:
+                remaining = int(self.circuit_open_until - now)
+                return False, f"Circuit breaker OPEN for {self.platform} ({remaining}s remaining). Platform paused."
+            self.circuit_state = CircuitState.HALF_OPEN
+
+        if now < self.retry_after_until:
+            remaining = int(self.retry_after_until - now)
+            return False, f"Rate limited on {self.platform} (HTTP 429 Retry-After active, {remaining}s remaining)."
+
+        elapsed = now - self.last_request_time
+        if elapsed < self.min_interval:
+            await asyncio.sleep(self.min_interval - elapsed)
+
+        self.last_request_time = time.time()
+        return True, None
+
+    def record_success(self):
+        self.consecutive_failures = 0
+        self.circuit_state = CircuitState.CLOSED
+        self.retry_after_until = 0.0
+
+    def record_failure(self, is_rate_limit: bool = False, retry_after: Optional[float] = None):
+        now = time.time()
+        self.consecutive_failures += 1
+        if is_rate_limit:
+            delay = retry_after if (retry_after is not None and retry_after > 0) else 30.0
+            self.retry_after_until = now + delay
+
+        if self.consecutive_failures >= self.failure_threshold:
+            duration = self.base_open_duration * (self.backoff_factor ** max(0, self.consecutive_failures - self.failure_threshold))
+            self.circuit_state = CircuitState.OPEN
+            self.circuit_open_until = now + duration
+
+    def handle_http_response(self, status_code: int, headers: Optional[Dict[str, str]] = None):
+        headers = headers or {}
+        if status_code == 429:
+            retry_after_val = 30.0
+            for k, v in headers.items():
+                if k.lower() == "retry-after":
+                    try:
+                        retry_after_val = float(v)
+                    except ValueError:
+                        retry_after_val = 30.0
+                    break
+            self.record_failure(is_rate_limit=True, retry_after=retry_after_val)
+        elif 200 <= status_code < 300:
+            self.record_success()
+        elif status_code >= 500:
+            self.record_failure(is_rate_limit=False)
+
+_PLATFORM_LIMITERS: Dict[str, PlatformRateLimiter] = {
+    "leetcode": PlatformRateLimiter("leetcode", min_interval=3.0, failure_threshold=3, base_open_duration=30.0),
+    "codeforces": PlatformRateLimiter("codeforces", min_interval=2.0, failure_threshold=3, base_open_duration=30.0),
+    "hackerrank": PlatformRateLimiter("hackerrank", min_interval=2.0, failure_threshold=3, base_open_duration=30.0),
+    "codechef": PlatformRateLimiter("codechef", min_interval=3.0, failure_threshold=3, base_open_duration=30.0),
+    "hackerearth": PlatformRateLimiter("hackerearth", min_interval=3.0, failure_threshold=3, base_open_duration=30.0),
+}
+
+def get_rate_limiter(platform: str) -> PlatformRateLimiter:
+    p = platform.lower().strip()
+    if p not in _PLATFORM_LIMITERS:
+        _PLATFORM_LIMITERS[p] = PlatformRateLimiter(p, min_interval=2.0)
+    return _PLATFORM_LIMITERS[p]
+
+async def detect_security_challenge_or_captcha(page: Page) -> SecurityChallengeDetection:
+    """Detects CAPTCHA, Cloudflare challenges, and login walls without bypassing them."""
+    if not page:
+        return SecurityChallengeDetection(detected=False)
+
+    curr_url = ""
+    try:
+        curr_url = page.url or ""
+    except Exception:
+        pass
+
+    # 1. URL-based challenge indicators
+    if any(k in curr_url.lower() for k in ["/challenge", "/captcha", "checkpoint", "/login?next=", "/enter?back="]):
+        return SecurityChallengeDetection(
+            detected=True,
+            challenge_type="url_challenge_or_login_barrier",
+            details=f"URL indicates challenge or forced login: {curr_url}",
+            url=curr_url
+        )
+
+    # 2. DOM-based challenge and CAPTCHA indicators
+    check_js = """() => {
+        // Cloudflare Turnstile / IUAM
+        const cf = document.querySelector('iframe[src*="cloudflare"], iframe[src*="turnstile"], .cf-turnstile, input[name="turnstileToken"], input[name="cf-turnstile-response"], #cf-wrapper, .cf-browser-verification');
+        if (cf) return { detected: true, type: 'cloudflare_turnstile', details: 'Cloudflare Turnstile or IUAM challenge detected in DOM' };
+
+        // Title checks
+        const title = (document.title || '').toLowerCase();
+        if (title.includes('just a moment') || title.includes('attention required') || title.includes('security check')) {
+            return { detected: true, type: 'cloudflare_iuam', details: `Challenge page title: ${document.title}` };
+        }
+
+        // Google reCAPTCHA
+        const recaptcha = document.querySelector('iframe[src*="recaptcha"], .g-recaptcha, #g-recaptcha, div[class*="recaptcha"]');
+        if (recaptcha) return { detected: true, type: 'recaptcha', details: 'Google reCAPTCHA iframe or container detected' };
+
+        // hCaptcha
+        const hcaptcha = document.querySelector('iframe[src*="hcaptcha"], .h-captcha, div[class*="hcaptcha"]');
+        if (hcaptcha) return { detected: true, type: 'hcaptcha', details: 'hCaptcha iframe or container detected' };
+
+        // Generic anti-bot / captcha text
+        const bodyText = (document.body ? document.body.innerText || '' : '').toLowerCase();
+        if (bodyText.includes('please verify you are a human') || bodyText.includes('confirm you are human') || bodyText.includes('complete the security check')) {
+            return { detected: true, type: 'generic_captcha', details: 'Human verification prompt detected in page text' };
+        }
+
+        return { detected: false };
+    }"""
+    try:
+        res = await page.evaluate(check_js)
+        if isinstance(res, dict) and res.get("detected"):
+            return SecurityChallengeDetection(
+                detected=True,
+                challenge_type=res.get("type", "unknown_challenge"),
+                details=res.get("details", ""),
+                url=curr_url
+            )
+    except Exception:
+        pass
+
+    return SecurityChallengeDetection(detected=False, url=curr_url)
+
+async def check_live_or_rated_contest(page: Page, url: str, platform_type: str) -> Tuple[bool, Optional[str]]:
+    """Checks whether the target problem is inside an active, live, or rated contest to prevent automated submission."""
+    url_lower = (url or "").lower()
+    if page:
+        contest_check_js = """() => {
+            const timer = document.querySelector('.contest-timer, .countdown, [data-testid="contest-timer"], [class*="contestTimer"]');
+            if (timer && (timer.innerText || '').trim().length > 0) {
+                return { is_live: true, reason: `Active countdown timer detected: ${timer.innerText.trim()}` };
+            }
+            const liveBadge = document.querySelector('.live-contest-banner, .contest-status-live, div:has-text("Contest is running")');
+            if (liveBadge) {
+                return { is_live: true, reason: 'Live contest banner detected' };
+            }
+            return { is_live: false };
+        }"""
+        try:
+            res = await page.evaluate(contest_check_js)
+            if isinstance(res, dict) and res.get("is_live"):
+                return True, res.get("reason", "Active contest detected on page")
+        except Exception:
+            pass
+
+    if "/weekly-contest-" in url_lower or "/biweekly-contest-" in url_lower:
+        return True, "LeetCode weekly/biweekly contest problems require manual contest participation"
+
+    return False, None
+
+async def resolve_verified_selector(
+    page: Page,
+    selectors: List[str],
+    role: str,
+    target_verifier: Optional[Callable[[str], bool]] = None,
+    timeout_ms: int = 4000
+) -> SelectorResolutionResult:
+    """Tries selectors in order, tracking failed locators for stale selector diagnostics,
+    and verifying element target identity before returning."""
+    failed: List[Tuple[str, str]] = []
+    for selector in selectors:
+        try:
+            loc = page.locator(selector).first
+            if await loc.count() > 0:
+                is_vis = await loc.is_visible()
+                if is_vis:
+                    text = ""
+                    try:
+                        text = (await loc.inner_text()).strip()
+                    except Exception:
+                        pass
+                    if target_verifier:
+                        if target_verifier(text):
+                            return SelectorResolutionResult(
+                                success=True,
+                                matched_selector=selector,
+                                element=loc,
+                                failed_selectors=failed,
+                                role=role
+                            )
+                        else:
+                            failed.append((selector, f"Target identity verification failed for text preview: {text[:60]}..."))
+                    else:
+                        return SelectorResolutionResult(
+                            success=True,
+                            matched_selector=selector,
+                            element=loc,
+                            failed_selectors=failed,
+                            role=role
+                        )
+                else:
+                    failed.append((selector, "Element present but not visible"))
+            else:
+                failed.append((selector, "Selector matched 0 elements"))
+        except Exception as e:
+            failed.append((selector, f"Locator error: {e}"))
+
+    if failed:
+        first_few = "; ".join([f"{sel} ({err})" for sel, err in failed[:3]])
+        print(f"   ⚠️ Stale or unverified selectors detected for [{role}]: {first_few}")
+
+    return SelectorResolutionResult(success=False, failed_selectors=failed, role=role)
+
+class BrowserManager:
+    """Manages browser lifecycle, health checks, reconnection strategies, and clean shutdown."""
+
+    @staticmethod
+    async def is_healthy(page: Optional[Page]) -> bool:
+        if not page:
+            return False
+        try:
+            if hasattr(page, "is_closed") and page.is_closed():
+                return False
+            val = await asyncio.wait_for(page.evaluate("1 + 1"), timeout=3.0)
+            return val == 2
+        except Exception:
+            return False
+
+    @staticmethod
+    async def reconnect(p_playwright=None, browser=None, context=None, cdp_port: int = 9222) -> Tuple[Any, Any, Page]:
+        """Safely reconnects to Chrome over CDP if the current session or page is broken."""
+        print("   🔄 BrowserManager: Reconnecting to Chrome via CDP...")
+        if browser:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+        if p_playwright:
+            try:
+                browser = await p_playwright.chromium.connect_over_cdp(f"http://localhost:{cdp_port}")
+                context = browser.contexts[0] if browser.contexts else await browser.new_context()
+                page = await context.new_page()
+                print("   ✅ BrowserManager: Reconnected cleanly to Chrome via CDP!")
+                return browser, context, page
+            except Exception as e:
+                print(f"   ⚠️ BrowserManager reconnection notice: {e}")
+
+        if context:
+            try:
+                page = await context.new_page()
+                return browser, context, page
+            except Exception:
+                pass
+
+        raise RuntimeError("BrowserManager: Unable to re-establish connection to browser.")
+
+    @staticmethod
+    async def clean_shutdown(browser=None, context=None, page=None, p_playwright=None):
+        """Cleanly releases all browser and playwright resources."""
+        if page:
+            try:
+                if not (hasattr(page, "is_closed") and page.is_closed()):
+                    await page.close()
+            except Exception:
+                pass
+        if context:
+            try:
+                await context.close()
+            except Exception:
+                pass
+        if browser:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+        if p_playwright:
+            try:
+                await p_playwright.stop()
+            except Exception:
+                pass
+        print("   🧹 BrowserManager: Resources shut down cleanly.")
 
 def get_repo_default_branch(repo_dir: Union[Path, str]) -> str:
     """Detects the default branch for a git repository (e.g. main, master)."""
@@ -2084,27 +2461,44 @@ def clean_code_string(code: str) -> str:
 # Browser Page Helpers (Selectors & Text Extraction)
 # ==============================================================================
 async def extract_problem_text(page: Page, selectors: List[str], timeout_ms: int = 15000) -> str:
-    """Tries multiple selectors to retrieve the problem description."""
-    per_selector_timeout = max(2000, timeout_ms // len(selectors))
-    for selector in selectors:
-        try:
-            loc = page.locator(selector).first
-            await loc.wait_for(state="visible", timeout=per_selector_timeout)
-            text = (await loc.inner_text()).strip()
-            if len(text) > 150:
-                return text
-        except Exception:
-            continue
+    """Tries multiple selectors to retrieve the problem description,
+    diagnosing stale selectors and verifying fallback target identity."""
+    def cp_verifier(text: str) -> bool:
+        if len(text) < 80:
+            return False
+        keywords = ["input", "output", "example", "constraints", "note", "given", "return", "task", "problem", "function", "sample"]
+        t_low = text.lower()
+        return any(k in t_low for k in keywords)
 
-    for fallback in ["article", "main", "#content", ".content", ".problem-content"]:
+    res = await resolve_verified_selector(
+        page,
+        selectors,
+        role="problem_description",
+        target_verifier=cp_verifier,
+        timeout_ms=timeout_ms
+    )
+    if res.success and res.element:
         try:
-            loc = page.locator(fallback).first
-            if await loc.is_visible():
-                text = (await loc.inner_text()).strip()
-                if len(text) > 80:
-                    return text
+            return (await res.element.inner_text()).strip()
         except Exception:
-            continue
+            pass
+
+    # Try verified fallbacks
+    fallbacks = ["article", "main", "#content", ".content", ".problem-content", "[role='main']"]
+    fb_res = await resolve_verified_selector(
+        page,
+        fallbacks,
+        role="problem_description_fallback",
+        target_verifier=cp_verifier,
+        timeout_ms=min(3000, timeout_ms)
+    )
+    if fb_res.success and fb_res.element:
+        print(f"   ℹ️ Used verified fallback selector: '{fb_res.matched_selector}'")
+        try:
+            return (await fb_res.element.inner_text()).strip()
+        except Exception:
+            pass
+
     return ""
 
 async def extract_editor_code(page: Page) -> str:
@@ -2153,8 +2547,11 @@ async def extract_editor_code(page: Page) -> str:
     except Exception:
         return ""
 
-async def inject_code_into_editor(page: Page, solution_code: str) -> bool:
-    """Injects solution code using Monaco/Ace APIs, direct keyboard insertion, or clipboard."""
+async def inject_code_into_editor(page: Page, solution_code: str) -> InjectionResult:
+    """Injects solution code using Monaco/Ace APIs, direct keyboard insertion, or clipboard,
+    and immediately verifies that injection succeeded by reading back editor content."""
+    injected_type = None
+
     js_inject = """(newCode) => {
         if (window.monaco && window.monaco.editor) {
             const models = window.monaco.editor.getModels();
@@ -2190,53 +2587,97 @@ async def inject_code_into_editor(page: Page, solution_code: str) -> bool:
     try:
         result = await page.evaluate(js_inject, solution_code)
         if result:
+            injected_type = result
             print(f"   ✅ Code injected via {result}!")
-            return True
     except Exception as e:
         print(f"   ⚠️  JS API injection notice: {e}")
 
     # Method 2: UI Focus + Keyboard Select All + Insert Text
-    print("   ⌨️  Using simulated keyboard injection...")
-    modifier = "Meta" if sys.platform == "darwin" else "Control"
-    editor_targets = [
-        ".monaco-editor .view-lines",
-        ".monaco-editor textarea",
-        ".ace_editor .ace_text-input",
-        ".ace_editor",
-        "textarea[name='source']",
-        "textarea.code-editor",
-        ".CodeMirror",
-    ]
+    if not injected_type:
+        print("   ⌨️  Using simulated keyboard injection...")
+        modifier = "Meta" if sys.platform == "darwin" else "Control"
+        editor_targets = [
+            ".monaco-editor .view-lines",
+            ".monaco-editor textarea",
+            ".ace_editor .ace_text-input",
+            ".ace_editor",
+            "textarea[name='source']",
+            "textarea.code-editor",
+            ".CodeMirror",
+        ]
 
-    for selector in editor_targets:
-        try:
-            loc = page.locator(selector).first
-            if await loc.is_visible():
-                await loc.click()
-                await asyncio.sleep(0.3)
-                await page.keyboard.press(f"{modifier}+KeyA")
-                await asyncio.sleep(0.1)
-                await page.keyboard.press("Backspace")
-                await asyncio.sleep(0.1)
+        for selector in editor_targets:
+            try:
+                loc = page.locator(selector).first
+                if await loc.count() > 0 and await loc.is_visible():
+                    await loc.click()
+                    await asyncio.sleep(0.2)
+                    await page.keyboard.press(f"{modifier}+KeyA")
+                    await asyncio.sleep(0.05)
+                    await page.keyboard.press("Backspace")
+                    await asyncio.sleep(0.05)
 
-                await page.keyboard.insert_text(solution_code)
-                print("   ✅ Code inserted via keyboard.")
-                return True
-        except Exception:
-            continue
+                    await page.keyboard.insert_text(solution_code)
+                    print(f"   ✅ Code inserted via keyboard ({selector}).")
+                    injected_type = f"keyboard_{selector}"
+                    break
+            except Exception:
+                continue
 
     # Method 3: System Clipboard Fallback
-    print("   📋 Using system clipboard fallback...")
+    if not injected_type:
+        print("   📋 Using system clipboard fallback...")
+        try:
+            modifier = "Meta" if sys.platform == "darwin" else "Control"
+            pyperclip.copy(solution_code)
+            await page.keyboard.press(f"{modifier}+KeyA")
+            await page.keyboard.press("Backspace")
+            await page.keyboard.press(f"{modifier}+KeyV")
+            print("   ✅ Code pasted from clipboard.")
+            injected_type = "clipboard"
+        except Exception as e:
+            print(f"   ❌ Clipboard injection failed: {e}")
+
+    if not injected_type:
+        return InjectionResult(success=False, verified=False, error="No supported editor found for code injection")
+
+    # READBACK VERIFICATION
+    readback = await extract_editor_code(page)
+    expected_class = None
     try:
-        pyperclip.copy(solution_code)
-        await page.keyboard.press(f"{modifier}+KeyA")
-        await page.keyboard.press("Backspace")
-        await page.keyboard.press(f"{modifier}+KeyV")
-        print("   ✅ Code pasted from clipboard.")
-        return True
-    except Exception as e:
-        print(f"   ❌ Clipboard injection failed: {e}")
-        return False
+        expected_class, _, _, _ = detect_java_class_and_filename(solution_code, "generic")
+    except Exception:
+        pass
+    if not expected_class:
+        m = re.search(r"\bclass\s+(\w+)", solution_code)
+        if m:
+            expected_class = m.group(1)
+
+    verified = True
+    verify_err = None
+
+    if not readback or len(readback.strip()) < 10:
+        verified = False
+        verify_err = "Editor readback was empty after injection"
+    elif expected_class and not re.search(rf"\b{re.escape(expected_class)}\b", readback):
+        verified = False
+        verify_err = f"Expected class '{expected_class}' missing from editor readback"
+    elif len(readback) < max(20, int(len(solution_code) * 0.35)):
+        verified = False
+        verify_err = f"Editor readback significantly shorter than expected ({len(readback)} vs {len(solution_code)} chars)"
+
+    if verified:
+        print("   ✅ Editor injection verified via readback!")
+    else:
+        print(f"   ❌ Editor injection verification failed: {verify_err}")
+
+    return InjectionResult(
+        success=True,
+        verified=verified,
+        editor_type=injected_type or "unknown",
+        readback_snippet=readback[:100] if readback else "",
+        error=verify_err
+    )
 
 # ==============================================================================
 # Local Java Compilation & Verification (Universal for All Platforms)
@@ -4094,6 +4535,386 @@ Solution generated in Java and verified on {platform_name} by autonomous AI bot.
         return PublishResult(success=False, error=f"Git operation failed: {e}", repo_name=repo_name, branch=branch)
 
 # ==============================================================================
+# Platform Adapters Architecture
+# ==============================================================================
+class BasePlatformAdapter(ABC):
+    platform_type: str = "generic"
+    platform_name: str = "Generic"
+    domains: List[str] = []
+    question_selectors: List[str] = []
+    run_selectors: Optional[List[str]] = None
+    submit_selectors: Optional[List[str]] = None
+
+    def __init__(self):
+        self.rate_limiter = get_rate_limiter(self.platform_type)
+
+    @abstractmethod
+    async def discover(self, page: Page, count: int = 15, difficulty: str = "medium-hard", offset: int = 0) -> List[str]:
+        pass
+
+    @abstractmethod
+    async def check_auth_state(self, page: Page) -> AuthStateResult:
+        pass
+
+    async def validate_url_and_platform(self, page: Page, expected_url: str) -> Tuple[bool, Optional[str]]:
+        if not page:
+            return False, "Page instance is null"
+        curr_url = ""
+        try:
+            curr_url = page.url or ""
+        except Exception:
+            pass
+        if not curr_url or curr_url.startswith("about:blank"):
+            return True, None
+
+        if self.domains and not any(d in curr_url for d in self.domains):
+            return False, f"Wrong platform domain: current URL '{curr_url}' does not match expected {self.domains}"
+
+        if any(r in curr_url.lower() for r in ["/login", "/enter", "/auth", "/accounts/login", "/checkpoint"]):
+            return False, f"Redirected to login/auth barrier: {curr_url}"
+
+        if any(r in curr_url.lower() for r in ["/404", "/page-not-found", "/error"]):
+            return False, f"Target problem returned 404 or page error: {curr_url}"
+
+        return True, None
+
+    async def detect_security_challenge(self, page: Page) -> SecurityChallengeDetection:
+        return await detect_security_challenge_or_captcha(page)
+
+    async def is_live_or_rated_contest(self, page: Page, url: str) -> Tuple[bool, Optional[str]]:
+        return await check_live_or_rated_contest(page, url, self.platform_type)
+
+    async def set_language(self, page: Page) -> bool:
+        await switch_editor_to_java(page, self.platform_type)
+        return True
+
+    async def extract(self, page: Page, url: str) -> ProblemExtractionResult:
+        text = await extract_problem_text(page, self.question_selectors)
+        starter = await extract_editor_code(page)
+        samples = await extract_sample_test_cases_from_page(page, self.platform_type)
+        if not samples and text:
+            samples = extract_sample_test_cases_from_text(text)
+        success = bool(text and len(text) > 80)
+        return ProblemExtractionResult(
+            success=success,
+            problem_text=text,
+            starter_code=starter,
+            samples=samples,
+            error=None if success else "Failed to extract problem description"
+        )
+
+    async def inject(self, page: Page, solution_code: str) -> InjectionResult:
+        return await inject_code_into_editor(page, solution_code)
+
+    async def submit(self, page: Page, url: str, solution_code: str, snapshot: Optional[Dict[str, Any]] = None) -> bool:
+        if not self.submit_selectors:
+            return False
+        for selector in self.submit_selectors:
+            try:
+                btn = page.locator(selector).first
+                if await btn.count() > 0 and await btn.is_visible():
+                    await btn.click()
+                    print(f"   🚀 Clicked submit button ({selector})")
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def verify(
+        self,
+        page: Page,
+        url: str,
+        submission_start_time: Optional[float] = None,
+        pre_submission_id: Optional[str] = None,
+        account: Optional[str] = None,
+        expected_problem_id: Optional[str] = None
+    ) -> SubmissionVerdict:
+        return await verify_live_submission_verdict(
+            page,
+            self.platform_type,
+            url,
+            submission_start_time=submission_start_time,
+            pre_submission_id=pre_submission_id,
+            account=account,
+            expected_problem_id=expected_problem_id
+        )
+
+
+class LeetCodeAdapter(BasePlatformAdapter):
+    platform_type = "leetcode"
+    platform_name = "LeetCode"
+    domains = ["leetcode.com"]
+    question_selectors = [
+        "div[data-track-load='description_content']",
+        "div.elfjS",
+        "[data-key='description-content']",
+        "div.content__uRIT",
+        "[data-layout-path*='description']",
+        "div[class*='description']",
+        ".question-content",
+    ]
+    run_selectors = [
+        "button[data-e2e-locator='console-run-button']",
+        "button:has-text('Run')",
+        "[data-cypress='RunCode']",
+    ]
+    submit_selectors = [
+        "button[data-e2e-locator='console-submit-button']",
+        "button:has-text('Submit')",
+        "[data-cypress='SubmitCode']",
+    ]
+
+    async def discover(self, page: Page, count: int = 15, difficulty: str = "medium-hard", offset: int = 0) -> List[str]:
+        return await discover_leetcode_candidates(page, count=count, difficulty=difficulty, offset=offset)
+
+    async def check_auth_state(self, page: Page) -> AuthStateResult:
+        js = """() => {
+            const hasLogin = !!document.querySelector('a[href*="/accounts/login"], a:has-text("Sign in")');
+            const hasAuth = !!document.querySelector('[data-cypress="UserAvatar"], #navbar_user_avatar, .avatar, a[href*="/profile/"]');
+            if (hasAuth) return 'LOGGED_IN';
+            if (hasLogin) return 'LOGGED_OUT';
+            return 'UNKNOWN';
+        }"""
+        try:
+            st = await page.evaluate(js)
+            if st == "LOGGED_OUT":
+                return AuthStateResult(state=AuthState.LOGGED_OUT, details="LeetCode login link detected", requires_human=True)
+            if st == "LOGGED_IN":
+                return AuthStateResult(state=AuthState.LOGGED_IN)
+        except Exception:
+            pass
+        return AuthStateResult(state=AuthState.UNKNOWN)
+
+
+class CodeforcesAdapter(BasePlatformAdapter):
+    platform_type = "codeforces"
+    platform_name = "Codeforces"
+    domains = ["codeforces.com"]
+    question_selectors = [
+        ".problem-statement",
+        "#pageContent",
+    ]
+    run_selectors = None
+    submit_selectors = [
+        "form.submit-form input.submit",
+        "input.submit",
+        "button:has-text('Submit')",
+    ]
+
+    async def discover(self, page: Page, count: int = 15, difficulty: str = "medium-hard", offset: int = 0) -> List[str]:
+        return await discover_codeforces_candidates(page, count=count, difficulty=difficulty, offset=offset)
+
+    async def check_auth_state(self, page: Page) -> AuthStateResult:
+        js = """() => {
+            const hasAuth = !!document.querySelector('a[href*="/logout"], a[href*="/profile/"]');
+            const hasLogin = !!document.querySelector('a[href*="/enter"], a[href*="/register"]');
+            if (hasAuth) return 'LOGGED_IN';
+            if (hasLogin) return 'LOGGED_OUT';
+            return 'UNKNOWN';
+        }"""
+        try:
+            st = await page.evaluate(js)
+            if st == "LOGGED_OUT":
+                return AuthStateResult(state=AuthState.LOGGED_OUT, details="Codeforces /enter link detected", requires_human=True)
+            if st == "LOGGED_IN":
+                return AuthStateResult(state=AuthState.LOGGED_IN, username=CODEFORCES_HANDLE)
+        except Exception:
+            pass
+        return AuthStateResult(state=AuthState.UNKNOWN)
+
+    async def submit(self, page: Page, url: str, solution_code: str, snapshot: Optional[Dict[str, Any]] = None) -> bool:
+        clean_url = url.rstrip("/")
+        parts = clean_url.split("/")
+        prob_code = f"{parts[-2]}{parts[-1]}"
+        try:
+            await page.goto("https://codeforces.com/problemset/submit", wait_until="domcontentloaded", timeout=25000)
+            await asyncio.sleep(1)
+            await page.locator('input[name="submittedProblemCode"]').fill(prob_code)
+            sel = page.locator('select[name="programTypeId"]').first
+            if await sel.count() > 0:
+                options = await sel.locator("option").all()
+                for opt in options:
+                    txt = await opt.inner_text()
+                    if "Java 21" in txt or "Java 17" in txt:
+                        val = await opt.get_attribute("value")
+                        await sel.select_option(val)
+                        break
+            await page.locator('textarea#sourceCodeTextarea, textarea[name="source"]').fill(solution_code)
+            await page.locator('input.submit').click()
+            print("   🚀 Clicked Codeforces submit button!")
+            return True
+        except Exception as e:
+            print(f"   ⚠️ Codeforces submit error: {e}")
+            return False
+
+
+class HackerRankAdapter(BasePlatformAdapter):
+    platform_type = "hackerrank"
+    platform_name = "HackerRank"
+    domains = ["hackerrank.com"]
+    question_selectors = [
+        ".challenge-body-html",
+        ".problem-statement",
+        ".challenge_problem_statement",
+        ".challenge-body",
+        ".problem-statement-limits",
+    ]
+    run_selectors = [
+        "button.hr-monaco-compile",
+        "button:has-text('Run Code')",
+        "button[data-analytics='CompileAndTest']",
+    ]
+    submit_selectors = [
+        "button.hr-monaco-submit",
+        "button:has-text('Submit Code')",
+        "button[data-analytics='SubmitCode']",
+    ]
+
+    async def discover(self, page: Page, count: int = 15, difficulty: str = "medium-hard", offset: int = 0) -> List[str]:
+        return await discover_hackerrank_candidates(page, count=count, difficulty=difficulty, offset=offset)
+
+    async def check_auth_state(self, page: Page) -> AuthStateResult:
+        js = """() => {
+            const hasAuth = !!document.querySelector('.avatar, [data-analytics="NavBarProfileAvatar"], a[href*="/profile/"]');
+            const hasLogin = !!document.querySelector('a[href*="/auth/login"], a:has-text("Log In")');
+            if (hasAuth) return 'LOGGED_IN';
+            if (hasLogin) return 'LOGGED_OUT';
+            return 'UNKNOWN';
+        }"""
+        try:
+            st = await page.evaluate(js)
+            if st == "LOGGED_OUT":
+                return AuthStateResult(state=AuthState.LOGGED_OUT, details="HackerRank login link detected", requires_human=True)
+            if st == "LOGGED_IN":
+                return AuthStateResult(state=AuthState.LOGGED_IN)
+        except Exception:
+            pass
+        return AuthStateResult(state=AuthState.UNKNOWN)
+
+
+class CodeChefAdapter(BasePlatformAdapter):
+    platform_type = "codechef"
+    platform_name = "CodeChef"
+    domains = ["codechef.com"]
+    question_selectors = [
+        "#problem-statement",
+        "._problem_statement_container_",
+        "div[class*='problem-statement']",
+        "div[class*='ProblemStatement']",
+        "div[id*='problem-statement']",
+        ".problem-statement",
+        "div._content_container_",
+    ]
+    run_selectors = [
+        "button:has-text('Run')",
+        "button:has-text('Run Code')",
+        "button[id*='run']",
+        "button[data-testid*='run']",
+    ]
+    submit_selectors = [
+        "button:has-text('Submit')",
+        "button:has-text('Submit Code')",
+        "button[id*='submit']",
+        "button[data-testid*='submit']",
+    ]
+
+    async def discover(self, page: Page, count: int = 15, difficulty: str = "medium-hard", offset: int = 0) -> List[str]:
+        return await discover_codechef_candidates(page, count=count, difficulty=difficulty, offset=offset)
+
+    async def check_auth_state(self, page: Page) -> AuthStateResult:
+        js = """() => {
+            const hasAuth = !!document.querySelector('a[href*="/logout"], .user-details, .profile-image');
+            const hasLogin = !!document.querySelector('a[href*="/login"], a:has-text("Log In")');
+            if (hasAuth) return 'LOGGED_IN';
+            if (hasLogin) return 'LOGGED_OUT';
+            return 'UNKNOWN';
+        }"""
+        try:
+            st = await page.evaluate(js)
+            if st == "LOGGED_OUT":
+                return AuthStateResult(state=AuthState.LOGGED_OUT, details="CodeChef login link detected", requires_human=True)
+            if st == "LOGGED_IN":
+                return AuthStateResult(state=AuthState.LOGGED_IN)
+        except Exception:
+            pass
+        return AuthStateResult(state=AuthState.UNKNOWN)
+
+
+class HackerEarthAdapter(BasePlatformAdapter):
+    platform_type = "hackerearth"
+    platform_name = "HackerEarth"
+    domains = ["hackerearth.com"]
+    question_selectors = [
+        ".problem-description",
+        ".problem-details",
+        ".statement",
+        "div[class*='problem-description']",
+        "div[class*='problem-statement']",
+        "[data-slot='card']",
+    ]
+    run_selectors = [
+        "button:has-text('Compile & Test')",
+        "button:has-text('Run')",
+        ".compile-test-button",
+    ]
+    submit_selectors = [
+        "button:has-text('Submit')",
+        "button:has-text('Submit Code')",
+        ".submit-button",
+    ]
+
+    async def discover(self, page: Page, count: int = 15, difficulty: str = "medium-hard", offset: int = 0) -> List[str]:
+        return await discover_hackerearth_candidates(page, count=count, difficulty=difficulty, offset=offset)
+
+    async def check_auth_state(self, page: Page) -> AuthStateResult:
+        js = """() => {
+            const hasAuth = !!document.querySelector('a[href*="/logout"], .user-avatar, img[alt*="profile"]');
+            const hasLogin = !!document.querySelector('a[href*="/login"], a:has-text("Log In")');
+            if (hasAuth) return 'LOGGED_IN';
+            if (hasLogin) return 'LOGGED_OUT';
+            return 'UNKNOWN';
+        }"""
+        try:
+            st = await page.evaluate(js)
+            if st == "LOGGED_OUT":
+                return AuthStateResult(state=AuthState.LOGGED_OUT, details="HackerEarth login link detected", requires_human=True)
+            if st == "LOGGED_IN":
+                return AuthStateResult(state=AuthState.LOGGED_IN)
+        except Exception:
+            pass
+        return AuthStateResult(state=AuthState.UNKNOWN)
+
+
+class GenericPlatformAdapter(BasePlatformAdapter):
+    platform_type = "generic"
+    platform_name = "Generic"
+    domains = []
+    question_selectors = ["article", "main", "#content", ".problem-statement"]
+
+    async def discover(self, page: Page, count: int = 15, difficulty: str = "medium-hard", offset: int = 0) -> List[str]:
+        return []
+
+    async def check_auth_state(self, page: Page) -> AuthStateResult:
+        return AuthStateResult(state=AuthState.UNKNOWN)
+
+
+_ADAPTER_INSTANCES: List[BasePlatformAdapter] = [
+    LeetCodeAdapter(),
+    CodeforcesAdapter(),
+    HackerRankAdapter(),
+    CodeChefAdapter(),
+    HackerEarthAdapter(),
+]
+_GENERIC_ADAPTER = GenericPlatformAdapter()
+
+def get_platform_adapter(platform_or_url: str) -> BasePlatformAdapter:
+    p = (platform_or_url or "").lower().strip()
+    for adapter in _ADAPTER_INSTANCES:
+        if p == adapter.platform_type or any(d in p for d in adapter.domains):
+            return adapter
+    return _GENERIC_ADAPTER
+
+# ==============================================================================
 # Problem Solver Pipeline (Fully Automated, Java)
 # ==============================================================================
 async def process_problem(
@@ -4189,21 +5010,105 @@ async def process_problem(
                 commit_hash=pub_res.commit_hash
             )
 
-    # 1. Navigate to problem page
-    print(f"[1/6] Navigating to {platform_name}...")
+    # 1. Check rate limiter before interacting
+    adapter = get_platform_adapter(platform_type)
+    ok, rate_err = await adapter.rate_limiter.acquire()
+    if not ok:
+        print(f"🛑 Rate limiter active on {platform_name}: {rate_err}")
+        return ProcessResult(
+            stage=ProcessStage.GENERATED,
+            success=False,
+            url=url,
+            platform=platform_type,
+            problem_id=prob_id,
+            error=redact_sensitive_data(rate_err),
+            published=False
+        )
+
+    # 2. Check if problem URL is in an active or live/rated contest
+    is_contest, contest_reason = await adapter.is_live_or_rated_contest(page, url)
+    if is_contest:
+        print(f"🛑 Refusing submission into active/rated contest: {contest_reason}")
+        return ProcessResult(
+            stage=ProcessStage.GENERATED,
+            success=False,
+            url=url,
+            platform=platform_type,
+            problem_id=prob_id,
+            error=redact_sensitive_data(f"Refusing submission into active/rated contest: {contest_reason}"),
+            published=False
+        )
+
+    # 3. Navigate to problem page
+    print(f"[1/7] Navigating to {platform_name}...")
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-        await asyncio.sleep(4)
+        await asyncio.sleep(2)
     except Exception as e:
+        adapter.rate_limiter.record_failure(is_rate_limit=False)
         print(f"❌ Failed to load {url}: {e}")
-        return ProcessResult(stage=ProcessStage.GENERATED, success=False, url=url, platform=platform_type, problem_id=prob_id, error=f"Failed to load {url}: {e}")
+        return ProcessResult(
+            stage=ProcessStage.GENERATED,
+            success=False,
+            url=url,
+            platform=platform_type,
+            problem_id=prob_id,
+            error=redact_sensitive_data(f"Failed to load {url}: {e}"),
+            published=False
+        )
 
-    # 2. Automatically ensure editor language is set to Java
-    print("[2/6] Ensuring editor language is set to Java...")
+    # 4. Check for security challenges / CAPTCHA on the loaded page
+    sec_check = await adapter.detect_security_challenge(page)
+    if sec_check.detected:
+        page._anti_bot_blocked = True
+        adapter.rate_limiter.record_failure(is_rate_limit=False)
+        print(f"\n🛡️  [{platform_name}] Security challenge detected: {sec_check.challenge_type} ({sec_check.details})")
+        print("👉 Automation paused for human action. Please complete the verification in your open Chrome browser window.")
+        return ProcessResult(
+            stage=ProcessStage.GENERATED,
+            success=False,
+            url=url,
+            platform=platform_type,
+            problem_id=prob_id,
+            error=redact_sensitive_data(f"Security challenge detected: {sec_check.challenge_type}"),
+            published=False
+        )
+
+    # 5. Validate exact current URL and expected platform
+    valid_url, val_err = await adapter.validate_url_and_platform(page, url)
+    if not valid_url:
+        print(f"❌ URL validation failed: {val_err}")
+        return ProcessResult(
+            stage=ProcessStage.GENERATED,
+            success=False,
+            url=url,
+            platform=platform_type,
+            problem_id=prob_id,
+            error=redact_sensitive_data(val_err),
+            published=False
+        )
+
+    # 6. Check authentication state
+    auth_state = await adapter.check_auth_state(page)
+    if auth_state.state in [AuthState.LOGGED_OUT, AuthState.EXPIRED] and mode in ["submit", "both"]:
+        print(f"⚠️  [{platform_name}] User not authenticated: {auth_state.state.value} ({auth_state.details})")
+        print("👉 Submissions require an active authenticated user session. Please log in.")
+        return ProcessResult(
+            stage=ProcessStage.GENERATED,
+            success=False,
+            url=url,
+            platform=platform_type,
+            problem_id=prob_id,
+            error=redact_sensitive_data(f"Authentication required: {auth_state.state.value} ({auth_state.details})"),
+            published=False
+        )
+
+    # 7. Automatically ensure editor language is set to Java
+    print("[2/7] Ensuring editor language is set to Java...")
     await switch_editor_to_java(page, platform_type)
 
-    # 3. Extract problem description
-    print("[3/6] Extracting problem description...")
+    # 8. Extract problem description
+    print("[3/7] Extracting problem description...")
     problem_text = await extract_problem_text(page, config["question_selectors"])
     if not problem_text:
         print("⚠️  Waiting 4 more seconds for lazy-loaded elements...")
@@ -4486,7 +5391,20 @@ async def process_problem(
             print("[5/7 & 6/7] Codeforces local test complete (Mode: RUN).")
     else:
         print("[5/7] Injecting Java solution into editor...")
-        await inject_code_into_editor(page, solution_code)
+        inject_res = await inject_code_into_editor(page, solution_code)
+        if not inject_res or (hasattr(inject_res, "verified") and not inject_res.verified):
+            print("   ❌ Editor injection failed verification! Aborting submission.")
+            return ProcessResult(
+                stage=ProcessStage.GENERATED,
+                success=False,
+                url=url,
+                platform=platform_type,
+                problem_id=prob_id,
+                solution_code=solution_code,
+                explanation=explanation,
+                error="Editor injection verification failed",
+                published=False
+            )
 
         # Execute action (Run / Submit) based on mode
         print(f"[6/7] Performing action (Mode: {mode.upper()})...")
@@ -4508,6 +5426,20 @@ async def process_problem(
                 await asyncio.sleep(wait_time)
 
         if mode in ["submit", "both"] and config.get("submit_selectors"):
+            is_live_c, c_err = await adapter.is_live_or_rated_contest(page, url)
+            if is_live_c:
+                print(f"🛑 Refusing submission into active/rated contest: {c_err}")
+                return ProcessResult(
+                    stage=ProcessStage.SUBMITTED,
+                    success=False,
+                    url=url,
+                    platform=platform_type,
+                    problem_id=prob_id,
+                    solution_code=solution_code,
+                    explanation=explanation,
+                    error=redact_sensitive_data(f"Refusing submission into active/rated contest: {c_err}"),
+                    published=False
+                )
             submission_snapshot = await capture_pre_submission_snapshot(page, platform_type, url)
             submit_clicked = False
             for selector in config["submit_selectors"]:
@@ -4553,6 +5485,9 @@ async def process_problem(
 
         # Persist submission evidence
         record_submission_evidence(verdict, url, platform_type, solution_code)
+
+        if verdict_state == VerdictState.ACCEPTED:
+            adapter.rate_limiter.record_success()
 
         if verdict_state != VerdictState.ACCEPTED:
             print(f"   ❌ Problem {url} NOT accepted by judge ({verdict_msg}) [State: {verdict_state.value}].")
@@ -4644,27 +5579,13 @@ async def process_problem(
 
 async def ensure_live_page(page: Page, p_playwright=None, browser=None, context=None) -> Tuple[Any, Any, Page]:
     """Guarantees an active, responsive browser page by reconnecting over CDP if disconnected."""
-    if page:
-        try:
-            if not page.is_closed():
-                await page.evaluate("1 + 1")
-                return browser, context, page
-        except Exception:
-            pass
+    if await BrowserManager.is_healthy(page):
+        return browser, context, page
 
     print("   🔄 Browser tab or CDP connection lost. Reconnecting to Chrome via CDP (port 9222)...")
     if p_playwright:
         try:
-            if browser:
-                try:
-                    await browser.close()
-                except Exception:
-                    pass
-            browser = await p_playwright.chromium.connect_over_cdp("http://localhost:9222")
-            context = browser.contexts[0]
-            page = await context.new_page()
-            print("   ✅ Reconnected cleanly to live Chrome via CDP!")
-            return browser, context, page
+            return await BrowserManager.reconnect(p_playwright, browser, context)
         except Exception as e:
             print(f"   ⚠️ CDP reconnection notice: {e}")
             chrome_app = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" if sys.platform == "darwin" else ""
