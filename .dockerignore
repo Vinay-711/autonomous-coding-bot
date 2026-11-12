@@ -1,0 +1,35 @@
+# Git & VCS
+.git
+.gitignore
+
+# Python virtual environment & caches
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local runtime data & caches (must be mounted or created at runtime)
+solutions/
+repos/
+logs/
+saved_chrome_login/
+chrome_user_data/
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Secrets & local config
+.env
+.env.*
+!.env.example
+
+# macOS metadata
+.DS_Store
+._*
+

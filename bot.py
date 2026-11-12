@@ -11,31 +11,871 @@ if hasattr(sys.stderr, "reconfigure"):
 import re
 import json
 import time
+import random
 import urllib.request
 import argparse
 import subprocess
 import tempfile
-from datetime import datetime, timedelta
+import sqlite3
+try:
+    import resource
+except ImportError:
+    resource = None
+import signal
+import shutil
+try:
+    import psycopg2
+    import psycopg2.extras
+except ImportError:
+    psycopg2 = None
+from contextlib import contextmanager
+from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional, Tuple, List, Set
+from typing import Optional, Tuple, List, Set, Dict, Any, Union, Callable
+from enum import Enum
+from dataclasses import dataclass, field
+from abc import ABC, abstractmethod
+
+KOLKATA_TZ = ZoneInfo("Asia/Kolkata")
+
+def get_kolkata_now() -> datetime:
+    """Returns the current datetime in Asia/Kolkata timezone."""
+    return datetime.now(KOLKATA_TZ)
+
+def get_kolkata_today_str() -> str:
+    """Returns today's date formatted as YYYY-MM-DD in Asia/Kolkata timezone."""
+    return get_kolkata_now().strftime("%Y-%m-%d")
 
 import pyperclip
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
-from google.genai.errors import APIError
-from playwright.async_api import async_playwright, Page, BrowserContext
+from playwright.async_api import async_playwright, Page
 
 # ==============================================================================
-# Configuration & Environment Setup
+# Typed Verdict States & Data Models
+# ==============================================================================
+class VerdictState(str, Enum):
+    ACCEPTED = "ACCEPTED"
+    REJECTED = "REJECTED"
+    PENDING = "PENDING"
+    UNKNOWN = "UNKNOWN"
+    ERROR = "ERROR"
+
+    def __bool__(self) -> bool:
+        """Allow boolean evaluation for backward compatibility: ACCEPTED is True, all others are False."""
+        return self == VerdictState.ACCEPTED
+
+@dataclass
+class SubmissionVerdict:
+    state: VerdictState
+    message: str
+    submission_id: Optional[str] = None
+    platform: Optional[str] = None
+    problem_id: Optional[str] = None
+    account: Optional[str] = None
+    timestamp: Optional[float] = None
+    correlation_mechanism: Optional[str] = None
+    evidence: Dict[str, Any] = field(default_factory=dict)
+
+    def __bool__(self) -> bool:
+        return self.state == VerdictState.ACCEPTED
+
+    def __iter__(self):
+        """Allows unpacking as (verdict_state, verdict_message) for backward compatibility."""
+        return iter((self.state, self.message))
+
+class ProcessStage(str, Enum):
+    GENERATED = "GENERATED"
+    COMPILED = "COMPILED"
+    TESTED = "TESTED"
+    SUBMITTED = "SUBMITTED"
+    ACCEPTED = "ACCEPTED"
+    REJECTED = "REJECTED"
+    PUBLISH_FAILED = "PUBLISH_FAILED"
+    PUBLISHED = "PUBLISHED"
+
+    def __bool__(self) -> bool:
+        return self in (ProcessStage.ACCEPTED, ProcessStage.PUBLISHED)
+
+@dataclass
+class ProcessResult:
+    stage: ProcessStage
+    success: bool
+    url: str = ""
+    platform: str = ""
+    problem_id: Optional[str] = None
+    solution_code: Optional[str] = None
+    explanation: Optional[str] = None
+    verdict: Optional[SubmissionVerdict] = None
+    error: Optional[str] = None
+    publish_error: Optional[str] = None
+    saved_path: Optional[str] = None
+    published: bool = False
+    repo_name: Optional[str] = None
+    repo_branch: Optional[str] = None
+    commit_hash: Optional[str] = None
+    compiler_output: Optional[str] = None
+    diagnostics: Optional[str] = None
+    sample_results: List[Any] = field(default_factory=list)
+
+    def __bool__(self) -> bool:
+        return self.success
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, bool):
+            return self.success is other
+        if isinstance(other, ProcessStage):
+            return self.stage == other
+        if isinstance(other, str):
+            return self.stage.value == other
+        return super().__eq__(other)
+
+@dataclass
+class SampleTestCase:
+    input_text: str
+    expected_output: str
+    sample_index: int = 1
+
+@dataclass
+class CompilationResult:
+    success: bool
+    class_name: str
+    source_filename: str
+    error_message: Optional[str] = None
+    diagnostics: Optional[str] = None
+    cleaned_code: str = ""
+    target_version: Optional[str] = None
+
+@dataclass
+class ExecutionResult:
+    success: bool
+    return_code: int
+    stdout: str
+    stderr: str
+    timeout: bool = False
+    oom: bool = False
+    security_violation: bool = False
+    error_message: Optional[str] = None
+
+class DiagnosticCategory(str, Enum):
+    COMPILATION_ERROR = "COMPILATION_ERROR"
+    PARSER_ERROR = "PARSER_ERROR"
+    ALGORITHM_ERROR = "ALGORITHM_ERROR"
+    TIMEOUT_ERROR = "TIMEOUT_ERROR"
+    MEMORY_ERROR = "MEMORY_ERROR"
+
+@dataclass
+class SampleTestResult:
+    sample_index: int
+    passed: bool
+    input_text: str
+    expected_output: str
+    actual_output: str
+    error_message: Optional[str] = None
+    diff: Optional[str] = None
+    diagnostic_category: Optional[DiagnosticCategory] = None
+    stderr: Optional[str] = None
+
+@dataclass
+class VerificationPipelineResult:
+    success: bool
+    solution_code: str
+    explanation: str
+    compilation: Optional[CompilationResult] = None
+    sample_results: List[SampleTestResult] = field(default_factory=list)
+    repair_attempts: int = 0
+    failure_reason: Optional[str] = None
+    diagnostic_category: Optional[DiagnosticCategory] = None
+
+@dataclass
+class PublishResult:
+    success: bool
+    error: Optional[str] = None
+    repo_name: Optional[str] = None
+    branch: Optional[str] = None
+    commit_hash: Optional[str] = None
+
+    def __bool__(self) -> bool:
+        return self.success
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, bool):
+            return self.success is other
+        return super().__eq__(other)
+
+    def __iter__(self):
+        yield self.success
+        yield self.error
+
+# ==============================================================================
+# Browser Automation & Security Data Models
+# ==============================================================================
+class AuthState(str, Enum):
+    LOGGED_IN = "LOGGED_IN"
+    LOGGED_OUT = "LOGGED_OUT"
+    CHALLENGE = "CHALLENGE"
+    EXPIRED = "EXPIRED"
+    UNKNOWN = "UNKNOWN"
+
+@dataclass
+class AuthStateResult:
+    state: AuthState
+    username: Optional[str] = None
+    details: Optional[str] = None
+    requires_human: bool = False
+
+@dataclass
+class SecurityChallengeDetection:
+    detected: bool
+    challenge_type: Optional[str] = None
+    details: Optional[str] = None
+    url: str = ""
+
+@dataclass
+class InjectionResult:
+    success: bool
+    verified: bool
+    editor_type: str = "unknown"
+    readback_snippet: str = ""
+    error: Optional[str] = None
+
+    def __bool__(self) -> bool:
+        return self.success and self.verified
+
+@dataclass
+class ProblemExtractionResult:
+    success: bool
+    problem_text: str = ""
+    starter_code: str = ""
+    samples: List[SampleTestCase] = field(default_factory=list)
+    error: Optional[str] = None
+
+@dataclass
+class SelectorResolutionResult:
+    success: bool
+    matched_selector: Optional[str] = None
+    element: Optional[Any] = None
+    failed_selectors: List[Tuple[str, str]] = field(default_factory=list)
+    role: str = ""
+
+def redact_sensitive_data(text: Optional[str]) -> str:
+    """Redacts API keys, cookies, tokens, and personally identifying session data from logs, diagnostics, and failure records."""
+    if not text:
+        return ""
+    text = str(text)
+    # API Keys
+    text = re.sub(r"AIza[0-9A-Za-z-_]{30,45}", "[REDACTED_API_KEY]", text)
+    text = re.sub(r'((?:api[-_]?key)[\s:=]+[\"\']?)[A-Za-z0-9_\-\.]{16,}([\"\']?)', r"\1[REDACTED_API_KEY]\2", text, flags=re.IGNORECASE)
+
+    # Tokens & Secrets
+    text = re.sub(r"(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{30,255}", "[REDACTED_GITHUB_TOKEN]", text)
+    text = re.sub(r"github_pat_[A-Za-z0-9_]{50,255}", "[REDACTED_GITHUB_TOKEN]", text)
+    text = re.sub(r"(Bearer\s+)[A-Za-z0-9_\-\.]+", r"\1[REDACTED_TOKEN]", text, flags=re.IGNORECASE)
+    text = re.sub(r"eyJ[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.[A-Za-z0-9-_.+/=]+", "[REDACTED_JWT]", text)
+    text = re.sub(r'((?:token|secret|access_key)[\s:=]+[\"\']?)(?!\[REDACTED_)[^\"\'\s;,\&]+([\"\']?)', r"\1[REDACTED_SECRET]\2", text, flags=re.IGNORECASE)
+
+    # Cookies (standard and cloudflare/session cookies)
+    cookie_names = (
+        r"sessionid|csrf(?:token|_token)?|phpsessid|jsessionid|cf_clearance|__cfduid|"
+        r"connect\.sid|remember_me|auth_token|auth|SSID|HSID|SID|APISID|SAPISID"
+    )
+    text = re.sub(rf"((?:{cookie_names})=)[^;\s&]+", r"\1[REDACTED_COOKIE]", text, flags=re.IGNORECASE)
+
+    # Passwords
+    text = re.sub(r'((?:password|passwd|pwd)[\s:=]+[\"\']?)(?!\[REDACTED_)[^\"\'\s;,\&]+([\"\']?)', r"\1[REDACTED_PASSWORD]\2", text, flags=re.IGNORECASE)
+
+    # Personally Identifying Information (PII) / Emails & Session IDs
+    text = re.sub(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', "[REDACTED_EMAIL]", text)
+    text = re.sub(r'((?:session_?id|account_?id|visitor_?id)[\s:=]+[\"\']?)(?!\[REDACTED_)[A-Za-z0-9_\-\.]{10,}([\"\']?)', r"\1[REDACTED_SESSION]\2", text, flags=re.IGNORECASE)
+
+    return text
+
+class FailureCode(str, Enum):
+    TRANSIENT = "TRANSIENT"
+    AUTH_REQUIRED = "AUTH_REQUIRED"
+    RATE_LIMITED = "RATE_LIMITED"
+    PLATFORM_CHANGED = "PLATFORM_CHANGED"
+    JUDGE_REJECTED = "JUDGE_REJECTED"
+    PUBLISH_FAILED = "PUBLISH_FAILED"
+    PERMANENT = "PERMANENT"
+
+def classify_failure(
+    error_msg: Optional[str],
+    verdict: Optional[Any] = None,
+    stage: Optional[Any] = None,
+    http_status: Optional[int] = None
+) -> FailureCode:
+    """Classifies a failure into one of 7 standardized FailureCodes."""
+    if http_status == 429:
+        return FailureCode.RATE_LIMITED
+    if http_status in (401, 403):
+        return FailureCode.AUTH_REQUIRED
+    if http_status in (502, 503, 504):
+        return FailureCode.TRANSIENT
+
+    msg_low = (str(error_msg) if error_msg else "").lower()
+
+    # Distinguish AI generation rate limits / errors from coding platform rate limits
+    if any(k in msg_low for k in ["gemini", "ai generation", "all gemini models failed", "resource_exhausted", "generativeai"]):
+        return FailureCode.TRANSIENT
+
+    # Rate limiting (platform-level)
+    if any(k in msg_low for k in ["rate limit", "429", "too many requests", "retry-after", "cooling down", "quota exceeded"]):
+        return FailureCode.RATE_LIMITED
+
+    # Authentication or security barriers
+    if any(k in msg_low for k in [
+        "login required", "authentication required", "not authenticated", "auth_required",
+        "session expired", "login redirected", "unauthenticated", "captcha", "cloudflare challenge",
+        "turnstile", "recaptcha", "hcaptcha", "login barrier", "access denied", "expired session"
+    ]):
+        return FailureCode.AUTH_REQUIRED
+
+    # Platform DOM or selector changes
+    if any(k in msg_low for k in [
+        "changed selector", "stale selector", "locator failed", "missing editor",
+        "editor element not found", "wrong platform page", "dom mismatch", "readback mismatch",
+        "editor injection verification failed"
+    ]):
+        return FailureCode.PLATFORM_CHANGED
+
+    # Judge verdicts & submissions
+    v_str = verdict.value if hasattr(verdict, "value") else (str(verdict) if verdict else "")
+    if v_str in ("REJECTED", "WRONG_ANSWER", "COMPILATION_ERROR", "TIME_LIMIT_EXCEEDED", "MEMORY_LIMIT_EXCEEDED", "RUNTIME_ERROR"):
+        return FailureCode.JUDGE_REJECTED
+    if any(k in msg_low for k in [
+        "judge rejected", "wrong answer", "time limit exceeded", "memory limit exceeded",
+        "compilation error on judge", "runtime error"
+    ]):
+        return FailureCode.JUDGE_REJECTED
+
+    # Publishing failures
+    s_str = stage.value if hasattr(stage, "value") else (str(stage) if stage else "")
+    if s_str == "PUBLISH_FAILED" or any(k in msg_low for k in [
+        "publish failed", "git push failed", "git commit failed", "rebase conflict",
+        "failed to pull", "failed to clone", "github publish error"
+    ]):
+        return FailureCode.PUBLISH_FAILED
+
+    # Transient network / infrastructure issues
+    if any(k in msg_low for k in [
+        "timeout", "timed out", "econnreset", "connection reset", "connection refused",
+        "network error", "temporary", "cdp reconnection notice", "session closed",
+        "target closed", "browser disconnected", "worker lease expired", "heartbeat lost",
+        "503", "502", "504"
+    ]):
+        return FailureCode.TRANSIENT
+
+    # Permanent failures
+    if any(k in msg_low for k in [
+        "unsupported", "live rated contest", "contest active", "interactive problem",
+        "not found (404)", "invalid problem url", "max repairs exhausted"
+    ]):
+        return FailureCode.PERMANENT
+
+    # Default to PERMANENT for unknown non-transient errors
+    return FailureCode.PERMANENT
+
+class CircuitState(str, Enum):
+    CLOSED = "CLOSED"
+    OPEN = "OPEN"
+    HALF_OPEN = "HALF_OPEN"
+
+class PlatformRateLimiter:
+    """Enforces per-platform rate limits, Retry-After compliance, backoff, and circuit breaking."""
+    def __init__(
+        self,
+        platform: str,
+        min_interval: float = 2.0,
+        failure_threshold: int = 3,
+        base_open_duration: float = 30.0,
+        backoff_factor: float = 2.0,
+    ):
+        self.platform = platform
+        self.min_interval = min_interval
+        self.failure_threshold = failure_threshold
+        self.base_open_duration = base_open_duration
+        self.backoff_factor = backoff_factor
+        self.last_request_time: float = 0.0
+        self.consecutive_failures: int = 0
+        self.circuit_state: CircuitState = CircuitState.CLOSED
+        self.circuit_open_until: float = 0.0
+        self.retry_after_until: float = 0.0
+        self.last_failure_reason: str = ""
+
+    @property
+    def state(self) -> CircuitState:
+        now = time.time()
+        if self.circuit_state == CircuitState.OPEN and now >= self.circuit_open_until:
+            return CircuitState.HALF_OPEN
+        return self.circuit_state
+
+    def is_paused(self) -> bool:
+        now = time.time()
+        if self.circuit_state == CircuitState.OPEN:
+            if now < self.circuit_open_until:
+                return True
+            self.circuit_state = CircuitState.HALF_OPEN
+        if now < self.retry_after_until:
+            return True
+        return False
+
+    async def acquire(self) -> Tuple[bool, Optional[str]]:
+        now = time.time()
+        if self.circuit_state == CircuitState.OPEN:
+            if now < self.circuit_open_until:
+                remaining = int(self.circuit_open_until - now)
+                return False, f"Circuit breaker OPEN for {self.platform} ({remaining}s remaining). Platform paused."
+            self.circuit_state = CircuitState.HALF_OPEN
+
+        if now < self.retry_after_until:
+            remaining = int(self.retry_after_until - now)
+            return False, f"Rate limited on {self.platform} (HTTP 429 Retry-After active, {remaining}s remaining)."
+
+        elapsed = now - self.last_request_time
+        if elapsed < self.min_interval:
+            await asyncio.sleep(self.min_interval - elapsed)
+
+        self.last_request_time = time.time()
+        return True, None
+
+    def record_success(self):
+        self.consecutive_failures = 0
+        self.circuit_state = CircuitState.CLOSED
+        self.retry_after_until = 0.0
+        self.last_failure_reason = ""
+
+    def record_failure(self, is_rate_limit: bool = False, retry_after: Optional[float] = None, reason: str = ""):
+        now = time.time()
+        self.consecutive_failures += 1
+        if reason:
+            self.last_failure_reason = reason
+        if is_rate_limit:
+            delay = retry_after if (retry_after is not None and retry_after > 0) else 30.0
+            self.retry_after_until = now + delay
+
+        if self.consecutive_failures >= self.failure_threshold:
+            duration = self.base_open_duration * (self.backoff_factor ** max(0, self.consecutive_failures - self.failure_threshold))
+            self.circuit_state = CircuitState.OPEN
+            self.circuit_open_until = now + duration
+
+    def trip(self, reason: str = "", duration: Optional[float] = None):
+        """Immediately trips the circuit breaker to OPEN."""
+        now = time.time()
+        self.circuit_state = CircuitState.OPEN
+        self.circuit_open_until = now + (duration if duration is not None else self.base_open_duration)
+        self.last_failure_reason = reason or "Manually tripped / security barrier detected"
+
+    def reset(self):
+        """Resets the circuit breaker to CLOSED."""
+        self.consecutive_failures = 0
+        self.circuit_state = CircuitState.CLOSED
+        self.circuit_open_until = 0.0
+        self.retry_after_until = 0.0
+        self.last_failure_reason = ""
+
+    def get_status(self) -> Dict[str, Any]:
+        now = time.time()
+        cur_state = self.state
+        rem = max(0, int(self.circuit_open_until - now)) if cur_state == CircuitState.OPEN else 0
+        return {
+            "platform": self.platform,
+            "state": cur_state.value,
+            "consecutive_failures": self.consecutive_failures,
+            "open_until": self.circuit_open_until,
+            "remaining_seconds": rem,
+            "reason": self.last_failure_reason,
+        }
+
+    def handle_http_response(self, status_code: int, headers: Optional[Dict[str, str]] = None):
+        headers = headers or {}
+        if status_code == 429:
+            retry_after_val = 30.0
+            for k, v in headers.items():
+                if k.lower() == "retry-after":
+                    try:
+                        retry_after_val = float(v)
+                    except ValueError:
+                        retry_after_val = 30.0
+                    break
+            self.record_failure(is_rate_limit=True, retry_after=retry_after_val, reason="HTTP 429 Too Many Requests")
+        elif 200 <= status_code < 300:
+            self.record_success()
+        elif status_code >= 500:
+            self.record_failure(is_rate_limit=False, reason=f"HTTP {status_code} Server Error")
+
+_PLATFORM_LIMITERS: Dict[str, PlatformRateLimiter] = {
+    "leetcode": PlatformRateLimiter("leetcode", min_interval=3.0, failure_threshold=3, base_open_duration=30.0),
+    "codeforces": PlatformRateLimiter("codeforces", min_interval=2.0, failure_threshold=3, base_open_duration=30.0),
+    "hackerrank": PlatformRateLimiter("hackerrank", min_interval=2.0, failure_threshold=3, base_open_duration=30.0),
+    "codechef": PlatformRateLimiter("codechef", min_interval=3.0, failure_threshold=3, base_open_duration=30.0),
+    "hackerearth": PlatformRateLimiter("hackerearth", min_interval=3.0, failure_threshold=3, base_open_duration=30.0),
+}
+
+def get_rate_limiter(platform: str) -> PlatformRateLimiter:
+    p = platform.lower().strip()
+    if p not in _PLATFORM_LIMITERS:
+        _PLATFORM_LIMITERS[p] = PlatformRateLimiter(p, min_interval=2.0)
+    return _PLATFORM_LIMITERS[p]
+
+get_platform_limiter = get_rate_limiter
+
+_PLATFORM_QUOTA_DIAGNOSTICS: Dict[str, str] = {}
+
+def set_platform_quota_diagnostic(platform: str, reason: str):
+    p = platform.lower().strip()
+    _PLATFORM_QUOTA_DIAGNOSTICS[p] = reason
+
+def get_platform_quota_diagnostic(platform: str) -> str:
+    p = platform.lower().strip()
+    return _PLATFORM_QUOTA_DIAGNOSTICS.get(p, "")
+
+async def detect_security_challenge_or_captcha(page: Page) -> SecurityChallengeDetection:
+    """Detects CAPTCHA, Cloudflare challenges, and login walls without bypassing them."""
+    if not page:
+        return SecurityChallengeDetection(detected=False)
+
+    curr_url = ""
+    try:
+        curr_url = page.url or ""
+    except Exception:
+        pass
+
+    # 1. URL-based challenge indicators
+    if any(k in curr_url.lower() for k in ["/challenge-platform/", "/cdn-cgi/challenge-platform/", "/captcha", "/checkpoint", "/login?next=", "/enter?back="]):
+        return SecurityChallengeDetection(
+            detected=True,
+            challenge_type="url_challenge_or_login_barrier",
+            details=f"URL indicates challenge or forced login: {curr_url}",
+            url=curr_url
+        )
+
+    # 2. DOM-based challenge and CAPTCHA indicators
+    check_js = """() => {
+        // Cloudflare IUAM / Turnstile full-page challenge or interstitial
+        const title = (document.title || '').toLowerCase();
+        if (title.includes('just a moment') || title.includes('attention required') || title.includes('security check')) {
+            return { detected: true, type: 'cloudflare_iuam', details: `Challenge page title: ${document.title}` };
+        }
+
+        const cfChallenge = document.querySelector('#challenge-running, #cf-challenge-running, #challenge-form, .cf-browser-verification, #cf-wrapper #challenge-stage, #challenge-stage');
+        if (cfChallenge) {
+            return { detected: true, type: 'cloudflare_turnstile', details: 'Cloudflare Turnstile or IUAM challenge container detected' };
+        }
+
+        // Active Turnstile interactive challenge or turnstileToken gate (only if main content is absent)
+        const turnstileIframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+        if (turnstileIframe) {
+            const hasContent = !!document.querySelector('.problem-statement, #pageContent, div[class*="description"], .challenge-body-html, div[class*="overflow-y-auto"]');
+            if (!hasContent) {
+                return { detected: true, type: 'cloudflare_turnstile', details: 'Blocking Cloudflare Turnstile challenge iframe detected' };
+            }
+        }
+
+        // Google reCAPTCHA (interactive challenge puzzle only, ignore invisible footer badge)
+        const recaptchaFrame = document.querySelector('iframe[src*="recaptcha/api2/bframe"], iframe[src*="recaptcha"][title*="challenge"]');
+        const normalRecaptcha = document.querySelector('.g-recaptcha:not([data-size="invisible"]), #g-recaptcha:not([data-size="invisible"])');
+        if (recaptchaFrame || normalRecaptcha) {
+            return { detected: true, type: 'recaptcha', details: 'Google reCAPTCHA interactive challenge detected' };
+        }
+
+        // hCaptcha
+        const hcaptcha = document.querySelector('iframe[src*="assets.hcaptcha.com/check"], iframe[data-hcaptcha-widget-id]');
+        if (hcaptcha) {
+            return { detected: true, type: 'hcaptcha', details: 'hCaptcha iframe or container detected' };
+        }
+
+        // Generic anti-bot / captcha text (only if main content is absent)
+        const bodyText = (document.body ? document.body.innerText || '' : '').toLowerCase();
+        if (bodyText.includes('please verify you are a human') || bodyText.includes('confirm you are human') || bodyText.includes('complete the security check')) {
+            const hasContent = !!document.querySelector('.problem-statement, #pageContent, div[class*="description"], .challenge-body-html, div[class*="overflow-y-auto"]');
+            if (!hasContent) {
+                return { detected: true, type: 'generic_captcha', details: 'Human verification prompt detected in page text' };
+            }
+        }
+
+        return { detected: false };
+    }"""
+    try:
+        res = await page.evaluate(check_js)
+        if isinstance(res, dict) and res.get("detected"):
+            return SecurityChallengeDetection(
+                detected=True,
+                challenge_type=res.get("type", "unknown_challenge"),
+                details=res.get("details", ""),
+                url=curr_url
+            )
+    except Exception:
+        pass
+
+    return SecurityChallengeDetection(detected=False, url=curr_url)
+
+async def check_live_or_rated_contest(page: Page, url: str, platform_type: str) -> Tuple[bool, Optional[str]]:
+    """Checks whether the target problem is inside an active, live, or rated contest to prevent automated submission."""
+    url_lower = (url or "").lower()
+    if page:
+        contest_check_js = """() => {
+            const timer = document.querySelector('.contest-timer, .countdown, [data-testid="contest-timer"], [class*="contestTimer"]');
+            if (timer && (timer.innerText || '').trim().length > 0) {
+                return { is_live: true, reason: `Active countdown timer detected: ${timer.innerText.trim()}` };
+            }
+            const liveBadge = document.querySelector('.live-contest-banner, .contest-status-live');
+            if (liveBadge) {
+                return { is_live: true, reason: 'Live contest banner detected' };
+            }
+            const hasLiveText = Array.from(document.querySelectorAll('div, span')).some(d => (d.innerText || '').includes('Contest is running'));
+            if (hasLiveText) {
+                return { is_live: true, reason: 'Live contest banner detected' };
+            }
+            return { is_live: false };
+        }"""
+        try:
+            res = await page.evaluate(contest_check_js)
+            if isinstance(res, dict) and res.get("is_live"):
+                return True, res.get("reason", "Active contest detected on page")
+        except Exception:
+            pass
+
+    if "/weekly-contest-" in url_lower or "/biweekly-contest-" in url_lower:
+        return True, "LeetCode weekly/biweekly contest problems require manual contest participation"
+
+    return False, None
+
+async def resolve_verified_selector(
+    page: Page,
+    selectors: List[str],
+    role: str,
+    target_verifier: Optional[Callable[[str], bool]] = None,
+    timeout_ms: int = 4000
+) -> SelectorResolutionResult:
+    """Tries selectors in order, tracking failed locators for stale selector diagnostics,
+    and verifying element target identity before returning."""
+    failed: List[Tuple[str, str]] = []
+    for selector in selectors:
+        try:
+            loc = page.locator(selector).first
+            if await loc.count() > 0:
+                is_vis = await loc.is_visible()
+                if is_vis:
+                    text = ""
+                    try:
+                        text = (await loc.inner_text()).strip()
+                    except Exception:
+                        pass
+                    if target_verifier:
+                        if target_verifier(text):
+                            return SelectorResolutionResult(
+                                success=True,
+                                matched_selector=selector,
+                                element=loc,
+                                failed_selectors=failed,
+                                role=role
+                            )
+                        else:
+                            failed.append((selector, f"Target identity verification failed for text preview: {text[:60]}..."))
+                    else:
+                        return SelectorResolutionResult(
+                            success=True,
+                            matched_selector=selector,
+                            element=loc,
+                            failed_selectors=failed,
+                            role=role
+                        )
+                else:
+                    failed.append((selector, "Element present but not visible"))
+            else:
+                failed.append((selector, "Selector matched 0 elements"))
+        except Exception as e:
+            failed.append((selector, f"Locator error: {e}"))
+
+    if failed:
+        first_few = "; ".join([f"{sel} ({err})" for sel, err in failed[:3]])
+        print(f"   ⚠️ Stale or unverified selectors detected for [{role}]: {first_few}")
+
+    return SelectorResolutionResult(success=False, failed_selectors=failed, role=role)
+
+class BrowserManager:
+    """Manages browser lifecycle, health checks, reconnection strategies, and clean shutdown."""
+
+    @staticmethod
+    async def is_healthy(page: Optional[Page]) -> bool:
+        if not page:
+            return False
+        try:
+            if hasattr(page, "is_closed") and page.is_closed():
+                return False
+            val = await asyncio.wait_for(page.evaluate("1 + 1"), timeout=3.0)
+            return val == 2
+        except Exception:
+            return False
+
+    @staticmethod
+    async def reconnect(p_playwright=None, browser=None, context=None, cdp_port: int = 9222) -> Tuple[Any, Any, Page]:
+        """Safely reconnects to Chrome over CDP if the current session or page is broken."""
+        print("   🔄 BrowserManager: Reconnecting to Chrome via CDP...")
+        if browser:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+        if p_playwright:
+            try:
+                browser = await p_playwright.chromium.connect_over_cdp(f"http://localhost:{cdp_port}")
+                context = browser.contexts[0] if browser.contexts else await browser.new_context()
+                page = await context.new_page()
+                print("   ✅ BrowserManager: Reconnected cleanly to Chrome via CDP!")
+                return browser, context, page
+            except Exception as e:
+                print(f"   ⚠️ BrowserManager reconnection notice: {e}")
+
+        if context:
+            try:
+                page = await context.new_page()
+                return browser, context, page
+            except Exception:
+                pass
+
+        raise RuntimeError("BrowserManager: Unable to re-establish connection to browser.")
+
+    @staticmethod
+    async def clean_shutdown(browser=None, context=None, page=None, p_playwright=None):
+        """Cleanly releases all browser and playwright resources."""
+        if page:
+            try:
+                if not (hasattr(page, "is_closed") and page.is_closed()):
+                    await page.close()
+            except Exception:
+                pass
+        if context:
+            try:
+                await context.close()
+            except Exception:
+                pass
+        if browser:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+        if p_playwright:
+            try:
+                await p_playwright.stop()
+            except Exception:
+                pass
+        print("   🧹 BrowserManager: Resources shut down cleanly.")
+
+def get_repo_default_branch(repo_dir: Union[Path, str]) -> str:
+    """Detects the default branch for a git repository (e.g. main, master)."""
+    r_dir = Path(repo_dir)
+    # 1. Try git symbolic-ref
+    try:
+        res = subprocess.run(
+            ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+            cwd=r_dir,
+            capture_output=True,
+            text=True
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            ref = res.stdout.strip()
+            return ref.split("/")[-1]
+    except Exception:
+        pass
+
+    # 2. Try git remote show origin
+    try:
+        res = subprocess.run(
+            ["git", "remote", "show", "origin"],
+            cwd=r_dir,
+            capture_output=True,
+            text=True
+        )
+        if res.returncode == 0 and res.stdout:
+            for line in res.stdout.splitlines():
+                if "HEAD branch:" in line:
+                    b = line.split(":")[-1].strip()
+                    if b:
+                        return b
+    except Exception:
+        pass
+
+    # 3. Try current local branch
+    try:
+        res = subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=r_dir,
+            capture_output=True,
+            text=True
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            return res.stdout.strip()
+    except Exception:
+        pass
+
+    # 4. Fallback to main
+    return "main"
+
+@dataclass
+class PollingConfig:
+    max_timeout: float = 45.0
+    initial_interval: float = 1.0
+    max_interval: float = 5.0
+    backoff_factor: float = 1.4
+    max_polls: int = 25
+
+async def poll_with_backoff(
+    config: Optional[PollingConfig] = None,
+    timeout: Optional[float] = None,
+    max_polls: Optional[int] = None,
+    initial_interval: Optional[float] = None,
+    max_interval: Optional[float] = None,
+    backoff_factor: Optional[float] = None,
+):
+    """Async generator yielding (poll_number, elapsed_seconds) with exponential backoff bounded by max_timeout."""
+    cfg = config or PollingConfig()
+    max_to = timeout if timeout is not None else cfg.max_timeout
+    polls_limit = max_polls if max_polls is not None else cfg.max_polls
+    curr_interval = initial_interval if initial_interval is not None else cfg.initial_interval
+    max_int = max_interval if max_interval is not None else cfg.max_interval
+    b_factor = backoff_factor if backoff_factor is not None else cfg.backoff_factor
+
+    start_time = time.time()
+    poll_count = 0
+
+    while poll_count < polls_limit:
+        elapsed = time.time() - start_time
+        if elapsed >= max_to and poll_count > 0:
+            break
+
+        poll_count += 1
+        yield poll_count, elapsed
+
+        remaining = max_to - (time.time() - start_time)
+        if remaining <= 0:
+            break
+        sleep_dur = min(curr_interval, remaining)
+        if sleep_dur > 0:
+            await asyncio.sleep(sleep_dur)
+        curr_interval = min(curr_interval * b_factor, max_int)
+
+
+# ==============================================================================
+# Configuration & Environment Setup (Cloud-Native & Environment-Driven)
 # ==============================================================================
 BASE_DIR = Path(__file__).resolve().parent
+
+# Configurable writable data directory: defaults to /app/data in container, or BASE_DIR locally
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data" if Path("/app/data").exists() else BASE_DIR))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 CONFIG_DIR = Path.home() / ".autocoder"
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
-# Auto-load .env file from working directory, user config dir, or base dir
+# Auto-load .env file from working directory, user config dir, data dir, or base dir
 env_candidates = [
     Path.cwd() / ".env",
+    DATA_DIR / ".env",
     CONFIG_DIR / ".env",
     BASE_DIR / ".env",
 ]
@@ -51,21 +891,406 @@ for _env in env_candidates:
         except Exception:
             pass
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+SOLUTIONS_DIR = Path(os.environ.get("SOLUTIONS_DIR", DATA_DIR / "solutions"))
+SOLUTIONS_DIR.mkdir(parents=True, exist_ok=True)
+LOGS_DIR = Path(os.environ.get("LOGS_DIR", DATA_DIR / "logs"))
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
+REPOS_DIR = Path(os.environ.get("REPOS_DIR", DATA_DIR / "repos"))
+REPOS_DIR.mkdir(parents=True, exist_ok=True)
+CHROME_USER_DATA_DIR = Path(os.environ.get("CHROME_USER_DATA_DIR", DATA_DIR / "chrome_user_data"))
+DEFAULT_DB_FILE = Path(os.environ.get("DB_PATH", DATA_DIR / "autocoder.db"))
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+
+# Cloud Run / Container Execution Flags
+DRY_RUN = os.environ.get("DRY_RUN", "").lower() in ("true", "1", "yes")
+OFFLINE_MODE = os.environ.get("OFFLINE_MODE", "").lower() in ("true", "1", "yes")
+MAX_RUN_DURATION_SECONDS = int(os.environ.get("MAX_RUN_DURATION_SECONDS", "3600"))
+STRUCTURED_LOGGING = (
+    os.environ.get("STRUCTURED_LOGGING", "").lower() in ("true", "1", "yes")
+    or bool(os.environ.get("K_SERVICE") or os.environ.get("CLOUD_RUN_JOB"))
+)
+
+def log_event(
+    level: str,
+    message: str,
+    run_id: Optional[Union[int, str]] = None,
+    problem_id: Optional[Union[int, str]] = None,
+    platform: Optional[str] = None,
+    attempt_id: Optional[Union[int, str]] = None,
+    state: Optional[str] = None,
+    duration: Optional[float] = None,
+    failure_code: Optional[Union[str, FailureCode]] = None,
+    **kwargs
+):
+    """
+    Outputs structured JSON for Google Cloud Logging when enabled, else formatted console print.
+    Includes run_id, problem_id, platform, attempt_id, state, duration, and failure_code.
+    Safeguard: Never logs an unconfirmed submission as ACCEPTED.
+    """
+    level = level.upper()
+    redacted_msg = redact_sensitive_data(message)
+
+    # Requirement 11: Never log an unconfirmed submission as accepted
+    if state == "ACCEPTED":
+        confirmed = kwargs.get("confirmed", True)
+        if not confirmed or kwargs.get("unconfirmed", False) or kwargs.get("mode") in ["run", "save"]:
+            state = "SUBMITTED"
+
+    f_code_str = (
+        failure_code.value
+        if hasattr(failure_code, "value")
+        else (str(failure_code) if failure_code is not None else None)
+    )
+
+    if STRUCTURED_LOGGING:
+        payload = {
+            "severity": level,
+            "message": redacted_msg,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "component": "autocoder",
+        }
+        if run_id is not None:
+            payload["run_id"] = run_id
+        if problem_id is not None:
+            payload["problem_id"] = str(problem_id)
+        if platform is not None:
+            payload["platform"] = str(platform)
+        if attempt_id is not None:
+            payload["attempt_id"] = attempt_id
+        if state is not None:
+            payload["state"] = str(state)
+        if duration is not None:
+            payload["duration"] = round(float(duration), 3)
+        if f_code_str is not None:
+            payload["failure_code"] = f_code_str
+
+        for k, v in kwargs.items():
+            if k not in payload and k not in ["confirmed", "unconfirmed"]:
+                payload[k] = redact_sensitive_data(str(v)) if isinstance(v, str) else v
+        out = sys.stdout if level in ["INFO", "DEBUG"] else sys.stderr
+        out.write(json.dumps(payload) + "\n")
+        out.flush()
+    else:
+        prefix = {
+            "INFO": "ℹ️ ",
+            "WARNING": "⚠️ ",
+            "ERROR": "❌",
+            "DEBUG": "🔍"
+        }.get(level, "")
+        extra_parts = []
+        if state:
+            extra_parts.append(f"state={state}")
+        if f_code_str:
+            extra_parts.append(f"code={f_code_str}")
+        if duration is not None:
+            extra_parts.append(f"{duration:.2f}s")
+        extra_str = f" [{', '.join(extra_parts)}]" if extra_parts else ""
+        print(f"{prefix} {redacted_msg}{extra_str}")
+
+class NotificationEvent(str, Enum):
+    AUTH_REQUIRED = "AUTH_REQUIRED"
+    QUOTA_MISSED = "QUOTA_MISSED"
+    RUN_FAILED = "RUN_FAILED"
+
+class NotificationManager:
+    """Dispatches notifications to opt-in channels (webhook/slack/discord/console) when triggered."""
+    def __init__(
+        self,
+        webhook_url: Optional[str] = None,
+        channel: Optional[str] = None,
+        enabled: Optional[bool] = None
+    ):
+        self.webhook_url = (webhook_url or os.environ.get("NOTIFICATION_WEBHOOK_URL", "")).strip()
+        self.channel = (channel or os.environ.get("NOTIFICATION_CHANNEL", "console" if self.webhook_url else "none")).lower()
+        if enabled is not None:
+            self.enabled = enabled
+        else:
+            self.enabled = (
+                os.environ.get("NOTIFICATION_ENABLED", "").lower() in ("true", "1", "yes")
+                or bool(self.webhook_url)
+            )
+
+    def send_notification(
+        self,
+        event: Union[NotificationEvent, str],
+        title: str,
+        message: str,
+        platform: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        if not self.enabled or self.channel in ("none", "disabled", "off"):
+            return False
+
+        ev_str = event.value if hasattr(event, "value") else str(event)
+        redacted_title = redact_sensitive_data(title)
+        redacted_msg = redact_sensitive_data(message)
+        redacted_details = {}
+        if details:
+            for k, v in details.items():
+                redacted_details[k] = redact_sensitive_data(str(v)) if isinstance(v, str) else v
+
+        payload = {
+            "event": ev_str,
+            "title": redacted_title,
+            "message": redacted_msg,
+            "platform": platform or "all",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "details": redacted_details
+        }
+
+        # Format for Slack/Discord webhooks if channel specified
+        post_data = payload
+        if self.channel == "slack":
+            post_data = {
+                "text": f"*{redacted_title}*\n{redacted_msg}",
+                "attachments": [{"fields": [{"title": k, "value": str(v), "short": True} for k, v in redacted_details.items()]}]
+            }
+        elif self.channel == "discord":
+            post_data = {
+                "content": f"**{redacted_title}**\n{redacted_msg}"
+            }
+
+        if self.webhook_url:
+            try:
+                req = urllib.request.Request(
+                    self.webhook_url,
+                    data=json.dumps(post_data).encode("utf-8"),
+                    headers={"Content-Type": "application/json", "User-Agent": "AutoCoder-Bot/1.0"},
+                    method="POST"
+                )
+                with urllib.request.urlopen(req, timeout=10.0) as resp:
+                    success = 200 <= resp.status < 300
+                    if success:
+                        log_event("INFO", f"Notification delivered successfully ({ev_str})", event=ev_str, platform=platform)
+                    return success
+            except Exception as e:
+                # Notification failures MUST NEVER crash the worker!
+                log_event("WARNING", f"Failed to deliver notification to {self.webhook_url}: {e}", event=ev_str, error=str(e))
+                return False
+        elif self.channel == "console":
+            print("\n" + "🔔" * 35)
+            print(f"🔔 [NOTIFICATION: {ev_str}] {redacted_title}")
+            print(f"   {redacted_msg}")
+            if platform:
+                print(f"   Platform: {platform.upper()}")
+            print("🔔" * 35 + "\n")
+            return True
+
+        return False
+
+NOTIFICATION_MANAGER = NotificationManager()
+
+def get_secret(secret_key: str, default: str = "") -> str:
+    """Retrieves secret from Secret Manager if running on GCP with project id or secret path, else environment."""
+    val = os.environ.get(secret_key, "").strip()
+    if val and not val.startswith("projects/"):
+        return val
+
+    secret_ref = val or os.environ.get(f"SECRET_{secret_key}", "").strip()
+    project_id = os.environ.get("GCP_PROJECT_ID") or os.environ.get("GOOGLE_CLOUD_PROJECT")
+
+    if secret_ref or (project_id and secret_key in ["GEMINI_API_KEY", "GITHUB_TOKEN"]):
+        try:
+            from google.cloud import secretmanager
+            client = secretmanager.SecretManagerServiceClient()
+            if secret_ref.startswith("projects/"):
+                name = secret_ref
+                if not name.endswith("/versions/latest") and "/versions/" not in name:
+                    name = f"{name}/versions/latest"
+            else:
+                s_name = secret_ref or secret_key
+                name = f"projects/{project_id}/secrets/{s_name}/versions/latest"
+
+            res = client.access_secret_version(request={"name": name})
+            retrieved = res.payload.data.decode("UTF-8").strip()
+            if retrieved:
+                log_event("INFO", f"Loaded secret for '{secret_key}' from Secret Manager ({name})")
+                return retrieved
+        except Exception as e:
+            log_event("WARNING", f"Secret Manager lookup for '{secret_key}' notice: {e}")
+
+    if DRY_RUN:
+        return f"dry_run_{secret_key.lower()}"
+    return default
+
+GEMINI_API_KEY = get_secret("GEMINI_API_KEY", "")
 GITHUB_USERNAME = os.environ.get("GITHUB_USERNAME", "").strip()
+GITHUB_TOKEN = get_secret("GITHUB_TOKEN", "")
 CODEFORCES_HANDLE = os.environ.get("CODEFORCES_HANDLE", "").strip()
 
+# Signal handling for Cloud Run Jobs SIGTERM
+SHUTDOWN_REQUESTED = False
+
+def handle_sigterm(signum, frame):
+    global SHUTDOWN_REQUESTED
+    SHUTDOWN_REQUESTED = True
+    sig_name = "SIGTERM" if signum == signal.SIGTERM else "SIGINT"
+    log_event("WARNING", f"Received {sig_name}. Initiating graceful shutdown and lease release...")
+    try:
+        if SolvedRegistry._db and getattr(SolvedRegistry, "_active_worker_id", None):
+            SolvedRegistry._db.recover_expired_leases(lease_timeout_sec=0)
+    except Exception:
+        pass
+
+try:
+    signal.signal(signal.SIGTERM, handle_sigterm)
+    signal.signal(signal.SIGINT, handle_sigterm)
+except (ValueError, AttributeError):
+    pass
+
+@dataclass
+class CloudWorkerConfig:
+    mode: str
+    platform: str
+    count: int
+    difficulty: str
+    dry_run: bool
+    offline_mode: bool
+    database_url: str
+    gemini_key_present: bool
+    github_auth_present: bool
+    max_duration: int
+
+def validate_startup_configuration(
+    mode: str = "both",
+    platform: str = "all",
+    count: int = 5,
+    difficulty: str = "medium-hard",
+    dry_run: bool = False,
+    offline_mode: bool = False,
+    timeout: Optional[int] = None
+) -> CloudWorkerConfig:
+    """Validates configuration at startup and fails fast with actionable errors."""
+    is_dry = dry_run or DRY_RUN
+    is_offline = offline_mode or OFFLINE_MODE
+    duration = timeout if timeout is not None else MAX_RUN_DURATION_SECONDS
+
+    gemini_present = bool(GEMINI_API_KEY) or is_dry
+    github_present = bool(GITHUB_USERNAME) and (bool(GITHUB_TOKEN) or os.environ.get("GITHUB_TOKEN"))
+
+    errors = []
+    if not is_dry and not gemini_present:
+        errors.append("GEMINI_API_KEY environment variable (or Secret Manager secret) is missing.")
+
+    if mode in ["submit", "both"] and not is_dry and not is_offline:
+        if not GITHUB_USERNAME:
+            log_event("WARNING", "GITHUB_USERNAME is not set. Publishing to GitHub will be skipped.")
+
+    if errors:
+        err_msg = "Startup configuration validation failed: " + "; ".join(errors)
+        log_event("ERROR", err_msg)
+        raise ValueError(err_msg)
+
+    cfg = CloudWorkerConfig(
+        mode=mode,
+        platform=platform,
+        count=count,
+        difficulty=difficulty,
+        dry_run=is_dry,
+        offline_mode=is_offline,
+        database_url=DATABASE_URL or str(DEFAULT_DB_FILE),
+        gemini_key_present=gemini_present,
+        github_auth_present=github_present or is_dry,
+        max_duration=duration
+    )
+    log_event("INFO", "Cloud worker configuration validated successfully",
+              mode=mode, platform=platform, count=count, dry_run=is_dry, offline=is_offline)
+    return cfg
+
+def get_chrome_executable_path() -> Optional[str]:
+    """Detects available Chrome or Chromium binary across Linux, macOS, and container environments."""
+    custom = os.environ.get("CHROME_PATH")
+    if custom and os.path.exists(custom):
+        return custom
+
+    if sys.platform == "darwin":
+        mac_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        if os.path.exists(mac_path):
+            return mac_path
+
+    # Linux / container paths
+    candidates = [
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/opt/google/chrome/chrome",
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    which_chrome = shutil.which("google-chrome") or shutil.which("chromium") or shutil.which("chromium-browser")
+    if which_chrome:
+        return which_chrome
+    return None
+
 AI_MODELS = [
+    "gemini-3.1-flash-lite",
+    "gemini-3.5-flash-lite",
     "gemini-2.5-flash",
     "gemini-3.5-flash",
     "gemini-3.6-flash",
-    "gemini-3.1-flash-lite",
 ]
-SOLUTIONS_DIR = BASE_DIR / "solutions"
-SOLUTIONS_DIR.mkdir(parents=True, exist_ok=True)
-LOGS_DIR = BASE_DIR / "logs"
-LOGS_DIR.mkdir(parents=True, exist_ok=True)
-DEFAULT_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+DEFAULT_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+SUBMISSIONS_LOG_FILE = LOGS_DIR / "submissions.jsonl"
+
+def record_submission_evidence(
+    verdict: SubmissionVerdict,
+    url: str,
+    platform_type: str,
+    code: Optional[str] = None
+):
+    """Persists detailed submission evidence to logs/submissions.jsonl to guarantee auditability."""
+    try:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        record = {
+            "timestamp": datetime.now().isoformat(),
+            "epoch": time.time(),
+            "platform": platform_type,
+            "url": url,
+            "problem_id": verdict.problem_id,
+            "submission_id": verdict.submission_id,
+            "account": verdict.account,
+            "verdict": verdict.state.value,
+            "message": verdict.message,
+            "correlation_mechanism": verdict.correlation_mechanism,
+            "evidence": verdict.evidence,
+        }
+        with open(SUBMISSIONS_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception as e:
+        print(f"   ⚠️  Could not persist submission evidence: {e}")
+
+def extract_problem_id(url: str, platform_type: str) -> str:
+    """Extracts a normalized problem identifier from a platform URL."""
+    clean_url = url.strip().rstrip("/")
+    if platform_type == "codeforces":
+        m = re.search(r"/(?:problemset/problem|contest)/(\d+)/(?:problem/)?([A-Za-z0-9]+)", clean_url)
+        if m:
+            return f"{m.group(1)}{m.group(2).upper()}"
+        parts = clean_url.split("/")
+        if len(parts) >= 2:
+            return f"{parts[-2]}{parts[-1]}".upper()
+        return parts[-1].upper()
+    elif platform_type == "hackerrank":
+        m = re.search(r"/challenges/([^/]+)", clean_url)
+        return m.group(1) if m else clean_url.split("/")[-1]
+    elif platform_type == "leetcode":
+        m = re.search(r"/problems/([^/]+)", clean_url)
+        return m.group(1) if m else clean_url.split("/")[-1]
+    elif platform_type == "codechef":
+        m = re.search(r"/problems/([^/]+)", clean_url)
+        return m.group(1) if m else clean_url.split("/")[-1]
+    elif platform_type == "hackerearth":
+        m = re.search(r"/(?:algorithm|approximate)/([^/]+)", clean_url)
+        if m:
+            return m.group(1)
+        m2 = re.search(r"/practice-problems/(?:algorithm/)?([^/]+)", clean_url)
+        if m2:
+            return m2.group(1)
+        return clean_url.split("/")[-1]
+    return clean_url.split("/")[-1]
+
 
 # ==============================================================================
 # Platform Rules & Selectors
@@ -187,90 +1412,1325 @@ class CodingAnswer(BaseModel):
 
 # ==============================================================================
 # ==============================================================================
-# Central Solved Registry (Eliminates All Repeated Questions)
+# Persistent SQLite Storage Engine & Solved Registry
 # ==============================================================================
-HISTORY_FILE = BASE_DIR / "solved_history.json"
-if not HISTORY_FILE.exists() and (CONFIG_DIR / "solved_history.json").exists():
+if os.environ.get("HISTORY_FILE"):
+    HISTORY_FILE = Path(os.environ["HISTORY_FILE"])
+elif (DATA_DIR / "solved_history.json").exists():
+    HISTORY_FILE = DATA_DIR / "solved_history.json"
+elif (CONFIG_DIR / "solved_history.json").exists():
     HISTORY_FILE = CONFIG_DIR / "solved_history.json"
+elif (BASE_DIR / "solved_history.json").exists():
+    HISTORY_FILE = BASE_DIR / "solved_history.json"
+else:
+    HISTORY_FILE = DATA_DIR / "solved_history.json"
+
+if os.environ.get("DB_PATH"):
+    DEFAULT_DB_FILE = Path(os.environ["DB_PATH"])
+elif (DATA_DIR / "autocoder.db").exists():
+    DEFAULT_DB_FILE = DATA_DIR / "autocoder.db"
+elif (CONFIG_DIR / "autocoder.db").exists():
+    DEFAULT_DB_FILE = CONFIG_DIR / "autocoder.db"
+elif (BASE_DIR / "autocoder.db").exists():
+    DEFAULT_DB_FILE = BASE_DIR / "autocoder.db"
+else:
+    DEFAULT_DB_FILE = DATA_DIR / "autocoder.db"
+
+TRANSIENT_ERROR_SUBSTRINGS = [
+    "timeout", "timed out", "econnreset", "connection reset",
+    "network error", "rate limit", "503", "502", "504", "temporary",
+    "cdp reconnection notice", "session closed", "target closed"
+]
+
+def is_transient_error(error_msg: Optional[str]) -> bool:
+    """Classifies whether an error message indicates a transient recoverable failure."""
+    if not error_msg:
+        return False
+    return classify_failure(error_msg) == FailureCode.TRANSIENT
+
+def normalize_problem_identity(url_or_slug: str, platform: Optional[str] = None) -> Tuple[str, str]:
+    """
+    Normalizes any problem URL, slug, or identifier into a canonical (platform, canonical_id) pair.
+    Handles query strings, hash fragments, trailing slashes, subpaths (/description, /problem),
+    and platform-specific conventions.
+    """
+    raw = url_or_slug.strip()
+    detected_platform = platform.lower().strip() if platform else None
+    if not detected_platform:
+        if "leetcode.com" in raw:
+            detected_platform = "leetcode"
+        elif "codeforces.com" in raw:
+            detected_platform = "codeforces"
+        elif "hackerrank.com" in raw:
+            detected_platform = "hackerrank"
+        elif "codechef.com" in raw:
+            detected_platform = "codechef"
+        elif "hackerearth.com" in raw:
+            detected_platform = "hackerearth"
+        else:
+            detected_platform = "leetcode"
+
+    # Strip query parameters (?...) and hash fragments (#...)
+    clean = re.sub(r"[?#].*$", "", raw).rstrip("/")
+
+    if detected_platform == "leetcode":
+        m = re.search(r"/problems/([^/]+)", clean)
+        slug = m.group(1) if m else clean.split("/")[-1]
+        canonical = re.sub(r"[\s_]+", "-", slug).strip("-").lower()
+        return detected_platform, canonical
+
+    elif detected_platform == "codeforces":
+        m = re.search(r"/(?:problemset/problem|contest)/(\d+)/(?:problem/)?([A-Za-z0-9]+)", clean)
+        if m:
+            canonical = f"{m.group(1)}{m.group(2).upper()}"
+            return detected_platform, canonical
+        parts = clean.split("/")
+        if len(parts) >= 2 and parts[-2].isdigit():
+            canonical = f"{parts[-2]}{parts[-1].upper()}"
+            return detected_platform, canonical
+        slug = parts[-1]
+        m_direct = re.match(r"^(\d+)[_\-]?([A-Za-z0-9]+)$", slug)
+        if m_direct:
+            canonical = f"{m_direct.group(1)}{m_direct.group(2).upper()}"
+        else:
+            canonical = re.sub(r"[^A-Za-z0-9]", "", slug).upper()
+        return detected_platform, canonical
+
+    elif detected_platform == "hackerrank":
+        m = re.search(r"/challenges/([^/]+)", clean)
+        if m:
+            slug = m.group(1)
+        else:
+            slug = clean.split("/")[-1]
+        if slug in ["problem", "submissions", "leaderboard"]:
+            parts = clean.split("/")
+            slug = parts[-2] if len(parts) >= 2 else slug
+        canonical = re.sub(r"[\s_]+", "-", slug).strip("-").lower()
+        return detected_platform, canonical
+
+    elif detected_platform == "codechef":
+        m = re.search(r"/(?:problems|practice/course/[^/]+)/([^/]+)", clean)
+        if m:
+            slug = m.group(1)
+        else:
+            slug = clean.split("/")[-1]
+        canonical = re.sub(r"[^A-Za-z0-9_]", "", slug).strip("_").upper()
+        return detected_platform, canonical
+
+    elif detected_platform == "hackerearth":
+        m = re.search(r"/(?:algorithm|approximate)/([^/]+)", clean)
+        if m:
+            slug = m.group(1)
+        else:
+            m2 = re.search(r"/practice-problems/(?:algorithm/)?([^/]+)", clean)
+            slug = m2.group(1) if m2 else clean.split("/")[-1]
+        canonical = re.sub(r"[\s_]+", "-", slug).strip("-").lower()
+        return detected_platform, canonical
+
+    slug = clean.split("/")[-1]
+    return detected_platform, slug.lower()
+
+
+class DatabaseManager:
+    """Persistent storage engine for problems, attempts, submissions, verdicts, publish jobs, and daily runs (SQLite & PostgreSQL dual-compatible)."""
+
+    def __init__(
+        self,
+        db_path: Optional[Union[str, Path]] = None,
+        database_url: Optional[str] = None,
+        auto_migrate: bool = True
+    ):
+        raw_url = database_url or DATABASE_URL or os.environ.get("DATABASE_URL", "").strip()
+        self.is_postgres = bool(raw_url and (raw_url.startswith("postgresql://") or raw_url.startswith("postgres://")))
+        self.database_url = raw_url if self.is_postgres else None
+
+        if not self.is_postgres:
+            if db_path is not None:
+                self.db_path = Path(db_path)
+            else:
+                env_db = os.environ.get("AUTOCODER_DB_PATH") or os.environ.get("DB_PATH")
+                self.db_path = Path(env_db) if env_db else DEFAULT_DB_FILE
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            self.db_path = None
+
+        self._init_db()
+        if auto_migrate and not self.is_postgres:
+            self.migrate_from_solved_history_if_needed()
+
+    @contextmanager
+    def get_connection(self):
+        if self.is_postgres:
+            if psycopg2 is None:
+                raise RuntimeError("psycopg2 is required for PostgreSQL. Please install psycopg2-binary.")
+            conn = psycopg2.connect(self.database_url, cursor_factory=psycopg2.extras.DictCursor)
+            try:
+                yield conn
+            finally:
+                conn.close()
+        else:
+            conn = sqlite3.connect(
+                str(self.db_path),
+                timeout=30.0,
+                isolation_level=None,
+                detect_types=sqlite3.PARSE_DECLTYPES
+            )
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA journal_mode = WAL")
+            try:
+                yield conn
+            finally:
+                conn.close()
+
+    def _execute(self, conn, sql: str, params: Optional[Union[tuple, list]] = None):
+        """Executes a SQL query, adapting syntax and placeholders between SQLite and PostgreSQL."""
+        cursor = conn.cursor()
+        effective_sql = sql
+        effective_params = list(params) if params is not None else []
+        if self.is_postgres:
+            # Replace SQLite ? placeholder with PostgreSQL %s
+            effective_sql = effective_sql.replace("?", "%s")
+            trimmed = effective_sql.strip().upper()
+            if trimmed.startswith("BEGIN IMMEDIATE") or trimmed.startswith("BEGIN"):
+                return cursor
+            if trimmed.startswith("COMMIT"):
+                conn.commit()
+                return cursor
+            # DDL replacements
+            effective_sql = effective_sql.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+            effective_sql = effective_sql.replace("REAL", "DOUBLE PRECISION")
+            cursor.execute(effective_sql, effective_params)
+        else:
+            cursor.execute(effective_sql, effective_params)
+        return cursor
+
+    def _init_db(self):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            self._execute(conn, "BEGIN IMMEDIATE")
+            self._execute(conn, """
+                CREATE TABLE IF NOT EXISTS problems (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    platform TEXT NOT NULL,
+                    canonical_id TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    title TEXT,
+                    difficulty TEXT,
+                    status TEXT NOT NULL DEFAULT 'DISCOVERED',
+                    claimed_by TEXT,
+                    claimed_at REAL,
+                    heartbeat_at REAL,
+                    lease_timeout REAL DEFAULT 300.0,
+                    failure_reason TEXT,
+                    failure_count INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(platform, canonical_id)
+                )
+            """)
+            self._execute(conn, """
+                CREATE TABLE IF NOT EXISTS daily_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_date TEXT NOT NULL,
+                    platform TEXT NOT NULL,
+                    target_quota INTEGER NOT NULL,
+                    attempted_count INTEGER DEFAULT 0,
+                    generated_count INTEGER DEFAULT 0,
+                    compiled_count INTEGER DEFAULT 0,
+                    tested_count INTEGER DEFAULT 0,
+                    accepted_count INTEGER DEFAULT 0,
+                    published_count INTEGER DEFAULT 0,
+                    failed_count INTEGER DEFAULT 0,
+                    skipped_count INTEGER DEFAULT 0,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    status TEXT NOT NULL DEFAULT 'IN_PROGRESS',
+                    locked_by TEXT,
+                    locked_at REAL
+                )
+            """)
+            self._execute(conn, """
+                CREATE TABLE IF NOT EXISTS attempts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    problem_id INTEGER NOT NULL REFERENCES problems(id),
+                    run_id INTEGER REFERENCES daily_runs(id),
+                    platform TEXT NOT NULL,
+                    canonical_id TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    solution_code TEXT,
+                    explanation TEXT,
+                    error TEXT,
+                    is_transient INTEGER DEFAULT 0,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    compiler_output TEXT,
+                    diagnostics TEXT
+                )
+            """)
+            self._execute(conn, """
+                CREATE TABLE IF NOT EXISTS submissions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    attempt_id INTEGER REFERENCES attempts(id),
+                    problem_id INTEGER NOT NULL REFERENCES problems(id),
+                    platform TEXT NOT NULL,
+                    canonical_id TEXT NOT NULL,
+                    submission_id TEXT,
+                    account TEXT,
+                    correlation_mechanism TEXT,
+                    submitted_at TEXT NOT NULL,
+                    payload TEXT
+                )
+            """)
+            self._execute(conn, """
+                CREATE TABLE IF NOT EXISTS judge_verdicts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    submission_id_ref INTEGER REFERENCES submissions(id),
+                    problem_id INTEGER NOT NULL REFERENCES problems(id),
+                    platform TEXT NOT NULL,
+                    canonical_id TEXT NOT NULL,
+                    verdict_state TEXT NOT NULL,
+                    message TEXT,
+                    submission_id TEXT,
+                    evidence TEXT,
+                    verified_at TEXT NOT NULL
+                )
+            """)
+            self._execute(conn, """
+                CREATE TABLE IF NOT EXISTS publish_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    problem_id INTEGER NOT NULL REFERENCES problems(id),
+                    attempt_id INTEGER REFERENCES attempts(id),
+                    platform TEXT NOT NULL,
+                    canonical_id TEXT NOT NULL,
+                    repo_name TEXT,
+                    branch TEXT,
+                    commit_hash TEXT,
+                    status TEXT NOT NULL,
+                    error TEXT,
+                    published_at TEXT NOT NULL
+                )
+            """)
+            self._execute(conn, """
+                CREATE TABLE IF NOT EXISTS sample_test_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    attempt_id INTEGER REFERENCES attempts(id),
+                    sample_index INTEGER NOT NULL,
+                    input_text TEXT,
+                    expected_output TEXT,
+                    actual_output TEXT,
+                    passed INTEGER NOT NULL,
+                    error_message TEXT,
+                    diff TEXT,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            self._execute(conn, """
+                CREATE TABLE IF NOT EXISTS retry_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    problem_id INTEGER NOT NULL REFERENCES problems(id),
+                    platform TEXT NOT NULL,
+                    canonical_id TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    retry_count INTEGER DEFAULT 0,
+                    max_retries INTEGER DEFAULT 3,
+                    failure_code TEXT NOT NULL,
+                    last_error TEXT,
+                    next_retry_at REAL NOT NULL,
+                    backoff_seconds REAL NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'PENDING',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(platform, canonical_id)
+                )
+            """)
+            self._execute(conn, "CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY, migrated_at TEXT)")
+            self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_problems_lookup ON problems(platform, canonical_id)")
+            self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_problems_status ON problems(status)")
+            self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_daily_runs_lookup ON daily_runs(run_date, platform)")
+            self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_judge_verdicts_lookup ON judge_verdicts(platform, canonical_id)")
+            self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_sample_test_attempt ON sample_test_results(attempt_id)")
+            self._execute(conn, "CREATE INDEX IF NOT EXISTS idx_retry_queue_status_next ON retry_queue(status, next_retry_at)")
+
+            if not self.is_postgres:
+                # Add columns to existing SQLite tables if missing
+                cursor.execute("PRAGMA table_info(problems)")
+                prob_cols = [col[1] for col in cursor.fetchall()]
+                if "heartbeat_at" not in prob_cols:
+                    cursor.execute("ALTER TABLE problems ADD COLUMN heartbeat_at REAL")
+                if "lease_timeout" not in prob_cols:
+                    cursor.execute("ALTER TABLE problems ADD COLUMN lease_timeout REAL DEFAULT 300.0")
+
+                cursor.execute("PRAGMA table_info(attempts)")
+                att_cols = [col[1] for col in cursor.fetchall()]
+                if "compiler_output" not in att_cols:
+                    cursor.execute("ALTER TABLE attempts ADD COLUMN compiler_output TEXT")
+                if "diagnostics" not in att_cols:
+                    cursor.execute("ALTER TABLE attempts ADD COLUMN diagnostics TEXT")
+
+                cursor.execute("PRAGMA table_info(daily_runs)")
+                dr_cols = [col[1] for col in cursor.fetchall()]
+                if "locked_by" not in dr_cols:
+                    cursor.execute("ALTER TABLE daily_runs ADD COLUMN locked_by TEXT")
+                if "locked_at" not in dr_cols:
+                    cursor.execute("ALTER TABLE daily_runs ADD COLUMN locked_at REAL")
+                if "tested_count" not in dr_cols:
+                    cursor.execute("ALTER TABLE daily_runs ADD COLUMN tested_count INTEGER DEFAULT 0")
+
+            self._execute(conn, "COMMIT")
+
+    def migrate_from_solved_history_if_needed(self, history_file: Optional[Path] = None, submissions_file: Optional[Path] = None):
+        """
+        Migrates legacy solved_history.json into the SQLite problems and judge_verdicts tables.
+        Entries without confirmed judge evidence in submissions.jsonl are strictly marked UNVERIFIED.
+        """
+        h_file = history_file or HISTORY_FILE
+        s_file = submissions_file or SUBMISSIONS_LOG_FILE
+
+        if not h_file.exists():
+            return
+
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM migrations WHERE name = 'solved_history_migration'")
+            if cursor.fetchone():
+                return  # Migration already completed
+
+            cursor.execute("BEGIN IMMEDIATE")
+
+            # 1. Parse verified evidence from submissions.jsonl if present
+            verified_evidence: Dict[Tuple[str, str], Dict[str, Any]] = {}
+            if s_file.exists():
+                try:
+                    with open(s_file, "r", encoding="utf-8") as sf:
+                        for line in sf:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                entry = json.loads(line)
+                                if entry.get("verdict") == "ACCEPTED":
+                                    p = entry.get("platform")
+                                    u = entry.get("url")
+                                    if p and u:
+                                        _, cid = normalize_problem_identity(u, p)
+                                        verified_evidence[(p, cid)] = entry
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+            # 2. Parse solved_history.json
+            now_iso = get_kolkata_now().isoformat()
+            try:
+                with open(h_file, "r", encoding="utf-8") as f:
+                    history_data = json.load(f)
+            except Exception:
+                history_data = {}
+
+            migrated_count = 0
+            for plat, slugs in history_data.items():
+                for s in slugs:
+                    _, cid = normalize_problem_identity(s, plat)
+                    evidence = verified_evidence.get((plat, cid))
+
+                    status = "ACCEPTED" if evidence else "UNVERIFIED"
+                    url = evidence.get("url") if evidence else f"https://{plat}.com/legacy/{cid}"
+
+                    cursor.execute(
+                        """
+                        INSERT OR IGNORE INTO problems (platform, canonical_id, url, status, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (plat, cid, url, status, now_iso, now_iso)
+                    )
+                    cursor.execute("SELECT id FROM problems WHERE platform = ? AND canonical_id = ?", (plat, cid))
+                    prob_row = cursor.fetchone()
+                    if prob_row:
+                        prob_id = prob_row[0]
+                        verdict_state = "ACCEPTED" if evidence else "UNVERIFIED"
+                        msg = evidence.get("message", "Accepted") if evidence else "Legacy solved_history.json entry without judge evidence"
+                        sub_id = evidence.get("submission_id") if evidence else None
+                        ev_json = json.dumps(evidence) if evidence else None
+
+                        cursor.execute(
+                            """
+                            INSERT INTO judge_verdicts (problem_id, platform, canonical_id, verdict_state, message, submission_id, evidence, verified_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (prob_id, plat, cid, verdict_state, msg, sub_id, ev_json, now_iso)
+                        )
+                        migrated_count += 1
+
+            cursor.execute(
+                "INSERT INTO migrations (name, migrated_at) VALUES ('solved_history_migration', ?)",
+                (now_iso,)
+            )
+            cursor.execute("COMMIT")
+
+    def is_accepted(self, platform: str, url_or_slug: str) -> bool:
+        """Returns True ONLY if the problem has confirmed judge ACCEPTED verdict."""
+        plat, cid = normalize_problem_identity(url_or_slug, platform)
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT p.status, jv.verdict_state
+                FROM problems p
+                LEFT JOIN judge_verdicts jv ON jv.problem_id = p.id AND jv.verdict_state = 'ACCEPTED'
+                WHERE p.platform = ? AND p.canonical_id = ?
+                LIMIT 1
+                """,
+                (plat, cid)
+            )
+            row = cursor.fetchone()
+            if not row:
+                return False
+            status, verdict_state = row[0], row[1]
+            return (status == "ACCEPTED" or verdict_state == "ACCEPTED")
+
+    def is_permanent_failure(self, platform: str, url_or_slug: str, max_failures: int = 3) -> bool:
+        """Returns True if the problem has permanently failed or exceeded max retry attempts."""
+        plat, cid = normalize_problem_identity(url_or_slug, platform)
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT status, failure_count FROM problems WHERE platform = ? AND canonical_id = ?",
+                (plat, cid)
+            )
+            row = cursor.fetchone()
+            if not row:
+                return False
+            status, fail_cnt = row[0], (row[1] or 0)
+            if status in ["FAILED", "REJECTED"]:
+                return True
+            if fail_cnt >= max_failures:
+                return True
+            return False
+
+    def get_accepted_canonical_ids(self, platform: str) -> Set[str]:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT canonical_id FROM problems
+                WHERE platform = ? AND status = 'ACCEPTED'
+                """,
+                (platform,)
+            )
+            return {row[0] for row in cursor.fetchall()}
+
+    def claim_problem(
+        self,
+        platform: str,
+        canonical_id: str,
+        url: str,
+        worker_id: str = "default",
+        lease_timeout_sec: float = 300.0
+    ) -> bool:
+        """
+        Atomically claims a problem for processing using a SQLite transaction with BEGIN IMMEDIATE.
+        Supports safe reclamation of expired leases by recovered workers.
+        Returns True if claim acquired; False if already accepted or actively claimed by another worker.
+        """
+        plat, canon = normalize_problem_identity(canonical_id, platform)
+        platform, canonical_id = plat, canon
+        now = time.time()
+        now_iso = get_kolkata_now().isoformat()
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute(
+                "SELECT id, status, claimed_by, claimed_at, heartbeat_at, lease_timeout FROM problems WHERE platform = ? AND canonical_id = ?",
+                (platform, canonical_id)
+            )
+            row = cursor.fetchone()
+            if row is None:
+                cursor.execute(
+                    """
+                    INSERT INTO problems (platform, canonical_id, url, status, claimed_by, claimed_at, heartbeat_at, lease_timeout, created_at, updated_at)
+                    VALUES (?, ?, ?, 'IN_PROGRESS', ?, ?, ?, ?, ?, ?)
+                    """,
+                    (platform, canonical_id, url, worker_id, now, now, lease_timeout_sec, now_iso, now_iso)
+                )
+                cursor.execute("COMMIT")
+                return True
+
+            prob_id, status, claimed_by, claimed_at, heartbeat_at, db_lease_timeout = (
+                row[0], row[1], row[2], row[3],
+                row[4] if len(row) > 4 else None,
+                row[5] if len(row) > 5 else None
+            )
+            if status == "ACCEPTED":
+                cursor.execute("COMMIT")
+                return False
+
+            if status == "IN_PROGRESS":
+                ref_time = heartbeat_at or claimed_at
+                eff_timeout = db_lease_timeout or lease_timeout_sec
+                if claimed_by != worker_id and ref_time and (now - ref_time) < eff_timeout:
+                    cursor.execute("COMMIT")
+                    return False
+
+            cursor.execute(
+                """
+                UPDATE problems
+                SET status = 'IN_PROGRESS', claimed_by = ?, claimed_at = ?, heartbeat_at = ?, lease_timeout = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (worker_id, now, now, lease_timeout_sec, now_iso, prob_id)
+            )
+            cursor.execute("COMMIT")
+            return True
+
+    def record_heartbeat(self, platform: str, canonical_id: str, worker_id: str = "default") -> bool:
+        """Updates the heartbeat timestamp for an in-progress problem to prevent lease expiration."""
+        plat, cid = normalize_problem_identity(canonical_id, platform)
+        now = time.time()
+        now_iso = get_kolkata_now().isoformat()
+        with self.get_connection() as conn:
+            self._execute(conn, "BEGIN IMMEDIATE")
+            res = self._execute(
+                conn,
+                """
+                UPDATE problems
+                SET heartbeat_at = ?, updated_at = ?
+                WHERE platform = ? AND canonical_id = ? AND status = 'IN_PROGRESS'
+                """,
+                (now, now_iso, plat, cid)
+            )
+            updated = res.rowcount > 0
+            self._execute(conn, "COMMIT")
+            return updated
+
+    def get_problem_id(self, platform: str, canonical_id: str) -> Optional[int]:
+        plat, cid = normalize_problem_identity(canonical_id, platform)
+        with self.get_connection() as conn:
+            cur = self._execute(
+                conn,
+                "SELECT id FROM problems WHERE platform = ? AND canonical_id = ?",
+                (plat, cid)
+            )
+            row = cur.fetchone()
+            return row[0] if row else None
+
+    def release_problem(
+        self,
+        platform: str,
+        canonical_id: str,
+        status: str,
+        failure_reason: Optional[str] = None,
+        is_transient: bool = False
+    ):
+        """Releases or updates the problem status after an attempt finishes."""
+        plat, cid = normalize_problem_identity(canonical_id, platform)
+        now_iso = get_kolkata_now().isoformat()
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute(
+                "SELECT id, failure_count FROM problems WHERE platform = ? AND canonical_id = ?",
+                (plat, cid)
+            )
+            row = cursor.fetchone()
+            if not row:
+                fail_cnt = 1
+                effective_status = "TRANSIENT_FAILURE" if (is_transient and fail_cnt < 3) else status
+                cursor.execute(
+                    """
+                    INSERT INTO problems (platform, canonical_id, url, status, failure_reason, failure_count, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (plat, cid, f"https://{plat}.com/problem/{cid}", effective_status, failure_reason, fail_cnt, now_iso, now_iso)
+                )
+                cursor.execute("COMMIT")
+                return
+
+            prob_id, fail_cnt = row[0], (row[1] or 0)
+            fail_cnt += 1
+            effective_status = "TRANSIENT_FAILURE" if (is_transient and fail_cnt < 3) else status
+
+            cursor.execute(
+                """
+                UPDATE problems
+                SET status = ?, claimed_by = NULL, claimed_at = NULL, heartbeat_at = NULL,
+                    failure_reason = ?, failure_count = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (effective_status, failure_reason, fail_cnt, now_iso, prob_id)
+            )
+            cursor.execute("COMMIT")
+
+    def mark_problem_accepted(
+        self,
+        platform: str,
+        canonical_id: str,
+        url: str,
+        verdict: Optional[SubmissionVerdict] = None
+    ):
+        """Records confirmed acceptance in both problems and judge_verdicts tables."""
+        plat, canon = normalize_problem_identity(canonical_id, platform)
+        platform, canonical_id = plat, canon
+        now_iso = get_kolkata_now().isoformat()
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute(
+                """
+                INSERT INTO problems (platform, canonical_id, url, status, created_at, updated_at)
+                VALUES (?, ?, ?, 'ACCEPTED', ?, ?)
+                ON CONFLICT(platform, canonical_id) DO UPDATE SET
+                    status = 'ACCEPTED',
+                    claimed_by = NULL,
+                    claimed_at = NULL,
+                    updated_at = excluded.updated_at
+                """,
+                (platform, canonical_id, url, now_iso, now_iso)
+            )
+            cursor.execute("SELECT id FROM problems WHERE platform = ? AND canonical_id = ?", (platform, canonical_id))
+            prob_id = cursor.fetchone()[0]
+
+            sub_id = verdict.submission_id if verdict else None
+            msg = verdict.message if verdict else "Accepted"
+            ev_str = json.dumps(verdict.evidence) if (verdict and verdict.evidence) else None
+
+            cursor.execute(
+                """
+                INSERT INTO judge_verdicts (problem_id, platform, canonical_id, verdict_state, message, submission_id, evidence, verified_at)
+                VALUES (?, ?, ?, 'ACCEPTED', ?, ?, ?, ?)
+                """,
+                (prob_id, platform, canonical_id, msg, sub_id, ev_str, now_iso)
+            )
+            cursor.execute("COMMIT")
+
+    def get_or_create_daily_run(self, platform: str, target_quota: int, run_date: Optional[str] = None) -> int:
+        r_date = run_date or get_kolkata_today_str()
+        now_iso = get_kolkata_now().isoformat()
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute(
+                "SELECT id FROM daily_runs WHERE run_date = ? AND platform = ? ORDER BY id DESC LIMIT 1",
+                (r_date, platform)
+            )
+            row = cursor.fetchone()
+            if row:
+                cursor.execute("COMMIT")
+                return row[0]
+
+            cursor.execute(
+                """
+                INSERT INTO daily_runs (run_date, platform, target_quota, started_at, status)
+                VALUES (?, ?, ?, ?, 'IN_PROGRESS')
+                """,
+                (r_date, platform, target_quota, now_iso)
+            )
+            run_id = cursor.lastrowid
+            cursor.execute("COMMIT")
+            return run_id
+
+    def increment_daily_run_counts(
+        self,
+        run_id: int,
+        attempted: int = 0,
+        generated: int = 0,
+        compiled: int = 0,
+        tested: int = 0,
+        accepted: int = 0,
+        published: int = 0,
+        failed: int = 0,
+        skipped: int = 0,
+    ):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute(
+                """
+                UPDATE daily_runs
+                SET attempted_count = attempted_count + ?,
+                    generated_count = generated_count + ?,
+                    compiled_count = compiled_count + ?,
+                    tested_count = tested_count + ?,
+                    accepted_count = accepted_count + ?,
+                    published_count = published_count + ?,
+                    failed_count = failed_count + ?,
+                    skipped_count = skipped_count + ?
+                WHERE id = ?
+                """,
+                (attempted, generated, compiled, tested, accepted, published, failed, skipped, run_id)
+            )
+            cursor.execute("COMMIT")
+
+    def recover_expired_leases(self, lease_timeout_sec: float = 300.0) -> int:
+        """
+        Recovers problems stranded in IN_PROGRESS status due to worker termination, container crash, or lost heartbeats.
+        Resets them to TRANSIENT_FAILURE and automatically enqueues them into the persistent retry queue.
+        """
+        now = time.time()
+        now_iso = get_kolkata_now().isoformat()
+        with self.get_connection() as conn:
+            self._execute(conn, "BEGIN IMMEDIATE")
+            if lease_timeout_sec <= 0:
+                cur = self._execute(
+                    conn,
+                    """
+                    SELECT id, platform, canonical_id, url FROM problems
+                    WHERE status = 'IN_PROGRESS'
+                    """
+                )
+            else:
+                cutoff = now - lease_timeout_sec
+                cur = self._execute(
+                    conn,
+                    """
+                    SELECT id, platform, canonical_id, url FROM problems
+                    WHERE status = 'IN_PROGRESS' AND (
+                        (heartbeat_at IS NOT NULL AND heartbeat_at < ?)
+                        OR (heartbeat_at IS NULL AND (claimed_at IS NULL OR claimed_at < ?))
+                    )
+                    """,
+                    (cutoff, cutoff)
+                )
+            rows = cur.fetchall()
+            if not rows:
+                self._execute(conn, "COMMIT")
+                return 0
+
+            prob_ids = [r[0] for r in rows]
+            placeholders = ",".join("?" for _ in prob_ids)
+            self._execute(
+                conn,
+                f"""
+                UPDATE problems
+                SET status = 'TRANSIENT_FAILURE',
+                    failure_reason = 'Worker lease expired / heartbeat lost (stuck job recovered)',
+                    claimed_by = NULL,
+                    claimed_at = NULL,
+                    heartbeat_at = NULL,
+                    updated_at = ?
+                WHERE id IN ({placeholders})
+                """,
+                [now_iso] + prob_ids
+            )
+            self._execute(conn, "COMMIT")
+
+        # Automatically enqueue each recovered stuck problem into the persistent retry queue
+        for r in rows:
+            p_id, plat, c_id = r[0], r[1], r[2]
+            p_url = r[3] if len(r) > 3 and r[3] else f"https://{plat}.com/problem/{c_id}"
+            self.enqueue_retry(
+                problem_id=p_id,
+                platform=plat,
+                canonical_id=c_id,
+                url=p_url,
+                failure_code=FailureCode.TRANSIENT,
+                error_msg="Worker lease expired / heartbeat lost (stuck job recovered)"
+            )
+
+        log_event("INFO", f"Crash recovery: released {len(prob_ids)} expired problem lease(s)")
+        return len(prob_ids)
+
+    def enqueue_retry(
+        self,
+        problem_id: int,
+        platform: str,
+        canonical_id: str,
+        url: str,
+        failure_code: Union[str, FailureCode],
+        error_msg: str,
+        max_retries: int = 3,
+        base_backoff: float = 30.0,
+        max_backoff: float = 1800.0,
+    ) -> bool:
+        """
+        Adds or updates a problem in the persistent retry queue.
+        Requirement 5: Retry only transient failures automatically.
+        Uses exponential backoff with jitter.
+        """
+        f_code_str = failure_code.value if hasattr(failure_code, "value") else str(failure_code)
+        if f_code_str != FailureCode.TRANSIENT.value:
+            return False
+
+        now = time.time()
+        now_iso = get_kolkata_now().isoformat()
+        with self.get_connection() as conn:
+            self._execute(conn, "BEGIN IMMEDIATE")
+            cur = self._execute(
+                conn,
+                "SELECT id, retry_count, max_retries FROM retry_queue WHERE platform = ? AND canonical_id = ?",
+                (platform, canonical_id)
+            )
+            row = cur.fetchone()
+            if row:
+                q_id, cur_count, limit = row[0], row[1], row[2]
+                if cur_count >= limit:
+                    self._execute(
+                        conn,
+                        """
+                        UPDATE retry_queue
+                        SET status = 'EXHAUSTED',
+                            failure_code = ?,
+                            last_error = ?,
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (f_code_str, redact_sensitive_data(error_msg), now_iso, q_id)
+                    )
+                    self._execute(conn, "COMMIT")
+                    return False
+
+                new_count = cur_count + 1
+                raw_backoff = min(base_backoff * (2 ** (new_count - 1)), max_backoff)
+                jitter = random.uniform(-0.15, 0.15) * raw_backoff
+                backoff = max(1.0, raw_backoff + jitter)
+                next_retry = now + backoff
+
+                self._execute(
+                    conn,
+                    """
+                    UPDATE retry_queue
+                    SET retry_count = ?,
+                        failure_code = ?,
+                        last_error = ?,
+                        next_retry_at = ?,
+                        backoff_seconds = ?,
+                        status = 'PENDING',
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (new_count, f_code_str, redact_sensitive_data(error_msg), next_retry, round(backoff, 2), now_iso, q_id)
+                )
+                self._execute(conn, "COMMIT")
+                return True
+            else:
+                raw_backoff = base_backoff
+                jitter = random.uniform(-0.15, 0.15) * raw_backoff
+                backoff = max(1.0, raw_backoff + jitter)
+                next_retry = now + backoff
+
+                self._execute(
+                    conn,
+                    """
+                    INSERT INTO retry_queue (
+                        problem_id, platform, canonical_id, url,
+                        retry_count, max_retries, failure_code, last_error,
+                        next_retry_at, backoff_seconds, status, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, 'PENDING', ?, ?)
+                    """,
+                    (
+                        problem_id, platform, canonical_id, url,
+                        max_retries, f_code_str, redact_sensitive_data(error_msg),
+                        next_retry, round(backoff, 2), now_iso, now_iso
+                    )
+                )
+                self._execute(conn, "COMMIT")
+                return True
+
+    def get_pending_retries(
+        self,
+        platform: Optional[str] = None,
+        limit: int = 10,
+        include_future: bool = False
+    ) -> List[Dict[str, Any]]:
+        """Retrieves due problems from the persistent retry queue."""
+        now = time.time()
+        with self.get_connection() as conn:
+            if include_future:
+                if platform:
+                    cur = self._execute(conn, "SELECT * FROM retry_queue WHERE status = 'PENDING' AND platform = ? ORDER BY next_retry_at ASC LIMIT ?", (platform, limit))
+                else:
+                    cur = self._execute(conn, "SELECT * FROM retry_queue WHERE status = 'PENDING' ORDER BY next_retry_at ASC LIMIT ?", (limit,))
+            else:
+                if platform:
+                    cur = self._execute(conn, "SELECT * FROM retry_queue WHERE status = 'PENDING' AND next_retry_at <= ? AND platform = ? ORDER BY next_retry_at ASC LIMIT ?", (now, platform, limit))
+                else:
+                    cur = self._execute(conn, "SELECT * FROM retry_queue WHERE status = 'PENDING' AND next_retry_at <= ? ORDER BY next_retry_at ASC LIMIT ?", (now, limit))
+            rows = cur.fetchall()
+            cols = [desc[0] for desc in cur.description] if cur.description else []
+            return [dict(zip(cols, r)) for r in rows]
+
+    def get_all_retry_queue_items(self, platform: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Retrieves all items from the persistent retry queue for status and inspection."""
+        with self.get_connection() as conn:
+            if platform:
+                cur = self._execute(conn, "SELECT * FROM retry_queue WHERE platform = ? ORDER BY id DESC", (platform,))
+            else:
+                cur = self._execute(conn, "SELECT * FROM retry_queue ORDER BY id DESC")
+            rows = cur.fetchall()
+            cols = [desc[0] for desc in cur.description] if cur.description else []
+            return [dict(zip(cols, r)) for r in rows]
+
+    def mark_retry_completed(self, platform: str, canonical_id: str):
+        now_iso = get_kolkata_now().isoformat()
+        with self.get_connection() as conn:
+            self._execute(conn, "BEGIN IMMEDIATE")
+            self._execute(
+                conn,
+                "UPDATE retry_queue SET status = 'COMPLETED', updated_at = ? WHERE platform = ? AND canonical_id = ?",
+                (now_iso, platform, canonical_id)
+            )
+            self._execute(conn, "COMMIT")
+
+    def get_failure_breakdown(self, platform: Optional[str] = None) -> Dict[str, Dict[str, int]]:
+        """Returns failure code counts grouped by platform."""
+        breakdown: Dict[str, Dict[str, int]] = {
+            p: {fc.value: 0 for fc in FailureCode}
+            for p in ["leetcode", "codeforces", "codechef", "hackerrank", "hackerearth"]
+        }
+        with self.get_connection() as conn:
+            if platform:
+                cur = self._execute(
+                    conn,
+                    "SELECT platform, error FROM attempts WHERE error IS NOT NULL AND platform = ?",
+                    (platform,)
+                )
+            else:
+                cur = self._execute(
+                    conn,
+                    "SELECT platform, error FROM attempts WHERE error IS NOT NULL"
+                )
+            rows = cur.fetchall()
+            for r in rows:
+                plat = (r[0] or "").lower()
+                err = r[1]
+                if plat not in breakdown:
+                    breakdown[plat] = {fc.value: 0 for fc in FailureCode}
+                fc = classify_failure(err)
+                breakdown[plat][fc.value] += 1
+        return breakdown
+
+    def get_active_leases(self) -> List[Dict[str, Any]]:
+        """Returns currently active in-progress problem leases with heartbeat diagnostics."""
+        with self.get_connection() as conn:
+            cur = self._execute(
+                conn,
+                """
+                SELECT id, platform, canonical_id, url, claimed_by, claimed_at, heartbeat_at, lease_timeout
+                FROM problems
+                WHERE status = 'IN_PROGRESS'
+                ORDER BY claimed_at ASC
+                """
+            )
+            rows = cur.fetchall()
+            cols = [desc[0] for desc in cur.description] if cur.description else []
+            return [dict(zip(cols, r)) for r in rows]
+
+    def acquire_daily_run_lock(
+        self,
+        platform: str,
+        target_quota: int,
+        worker_id: str,
+        run_date: Optional[str] = None,
+        lock_duration_sec: float = 3600.0
+    ) -> Optional[int]:
+        """
+        Acquires an atomic execution lock on today's daily_run record for the platform.
+        Prevents overlapping Cloud Scheduler runs or multiple worker containers from duplicating work.
+        Returns run_id if lock acquired, or None if quota already completed or another active worker holds the lock.
+        """
+        r_date = run_date or get_kolkata_today_str()
+        now = time.time()
+        now_iso = get_kolkata_now().isoformat()
+
+        with self.get_connection() as conn:
+            self._execute(conn, "BEGIN IMMEDIATE")
+            cur = self._execute(
+                conn,
+                """
+                SELECT id, target_quota, accepted_count, status, locked_by, locked_at
+                FROM daily_runs
+                WHERE run_date = ? AND platform = ?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (r_date, platform)
+            )
+            row = cur.fetchone()
+            if row is None:
+                cur = self._execute(
+                    conn,
+                    """
+                    INSERT INTO daily_runs (run_date, platform, target_quota, started_at, status, locked_by, locked_at)
+                    VALUES (?, ?, ?, ?, 'IN_PROGRESS', ?, ?)
+                    RETURNING id
+                    """,
+                    (r_date, platform, target_quota, now_iso, worker_id, now)
+                )
+                run_id = cur.fetchone()[0]
+                self._execute(conn, "COMMIT")
+                log_event("INFO", f"Acquired new daily run lock for {platform} on {r_date} (run_id={run_id})")
+                return run_id
+
+            run_id = row[0]
+            existing_target = row[1]
+            accepted_count = row[2]
+            status = row[3]
+            locked_by = row[4]
+            locked_at = row[5]
+
+            # If quota is already met, avoid duplicate runs
+            effective_target = max(existing_target, target_quota)
+            if status == "COMPLETED" and accepted_count >= effective_target:
+                self._execute(conn, "COMMIT")
+                log_event("INFO", f"Daily quota for {platform} on {r_date} is already completed ({accepted_count}/{effective_target}). Skipping duplicate run.")
+                return None
+
+            # If locked by another worker and lock is still active
+            if locked_by and locked_by != worker_id:
+                lock_age = now - (locked_at or 0)
+                if lock_age < lock_duration_sec:
+                    self._execute(conn, "COMMIT")
+                    log_event("WARNING", f"Daily run for {platform} is currently locked by active worker '{locked_by}' (age: {int(lock_age)}s). Rejecting overlapping run.")
+                    return None
+                else:
+                    log_event("WARNING", f"Stale worker lock from '{locked_by}' (age: {int(lock_age)}s) expired. Re-claiming daily run {run_id}.")
+
+            self._execute(
+                conn,
+                """
+                UPDATE daily_runs
+                SET locked_by = ?, locked_at = ?, target_quota = ?, status = 'IN_PROGRESS'
+                WHERE id = ?
+                """,
+                (worker_id, now, effective_target, run_id)
+            )
+            self._execute(conn, "COMMIT")
+            log_event("INFO", f"Acquired lock on daily run {run_id} for {platform} (worker={worker_id})")
+            return run_id
+
+    def get_daily_run_accepted_count(self, run_id: int) -> int:
+        with self.get_connection() as conn:
+            cur = self._execute(conn, "SELECT accepted_count FROM daily_runs WHERE id = ?", (run_id,))
+            row = cur.fetchone()
+            return (row[0] or 0) if row else 0
+
+    def release_daily_run_lock(self, run_id: int):
+        with self.get_connection() as conn:
+            self._execute(conn, "BEGIN IMMEDIATE")
+            self._execute(conn, "UPDATE daily_runs SET locked_by = NULL, locked_at = NULL WHERE id = ?", (run_id,))
+            self._execute(conn, "COMMIT")
+
+    def complete_daily_run(self, run_id: int, status: str = "COMPLETED"):
+        now_iso = get_kolkata_now().isoformat()
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute(
+                "UPDATE daily_runs SET completed_at = ?, status = ?, locked_by = NULL, locked_at = NULL WHERE id = ?",
+                (now_iso, status, run_id)
+            )
+            cursor.execute("COMMIT")
+
+    def record_attempt(
+        self,
+        platform: str,
+        canonical_id: str,
+        run_id: Optional[int],
+        stage: ProcessStage,
+        mode: str,
+        solution_code: Optional[str] = None,
+        explanation: Optional[str] = None,
+        error: Optional[str] = None,
+        is_transient: bool = False,
+        compiler_output: Optional[str] = None,
+        diagnostics: Optional[str] = None
+    ) -> int:
+        now_iso = get_kolkata_now().isoformat()
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute("SELECT id FROM problems WHERE platform = ? AND canonical_id = ?", (platform, canonical_id))
+            row = cursor.fetchone()
+            prob_id = row[0] if row else 0
+
+            cursor.execute(
+                """
+                INSERT INTO attempts (problem_id, run_id, platform, canonical_id, stage, mode, solution_code, explanation, error, is_transient, started_at, finished_at, compiler_output, diagnostics)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (prob_id, run_id, platform, canonical_id, stage.value, mode, solution_code, explanation, error, 1 if is_transient else 0, now_iso, now_iso, compiler_output, diagnostics)
+            )
+            attempt_id = cursor.lastrowid
+            cursor.execute("COMMIT")
+            return attempt_id
+
+    def record_sample_test_results(
+        self,
+        attempt_id: int,
+        sample_results: List[Any]
+    ):
+        """Persists executed sample test cases and their diagnostic diffs for an attempt."""
+        if not sample_results:
+            return
+        now_iso = get_kolkata_now().isoformat()
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            for s in sample_results:
+                cursor.execute(
+                    """
+                    INSERT INTO sample_test_results (
+                        attempt_id, sample_index, input_text, expected_output, actual_output, passed, error_message, diff, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        attempt_id,
+                        getattr(s, "sample_index", 1),
+                        getattr(s, "input_text", ""),
+                        getattr(s, "expected_output", ""),
+                        getattr(s, "actual_output", ""),
+                        1 if getattr(s, "passed", False) else 0,
+                        getattr(s, "error_message", None),
+                        getattr(s, "diff", None),
+                        now_iso,
+                    )
+                )
+            cursor.execute("COMMIT")
+
+    def record_publish_job(
+        self,
+        platform: str,
+        canonical_id: str,
+        attempt_id: Optional[int],
+        repo_name: Optional[str],
+        branch: Optional[str],
+        commit_hash: Optional[str],
+        status: str,
+        error: Optional[str] = None
+    ) -> int:
+        now_iso = get_kolkata_now().isoformat()
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute("SELECT id FROM problems WHERE platform = ? AND canonical_id = ?", (platform, canonical_id))
+            row = cursor.fetchone()
+            prob_id = row[0] if row else 0
+
+            cursor.execute(
+                """
+                INSERT INTO publish_jobs (problem_id, attempt_id, platform, canonical_id, repo_name, branch, commit_hash, status, error, published_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (prob_id, attempt_id, platform, canonical_id, repo_name, branch, commit_hash, status, error, now_iso)
+            )
+            job_id = cursor.lastrowid
+            cursor.execute("COMMIT")
+            return job_id
+
+    def get_daily_summary(self, run_date: Optional[str] = None) -> List[Dict[str, Any]]:
+        r_date = run_date or get_kolkata_today_str()
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT platform, target_quota, attempted_count, generated_count, compiled_count,
+                       tested_count, accepted_count, published_count, failed_count, skipped_count, status
+                FROM daily_runs
+                WHERE run_date = ?
+                ORDER BY platform
+                """,
+                (r_date,)
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_all_time_stats(self) -> Dict[str, Dict[str, int]]:
+        platforms = ["leetcode", "codeforces", "hackerrank", "codechef", "hackerearth"]
+        res = {p: {"accepted": 0, "published": 0, "unverified": 0, "failed": 0, "discovered": 0} for p in platforms}
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT platform, COUNT(DISTINCT canonical_id)
+                FROM problems
+                WHERE status = 'ACCEPTED'
+                GROUP BY platform
+                """
+            )
+            for plat, cnt in cursor.fetchall():
+                if plat in res:
+                    res[plat]["accepted"] = cnt
+
+            cursor.execute(
+                """
+                SELECT platform, COUNT(DISTINCT canonical_id)
+                FROM publish_jobs
+                WHERE status = 'PUBLISHED'
+                GROUP BY platform
+                """
+            )
+            for plat, cnt in cursor.fetchall():
+                if plat in res:
+                    res[plat]["published"] = cnt
+
+            cursor.execute(
+                """
+                SELECT platform, COUNT(DISTINCT canonical_id)
+                FROM problems
+                WHERE status = 'UNVERIFIED'
+                GROUP BY platform
+                """
+            )
+            for plat, cnt in cursor.fetchall():
+                if plat in res:
+                    res[plat]["unverified"] = cnt
+
+            cursor.execute(
+                """
+                SELECT platform, COUNT(DISTINCT canonical_id)
+                FROM problems
+                WHERE status IN ('FAILED', 'REJECTED')
+                GROUP BY platform
+                """
+            )
+            for plat, cnt in cursor.fetchall():
+                if plat in res:
+                    res[plat]["failed"] = cnt
+
+        return res
+
 
 class SolvedRegistry:
-    """Central registry tracking all solved problems across all platforms, local folders, and git repos."""
-    _cache: Optional[dict] = None
+    """Central registry tracking all solved problems backed by persistent SQLite storage."""
+    _db: Optional[DatabaseManager] = None
 
     @classmethod
-    def normalize(cls, s: str) -> str:
-        s = s.strip().lower()
-        s = re.sub(r"^https?://[^/]+/", "", s)
-        s = re.sub(r"^(problems|challenges|practice-problems/algorithm|problemset/problem)/\??", "", s)
-        s = re.sub(r"/problem/?$", "", s)
-        s = re.sub(r"[^a-z0-9_]", "_", s)
-        s = re.sub(r"_+", "_", s).strip("_")
-        return s
+    def get_db(cls) -> DatabaseManager:
+        if cls._db is None:
+            cls._db = DatabaseManager(database_url=DATABASE_URL or None)
+        return cls._db
+
+    @classmethod
+    def set_db(cls, db: DatabaseManager):
+        cls._db = db
+
+    @classmethod
+    def normalize(cls, s: str, platform: Optional[str] = None) -> str:
+        plat, canon = normalize_problem_identity(s, platform)
+        return canon
 
     @classmethod
     def get_all_solved(cls, force_refresh: bool = False) -> dict:
-        if cls._cache is not None and not force_refresh:
-            return cls._cache
-
+        """Returns verified accepted problems per platform from SQLite database (no file/directory false positives)."""
+        db = cls.get_db()
         platforms = ["leetcode", "codeforces", "hackerrank", "codechef", "hackerearth"]
-        solved = {p: set() for p in platforms}
-
-        # 1. Load from persistent history file
-        if HISTORY_FILE.exists():
-            try:
-                with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    for p, slugs in data.items():
-                        if p in solved:
-                            for s in slugs:
-                                solved[p].add(cls.normalize(s))
-            except Exception:
-                pass
-
-        # 2. Load from local solutions/ folder
-        for f in SOLUTIONS_DIR.glob("*.*"):
-            if f.suffix in [".java", ".py"]:
-                name = f.stem.lower()
-                for p in platforms:
-                    if name.startswith(f"{p}_"):
-                        slug = name[len(p)+1:]
-                        solved[p].add(cls.normalize(slug))
-
-        # 3. Load from all 5 GitHub repositories (repos/*/solutions/**)
-        for p in platforms:
-            repo_solutions = REPOS_DIR / f"{p}-daily" / "solutions"
-            if repo_solutions.exists():
-                for sub in repo_solutions.glob("*/*"):
-                    if sub.is_dir():
-                        solved[p].add(cls.normalize(sub.name))
-
-        cls._cache = solved
-        return cls._cache
+        return {p: db.get_accepted_canonical_ids(p) for p in platforms}
 
     @classmethod
     def is_solved(cls, platform: str, slug_or_url: str) -> bool:
-        norm = cls.normalize(slug_or_url)
-        all_solved = cls.get_all_solved()
-        return norm in all_solved.get(platform, set())
+        """Returns True ONLY if the problem has confirmed judge ACCEPTED verdict in SQLite database."""
+        return cls.get_db().is_accepted(platform, slug_or_url)
 
     @classmethod
-    def mark_solved(cls, platform: str, slug_or_url: str):
-        norm = cls.normalize(slug_or_url)
-        all_solved = cls.get_all_solved()
-        if platform not in all_solved:
-            all_solved[platform] = set()
-        all_solved[platform].add(norm)
-        cls._cache = all_solved
-        try:
-            with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-                json.dump({p: sorted(list(s)) for p, s in all_solved.items()}, f, indent=2)
-        except Exception:
-            try:
-                fallback_file = CONFIG_DIR / "solved_history.json"
-                with open(fallback_file, "w", encoding="utf-8") as f:
-                    json.dump({p: sorted(list(s)) for p, s in all_solved.items()}, f, indent=2)
-            except Exception as e:
-                print(f"⚠️ Failed to write to solved_history.json: {e}")
+    def is_accepted(cls, platform: str, slug_or_url: str) -> bool:
+        """Explicit alias for is_solved verifying confirmed judge ACCEPTED verdict."""
+        return cls.get_db().is_accepted(platform, slug_or_url)
+
+    @classmethod
+    def mark_solved(cls, platform: str, slug_or_url: str, verdict: Optional[SubmissionVerdict] = None):
+        """Marks a problem as accepted in the SQLite database with verified verdict."""
+        plat, canon = normalize_problem_identity(slug_or_url, platform)
+        cls.get_db().mark_problem_accepted(plat, canon, slug_or_url, verdict=verdict)
+
 
 def get_existing_solved_slugs() -> Set[str]:
     """Backward compatibility helper."""
@@ -279,10 +2739,295 @@ def get_existing_solved_slugs() -> Set[str]:
         all_s.update(s_set)
     return all_s
 
-async def discover_leetcode_candidates(page: Page, count: int = 15, difficulty: str = "medium-hard") -> List[str]:
-    """Queries LeetCode GraphQL directly for free, completely unsolved problems for user."""
-    print(f"\n🔍 [LeetCode] Finding up to {count} unsolved problems (Difficulty: {difficulty.upper()})...")
+
+# Offline Problem Catalog for Cloud Mode & Dry-Run Execution
+OFFLINE_PROBLEM_CATALOG: Dict[str, List[Dict[str, Any]]] = {
+    "leetcode": [
+        {
+            "id": "two-sum",
+            "url": "https://leetcode.com/problems/two-sum/",
+            "title": "Two Sum",
+            "difficulty": "easy",
+            "description": "Given an array of integers nums and an integer target, return indices of the two numbers such that they add up to target.",
+            "starter_code": "class Solution {\n    public int[] twoSum(int[] nums, int target) {\n        \n    }\n}",
+            "sample_solution": (
+                "class Solution {\n"
+                "    public int[] twoSum(int[] nums, int target) {\n"
+                "        java.util.Map<Integer, Integer> map = new java.util.HashMap<>();\n"
+                "        for (int i = 0; i < nums.length; i++) {\n"
+                "            int complement = target - nums[i];\n"
+                "            if (map.containsKey(complement)) {\n"
+                "                return new int[] { map.get(complement), i };\n"
+                "            }\n"
+                "            map.put(nums[i], i);\n"
+                "        }\n"
+                "        return new int[0];\n"
+                "    }\n"
+                "}"
+            ),
+            "samples": [
+                {"input": "[2,7,11,15]\n9", "expected": "[0,1]"}
+            ]
+        },
+        {
+            "id": "palindrome-number",
+            "url": "https://leetcode.com/problems/palindrome-number/",
+            "title": "Palindrome Number",
+            "difficulty": "easy",
+            "description": "Given an integer x, return true if x is a palindrome, and false otherwise.",
+            "starter_code": "class Solution {\n    public boolean isPalindrome(int x) {\n        \n    }\n}",
+            "sample_solution": (
+                "class Solution {\n"
+                "    public boolean isPalindrome(int x) {\n"
+                "        if (x < 0) return false;\n"
+                "        int rev = 0, orig = x;\n"
+                "        while (x > 0) {\n"
+                "            rev = rev * 10 + x % 10;\n"
+                "            x /= 10;\n"
+                "        }\n"
+                "        return rev == orig;\n"
+                "    }\n"
+                "}"
+            ),
+            "samples": [
+                {"input": "121", "expected": "true"}
+            ]
+        },
+        {
+            "id": "roman-to-integer",
+            "url": "https://leetcode.com/problems/roman-to-integer/",
+            "title": "Roman to Integer",
+            "difficulty": "easy",
+            "description": "Convert a roman numeral to an integer.",
+            "starter_code": "class Solution {\n    public int romanToInt(String s) {\n        \n    }\n}",
+            "sample_solution": (
+                "class Solution {\n"
+                "    public int romanToInt(String s) {\n"
+                "        java.util.Map<Character, Integer> map = new java.util.HashMap<>();\n"
+                "        map.put('I', 1); map.put('V', 5); map.put('X', 10);\n"
+                "        map.put('L', 50); map.put('C', 100); map.put('D', 500); map.put('M', 1000);\n"
+                "        int ans = 0;\n"
+                "        for (int i = 0; i < s.length(); i++) {\n"
+                "            if (i + 1 < s.length() && map.get(s.charAt(i)) < map.get(s.charAt(i + 1))) {\n"
+                "                ans -= map.get(s.charAt(i));\n"
+                "            } else {\n"
+                "                ans += map.get(s.charAt(i));\n"
+                "            }\n"
+                "        }\n"
+                "        return ans;\n"
+                "    }\n"
+                "}"
+            ),
+            "samples": [
+                {"input": "III", "expected": "3"}
+            ]
+        }
+    ],
+    "codeforces": [
+        {
+            "id": "4A",
+            "url": "https://codeforces.com/problemset/problem/4/A",
+            "title": "Watermelon",
+            "difficulty": "easy",
+            "description": "Check if watermelon of weight w can be divided into two even parts.",
+            "starter_code": "",
+            "sample_solution": (
+                "import java.util.Scanner;\n"
+                "public class Main {\n"
+                "    public static void main(String[] args) {\n"
+                "        Scanner sc = new Scanner(System.in);\n"
+                "        if (sc.hasNextInt()) {\n"
+                "            int w = sc.nextInt();\n"
+                "            System.out.println(w > 2 && w % 2 == 0 ? \"YES\" : \"NO\");\n"
+                "        }\n"
+                "    }\n"
+                "}"
+            ),
+            "samples": [
+                {"input": "8\n", "expected": "YES\n"}
+            ]
+        },
+        {
+            "id": "71A",
+            "url": "https://codeforces.com/problemset/problem/71/A",
+            "title": "Way Too Long Words",
+            "difficulty": "easy",
+            "description": "Replace words longer than 10 characters with abbreviation.",
+            "starter_code": "",
+            "sample_solution": (
+                "import java.util.Scanner;\n"
+                "public class Main {\n"
+                "    public static void main(String[] args) {\n"
+                "        Scanner sc = new Scanner(System.in);\n"
+                "        if (sc.hasNextInt()) {\n"
+                "            int n = sc.nextInt();\n"
+                "            while (n-- > 0 && sc.hasNext()) {\n"
+                "                String s = sc.next();\n"
+                "                if (s.length() > 10) {\n"
+                "                    System.out.println(\"\" + s.charAt(0) + (s.length() - 2) + s.charAt(s.length() - 1));\n"
+                "                } else {\n"
+                "                    System.out.println(s);\n"
+                "                }\n"
+                "            }\n"
+                "        }\n"
+                "    }\n"
+                "}"
+            ),
+            "samples": [
+                {"input": "4\nword\nlocalization\ninternationalization\npneumonoultramicroscopicsilicovolcanoconiosis\n", "expected": "word\nl10n\ni18n\np43s\n"}
+            ]
+        }
+    ],
+    "hackerrank": [
+        {
+            "id": "solve-me-first",
+            "url": "https://www.hackerrank.com/challenges/solve-me-first/problem",
+            "title": "Solve Me First",
+            "difficulty": "easy",
+            "description": "Complete solveMeFirst to compute the sum of two integers.",
+            "starter_code": "import java.io.*;\nimport java.util.*;\n\npublic class Solution {\n    static int solveMeFirst(int a, int b) {\n        \n    }\n    public static void main(String[] args) {\n        Scanner in = new Scanner(System.in);\n        int a = in.nextInt();\n        int b = in.nextInt();\n        int sum = solveMeFirst(a, b);\n        System.out.println(sum);\n    }\n}",
+            "sample_solution": (
+                "import java.io.*;\n"
+                "import java.util.*;\n\n"
+                "public class Solution {\n"
+                "    static int solveMeFirst(int a, int b) {\n"
+                "        return a + b;\n"
+                "    }\n"
+                "    public static void main(String[] args) {\n"
+                "        Scanner in = new Scanner(System.in);\n"
+                "        if (in.hasNextInt()) {\n"
+                "            int a = in.nextInt();\n"
+                "            int b = in.nextInt();\n"
+                "            int sum = solveMeFirst(a, b);\n"
+                "            System.out.println(sum);\n"
+                "        }\n"
+                "    }\n"
+                "}"
+            ),
+            "samples": [
+                {"input": "2\n3\n", "expected": "5\n"}
+            ]
+        }
+    ],
+    "codechef": [
+        {
+            "id": "FLOW001",
+            "url": "https://www.codechef.com/problems/FLOW001",
+            "title": "Add Two Numbers",
+            "difficulty": "easy",
+            "description": "Add two integers for T testcases.",
+            "starter_code": "",
+            "sample_solution": (
+                "import java.util.Scanner;\n"
+                "public class Main {\n"
+                "    public static void main(String[] args) {\n"
+                "        Scanner sc = new Scanner(System.in);\n"
+                "        if (sc.hasNextInt()) {\n"
+                "            int t = sc.nextInt();\n"
+                "            while (t-- > 0 && sc.hasNextInt()) {\n"
+                "                int a = sc.nextInt();\n"
+                "                int b = sc.nextInt();\n"
+                "                System.out.println(a + b);\n"
+                "            }\n"
+                "        }\n"
+                "    }\n"
+                "}"
+            ),
+            "samples": [
+                {"input": "1\n1 2\n", "expected": "3\n"}
+            ]
+        }
+    ],
+    "hackerearth": [
+        {
+            "id": "zoos-04664a78",
+            "url": "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/zoos-04664a78/",
+            "title": "Zoos",
+            "difficulty": "easy",
+            "description": "Determine if a string complies with 2 * count('z') == count('o').",
+            "starter_code": "",
+            "sample_solution": (
+                "import java.util.Scanner;\n"
+                "public class TestClass {\n"
+                "    public static void main(String[] args) {\n"
+                "        Scanner sc = new Scanner(System.in);\n"
+                "        if (sc.hasNext()) {\n"
+                "            String s = sc.next();\n"
+                "            int z = 0, o = 0;\n"
+                "            for (char c : s.toCharArray()) {\n"
+                "                if (c == 'z') z++;\n"
+                "                else if (c == 'o') o++;\n"
+                "            }\n"
+                "            System.out.println(2 * z == o ? \"Yes\" : \"No\");\n"
+                "        }\n"
+                "    }\n"
+                "}"
+            ),
+            "samples": [
+                {"input": "zzzoooooo\n", "expected": "Yes\n"}
+            ]
+        }
+    ]
+}
+
+def discover_offline_candidates(platform: str, count: int = 5, difficulty: str = "medium-hard", offset: int = 0) -> List[str]:
+    """Provides problem candidate URLs in offline cloud mode without web scraping or browser dependency."""
     candidates = []
+    # 1. From offline problem catalog
+    entries = OFFLINE_PROBLEM_CATALOG.get(platform, [])
+    for item in entries:
+        candidates.append(item["url"])
+
+    # 2. From problems.txt if present
+    prob_file = BASE_DIR / "problems.txt"
+    if prob_file.exists():
+        try:
+            with open(prob_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        p_type, _ = normalize_problem_identity(line, platform)
+                        if p_type == platform and line not in candidates:
+                            candidates.append(line)
+        except Exception:
+            pass
+
+    return candidates[offset : offset + count] if offset < len(candidates) else candidates[:count]
+
+def get_offline_problem_info(url: str, platform_type: str) -> Dict[str, Any]:
+    """Retrieves problem definition and deterministic sample solution for offline execution."""
+    catalog = OFFLINE_PROBLEM_CATALOG.get(platform_type, [])
+    for item in catalog:
+        if item["url"] == url or item["id"] in url:
+            return item
+    _, cid = normalize_problem_identity(url, platform_type)
+    return {
+        "id": cid,
+        "url": url,
+        "title": cid.replace("-", " ").title(),
+        "difficulty": "medium",
+        "description": f"Offline problem {cid} on {platform_type}.",
+        "starter_code": "",
+        "sample_solution": (
+            "public class Solution {\n"
+            "    public static void main(String[] args) {\n"
+            "        System.out.println(\"Solved\");\n"
+            "    }\n"
+            "}" if platform_type in ["hackerrank", "leetcode"] else
+            "public class Main {\n"
+            "    public static void main(String[] args) {\n"
+            "        System.out.println(\"Solved\");\n"
+            "    }\n"
+            "}"
+        ),
+        "samples": []
+    }
+
+async def discover_leetcode_candidates(page: Page, count: int = 15, difficulty: str = "medium-hard", offset: int = 0) -> List[str]:
+    """Queries LeetCode GraphQL directly for free, completely unsolved problems for user."""
+    print(f"\n🔍 [LeetCode] Finding up to {count} unsolved problems (Difficulty: {difficulty.upper()}, Offset: {offset})...")
+    candidates = []
+    db = SolvedRegistry.get_db()
 
     diff_list = []
     if difficulty.lower() == "hard":
@@ -301,7 +3046,7 @@ async def discover_leetcode_candidates(page: Page, count: int = 15, difficulty: 
         for diff in diff_list:
             if len(candidates) >= count:
                 break
-            gql_query = """async (diff) => {
+            gql_query = """async ({diff, skip, limit}) => {
                 const query = `
                     query problemsetQuestionList($categorySlug: String, $limit: Int, $skip: Int, $filters: QuestionListFilterInput) {
                         problemsetQuestionList: questionList(
@@ -328,8 +3073,8 @@ async def discover_leetcode_candidates(page: Page, count: int = 15, difficulty: 
                         query: query,
                         variables: {
                             categorySlug: "",
-                            skip: 0,
-                            limit: 50,
+                            skip: skip,
+                            limit: limit,
                             filters: {
                                 difficulty: diff,
                                 status: "NOT_STARTED"
@@ -341,7 +3086,7 @@ async def discover_leetcode_candidates(page: Page, count: int = 15, difficulty: 
                 const d = await resp.json();
                 return d.data?.problemsetQuestionList?.questions || [];
             }"""
-            questions = await page.evaluate(gql_query, diff)
+            questions = await page.evaluate(gql_query, {"diff": diff, "skip": offset, "limit": max(50, count * 2)})
             for q in questions:
                 if q.get("paidOnly"):
                     continue
@@ -350,7 +3095,7 @@ async def discover_leetcode_candidates(page: Page, count: int = 15, difficulty: 
                 slug = q.get("titleSlug")
                 if not slug:
                     continue
-                if SolvedRegistry.is_solved("leetcode", slug):
+                if SolvedRegistry.is_solved("leetcode", slug) or db.is_permanent_failure("leetcode", slug):
                     continue
                 full_url = f"https://leetcode.com/problems/{slug}/"
                 if full_url not in candidates:
@@ -363,10 +3108,11 @@ async def discover_leetcode_candidates(page: Page, count: int = 15, difficulty: 
     print(f"   ✅ Discovered {len(candidates)} completely unsolved LeetCode candidates.")
     return candidates
 
-async def discover_codeforces_candidates(page: Page, count: int = 15, difficulty: str = "medium-hard") -> List[str]:
+async def discover_codeforces_candidates(page: Page, count: int = 15, difficulty: str = "medium-hard", offset: int = 0) -> List[str]:
     """Finds unsolved Codeforces problems in Medium/Hard ratings, excluding any already solved by user."""
-    print(f"\n🔍 [Codeforces] Finding up to {count} unsolved problems (Difficulty: {difficulty.upper()})...")
+    print(f"\n🔍 [Codeforces] Finding up to {count} unsolved problems (Difficulty: {difficulty.upper()}, Offset: {offset})...")
     candidates = []
+    db = SolvedRegistry.get_db()
 
     try:
         try:
@@ -394,6 +3140,7 @@ async def discover_codeforces_candidates(page: Page, count: int = 15, difficulty
             stats = {(s["contestId"], s["index"]): s["solvedCount"] for s in res["result"]["problemStatistics"]}
             sorted_probs = sorted(probs, key=lambda p: stats.get((p["contestId"], p["index"]), 0), reverse=True)
 
+            matching_probs = []
             for p in sorted_probs:
                 rating = p.get("rating", 1200)
                 if difficulty.lower() in ["medium-hard", "hard-medium"]:
@@ -408,9 +3155,12 @@ async def discover_codeforces_candidates(page: Page, count: int = 15, difficulty
                 elif difficulty.lower() == "easy":
                     if rating > 1000:
                         continue
+                matching_probs.append(p)
 
+            paged_probs = matching_probs[offset:]
+            for p in paged_probs:
                 slug = f"{p['contestId']}_{p['index']}"
-                if SolvedRegistry.is_solved("codeforces", slug):
+                if SolvedRegistry.is_solved("codeforces", slug) or db.is_permanent_failure("codeforces", slug):
                     continue
 
                 url = f"https://codeforces.com/problemset/problem/{p['contestId']}/{p['index']}"
@@ -479,9 +3229,10 @@ async def discover_codeforces_candidates(page: Page, count: int = 15, difficulty
                 "https://codeforces.com/problemset/problem/1360/C",
                 "https://codeforces.com/problemset/problem/1374/C",
             ]
-        for u in catalog_fallback:
+        paged_catalog = catalog_fallback[offset:]
+        for u in paged_catalog:
             slug = u.rstrip("/").split("/")[-2] + "_" + u.rstrip("/").split("/")[-1]
-            if not SolvedRegistry.is_solved("codeforces", slug) and u not in candidates:
+            if not SolvedRegistry.is_solved("codeforces", slug) and not db.is_permanent_failure("codeforces", slug) and u not in candidates:
                 candidates.append(u)
             if len(candidates) >= count:
                 break
@@ -489,10 +3240,11 @@ async def discover_codeforces_candidates(page: Page, count: int = 15, difficulty
     print(f"   ✅ Discovered {len(candidates)} completely unsolved Codeforces candidates.")
     return candidates
 
-async def discover_hackerrank_candidates(page: Page, count: int = 15, difficulty: str = "medium-hard") -> List[str]:
+async def discover_hackerrank_candidates(page: Page, count: int = 15, difficulty: str = "medium-hard", offset: int = 0) -> List[str]:
     """Finds unsolved HackerRank challenges (Medium/Hard) using API with pagination and fallback catalog."""
-    print(f"\n🔍 [HackerRank] Finding up to {count} unsolved challenges (Difficulty: {difficulty.upper()})...")
+    print(f"\n🔍 [HackerRank] Finding up to {count} unsolved challenges (Difficulty: {difficulty.upper()}, Offset: {offset})...")
     candidates = []
+    db = SolvedRegistry.get_db()
 
     diff_params = ""
     if difficulty.lower() == "hard":
@@ -508,17 +3260,17 @@ async def discover_hackerrank_candidates(page: Page, count: int = 15, difficulty
     for track in tracks:
         if len(candidates) >= count:
             break
-        for offset in [0, 50, 100, 150]:
+        for page_offset in [offset, offset + 50, offset + 100, offset + 150]:
             if len(candidates) >= count:
                 break
             try:
-                api_url = f"https://www.hackerrank.com/rest/contests/master/tracks/{track}/challenges?offset={offset}&limit=50{diff_params}"
+                api_url = f"https://www.hackerrank.com/rest/contests/master/tracks/{track}/challenges?offset={page_offset}&limit=50{diff_params}"
                 req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
                 with urllib.request.urlopen(req, timeout=8) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                     for m in data.get("models", []):
                         slug = m.get("slug")
-                        if not slug or SolvedRegistry.is_solved("hackerrank", slug):
+                        if not slug or SolvedRegistry.is_solved("hackerrank", slug) or db.is_permanent_failure("hackerrank", slug):
                             continue
                         u = f"https://www.hackerrank.com/challenges/{slug}/problem"
                         if u not in candidates:
@@ -526,7 +3278,7 @@ async def discover_hackerrank_candidates(page: Page, count: int = 15, difficulty
                         if len(candidates) >= count:
                             break
             except Exception as e:
-                print(f"   ⚠️  HackerRank API ({track}, offset {offset}) note: {e}")
+                print(f"   ⚠️  HackerRank API ({track}, offset {page_offset}) note: {e}")
                 continue
 
     # Fallback catalog of verified active HackerRank challenges across tracks
@@ -543,8 +3295,9 @@ async def discover_hackerrank_candidates(page: Page, count: int = 15, difficulty
             "simple-array-sum", "compare-the-triplets", "a-very-big-sum", "diagonal-difference",
             "plus-minus", "staircase", "mini-max-sum", "birthday-cake-candles", "time-conversion"
         ]
-        for slug in curated_hr:
-            if not SolvedRegistry.is_solved("hackerrank", slug):
+        paged_curated = curated_hr[offset:]
+        for slug in paged_curated:
+            if not SolvedRegistry.is_solved("hackerrank", slug) and not db.is_permanent_failure("hackerrank", slug):
                 u = f"https://www.hackerrank.com/challenges/{slug}/problem"
                 if u not in candidates:
                     candidates.append(u)
@@ -554,17 +3307,20 @@ async def discover_hackerrank_candidates(page: Page, count: int = 15, difficulty
     print(f"   ✅ Discovered {len(candidates)} completely unsolved HackerRank candidates.")
     return candidates
 
-async def discover_codechef_candidates(page: Page, count: int = 15, difficulty: str = "medium-hard") -> List[str]:
+async def discover_codechef_candidates(page: Page, count: int = 15, difficulty: str = "medium-hard", offset: int = 0) -> List[str]:
     """Finds unsolved CodeChef problems in Medium/Hard ratings via API pagination."""
-    print(f"\n🔍 [CodeChef] Finding up to {count} unsolved problems (Difficulty: {difficulty.upper()})...")
+    print(f"\n🔍 [CodeChef] Finding up to {count} unsolved problems (Difficulty: {difficulty.upper()}, Offset: {offset})...")
     candidates = []
+    db = SolvedRegistry.get_db()
 
+    page_shift = offset // 50
     if difficulty.lower() == "easy":
-        pages_to_check = [0, 1, 2, 3, 4, 5, 6, 7]
+        base_pages = [0, 1, 2, 3, 4, 5, 6, 7]
     elif difficulty.lower() in ["medium-hard", "hard-medium", "medium"]:
-        pages_to_check = [10, 20, 30, 40, 50, 60]
+        base_pages = [10, 20, 30, 40, 50, 60]
     else:
-        pages_to_check = [20, 40, 60, 80]
+        base_pages = [20, 40, 60, 80]
+    pages_to_check = [p + page_shift for p in base_pages]
     for p_num in pages_to_check:
         if len(candidates) >= count:
             break
@@ -592,7 +3348,7 @@ async def discover_codechef_candidates(page: Page, count: int = 15, difficulty: 
                         continue
 
                     code = p.get("code")
-                    if not code or SolvedRegistry.is_solved("codechef", code):
+                    if not code or SolvedRegistry.is_solved("codechef", code) or db.is_permanent_failure("codechef", code):
                         continue
                     u = f"https://www.codechef.com/problems/{code}"
                     if u not in candidates:
@@ -610,8 +3366,9 @@ async def discover_codechef_candidates(page: Page, count: int = 15, difficulty: 
             "JOHNY", "CLEANUP", "HORSES", "CSUB", "CNOTE",
             "RAINBOWA", "SALARY", "CHN15A", "FRGTNLNG", "COPS"
         ]
-        for c in curated_cc:
-            if not SolvedRegistry.is_solved("codechef", c):
+        paged_curated = curated_cc[offset:]
+        for c in paged_curated:
+            if not SolvedRegistry.is_solved("codechef", c) and not db.is_permanent_failure("codechef", c):
                 u = f"https://www.codechef.com/problems/{c}"
                 if u not in candidates:
                     candidates.append(u)
@@ -621,10 +3378,11 @@ async def discover_codechef_candidates(page: Page, count: int = 15, difficulty: 
     print(f"   ✅ Discovered {len(candidates)} completely unsolved CodeChef candidates.")
     return candidates
 
-async def discover_hackerearth_candidates(page: Page, count: int = 15, difficulty: str = "medium-hard") -> List[str]:
+async def discover_hackerearth_candidates(page: Page, count: int = 15, difficulty: str = "medium-hard", offset: int = 0) -> List[str]:
     """Finds unsolved HackerEarth problems (Medium/Hard) using curated pool and live track crawling."""
-    print(f"\n🔍 [HackerEarth] Finding up to {count} unsolved problems (Difficulty: {difficulty.upper()})...")
+    print(f"\n🔍 [HackerEarth] Finding up to {count} unsolved problems (Difficulty: {difficulty.upper()}, Offset: {offset})...")
     candidates = []
+    db = SolvedRegistry.get_db()
 
     # Curated catalog of verified, active algorithmic challenges across topics
     if difficulty.lower() == "easy":
@@ -697,9 +3455,10 @@ async def discover_hackerearth_candidates(page: Page, count: int = 15, difficult
         "https://www.hackerearth.com/practice/data-structures/trees/binary-search-tree/practice-problems/algorithm/mst-revisited-3f9d614c/",
     ]
 
-    for u in catalog:
+    paged_catalog = catalog[offset:]
+    for u in paged_catalog:
         slug = u.rstrip("/").split("/")[-1]
-        if not SolvedRegistry.is_solved("hackerearth", slug):
+        if not SolvedRegistry.is_solved("hackerearth", slug) and not db.is_permanent_failure("hackerearth", slug):
             if u not in candidates:
                 candidates.append(u)
         if len(candidates) >= count:
@@ -754,7 +3513,7 @@ async def discover_hackerearth_candidates(page: Page, count: int = 15, difficult
                 }''')
                 for link in dom_links:
                     slug = link.rstrip("/").split("/")[-1]
-                    if not SolvedRegistry.is_solved("hackerearth", slug) and link not in candidates:
+                    if not SolvedRegistry.is_solved("hackerearth", slug) and not db.is_permanent_failure("hackerearth", slug) and link not in candidates:
                         candidates.append(link)
                     if len(candidates) >= count:
                         break
@@ -878,16 +3637,123 @@ async def switch_editor_to_java(page: Page, platform_type: str):
 # ==============================================================================
 # AI Solver Engine (Gemini 2.5 generating Java solutions)
 # ==============================================================================
+JAVA_FAST_SCANNER_TEMPLATE = """static class FastScanner {
+    BufferedReader br = new BufferedReader(new InputStreamReader(System.in));
+    StringTokenizer st;
+
+    FastScanner() {}
+    FastScanner(InputStream in) { br = new BufferedReader(new InputStreamReader(in)); }
+
+    String next() {
+        while (st == null || !st.hasMoreTokens()) {
+            try {
+                String line = br.readLine();
+                if (line == null) return null;
+                st = new StringTokenizer(line);
+            } catch (IOException e) {
+                return null;
+            }
+        }
+        return st.nextToken();
+    }
+
+    boolean hasNext() {
+        while (st == null || !st.hasMoreTokens()) {
+            try {
+                String line = br.readLine();
+                if (line == null) return false;
+                st = new StringTokenizer(line);
+            } catch (IOException e) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    int nextInt() {
+        String s = next();
+        if (s == null) throw new NoSuchElementException("EOF encountered while reading int");
+        return Integer.parseInt(s);
+    }
+
+    long nextLong() {
+        String s = next();
+        if (s == null) throw new NoSuchElementException("EOF encountered while reading long");
+        return Long.parseLong(s);
+    }
+
+    double nextDouble() {
+        String s = next();
+        if (s == null) throw new NoSuchElementException("EOF encountered while reading double");
+        return Double.parseDouble(s);
+    }
+
+    String nextLine() {
+        st = null;
+        try {
+            return br.readLine();
+        } catch (IOException e) {
+            return null;
+        }
+    }
+}"""
+
 def ask_gemini_for_java_code(
     problem_text: str,
     starter_code: str,
     platform_name: str,
     platform_type: str,
-    error_feedback: Optional[str] = None
+    error_feedback: Optional[str] = None,
+    dry_run: bool = False,
 ) -> Tuple[str, str]:
-    """Generates pure Java solution using Gemini 2.5 with model fallbacks."""
-    if not GEMINI_API_KEY:
-        raise ValueError("GEMINI_API_KEY is not set.")
+    """Generates pure Java solution using Gemini 2.5 with model fallbacks (or deterministic in dry-run mode)."""
+    if dry_run or DRY_RUN or not GEMINI_API_KEY:
+        cat = OFFLINE_PROBLEM_CATALOG.get(platform_type, [])
+        for p in cat:
+            if p["title"].lower() in problem_text.lower() or p["id"].lower() in problem_text.lower():
+                return p["sample_solution"], "Deterministic Java solution generated in dry-run mode."
+        if cat:
+            return cat[0]["sample_solution"], "Deterministic fallback Java solution generated in dry-run mode."
+
+        if platform_type == "leetcode":
+            code = (
+                "class Solution {\n"
+                "    public int[] twoSum(int[] nums, int target) {\n"
+                "        return new int[]{0, 1};\n"
+                "    }\n"
+                "}"
+            )
+        elif platform_type == "hackerearth":
+            code = (
+                "import java.util.Scanner;\n"
+                "public class TestClass {\n"
+                "    public static void main(String[] args) {\n"
+                "        Scanner sc = new Scanner(System.in);\n"
+                "        System.out.println(\"Yes\");\n"
+                "    }\n"
+                "}"
+            )
+        elif platform_type == "hackerrank":
+            code = (
+                "import java.util.Scanner;\n"
+                "public class Solution {\n"
+                "    public static void main(String[] args) {\n"
+                "        Scanner in = new Scanner(System.in);\n"
+                "        System.out.println(1);\n"
+                "    }\n"
+                "}"
+            )
+        else:
+            code = (
+                "import java.util.Scanner;\n"
+                "public class Main {\n"
+                "    public static void main(String[] args) {\n"
+                "        Scanner sc = new Scanner(System.in);\n"
+                "        System.out.println(\"YES\");\n"
+                "    }\n"
+                "}"
+            )
+        return code, "Deterministic fallback Java solution generated in dry-run mode."
 
     client = genai.Client(
         api_key=GEMINI_API_KEY,
@@ -908,19 +3774,46 @@ def ask_gemini_for_java_code(
         platform_instructions = f"""
 1. Write a complete, standalone Java program for {platform_name}.
 2. The class MUST be named 'Main' (e.g. `public class Main {{ public static void main(String[] args) throws IOException {{ ... }} }}`).
-3. Read all input from standard input using fast I/O:
-   Use `BufferedReader br = new BufferedReader(new InputStreamReader(System.in));` and `StringTokenizer st;`.
+3. CRITICAL INPUT PARSING & AVOIDANCE OF NumberFormatException:
+   - Competitive programming input frequently has multiple space-separated numbers on one line (e.g., '1 2' or '10 20 30').
+   - NEVER call `Integer.parseInt(br.readLine())` directly on lines with multiple integers! That crashes with NumberFormatException.
+   - Use the FastScanner helper class (or StringTokenizer) to parse whitespace-separated tokens individually:
+```java
+static class FastScanner {{
+    BufferedReader br = new BufferedReader(new InputStreamReader(System.in));
+    StringTokenizer st;
+    String next() {{
+        while (st == null || !st.hasMoreTokens()) {{
+            try {{ String l = br.readLine(); if (l == null) return null; st = new StringTokenizer(l); }}
+            catch (IOException e) {{ return null; }}
+        }}
+        return st.nextToken();
+    }}
+    boolean hasNext() {{
+        while (st == null || !st.hasMoreTokens()) {{
+            try {{ String l = br.readLine(); if (l == null) return false; st = new StringTokenizer(l); }}
+            catch (IOException e) {{ return false; }}
+        }}
+        return true;
+    }}
+    int nextInt() {{ return Integer.parseInt(next()); }}
+    long nextLong() {{ return Long.parseLong(next()); }}
+    double nextDouble() {{ return Double.parseDouble(next()); }}
+    String nextLine() {{ st = null; try {{ return br.readLine(); }} catch (IOException e) {{ return null; }} }}
+}}
+```
 4. Handle multiple test cases (T) if required by the problem statement.
 5. Print the output to System.out using PrintWriter or System.out.println.
 6. Optimal time & space complexity to prevent TLE (Time Limit Exceeded).
 """
     elif platform_type == "hackerrank":
-        platform_instructions = f"""
+        platform_instructions = """
 1. For HackerRank, inspect the starter code template below.
 2. If the starter template defines `class Result` and `public class Solution`, you MUST include BOTH classes intact in your output.
 3. NEVER omit or remove `public class Solution` or its `main` method, because HackerRank judge runs `Solution.main`!
 4. Write optimal algorithm in `Result` (or `Solution`), using fast I/O and handling all constraints and multiple test cases.
-5. STRICT JAVA 8 COMPATIBILITY REQUIRED (HackerRank judge executes with Java 8):
+5. Avoid NumberFormatException by parsing whitespace-separated tokens with StringTokenizer/Scanner when reading multiple numbers from a single line.
+6. STRICT JAVA 8 COMPATIBILITY REQUIRED (HackerRank judge executes with Java 8):
    - DO NOT use the 'var' keyword (use explicit types like int, String, List<Integer>, etc.).
    - DO NOT use Java 11+ methods like 'String.strip()', 'String.repeat()', or 'String.isBlank()' (use 'trim()' or standard loops).
    - DO NOT use Java 9+ factory methods like 'List.of()', 'Set.of()', or 'Map.of()' (use 'Arrays.asList()' or 'new ArrayList<>()').
@@ -928,10 +3821,10 @@ def ask_gemini_for_java_code(
    - DO NOT use modern switch expressions (use standard switch-case statements).
 """
     else:  # hackerearth
-        platform_instructions = f"""
+        platform_instructions = """
 1. For HackerEarth, write a complete, standalone Java program.
-2. The primary class MUST be named 'TestClass' (e.g. `public class TestClass {{ public static void main(String[] args) throws Exception {{ ... }} }}`).
-3. Read input from System.in using BufferedReader / Scanner and print to System.out.
+2. The primary class MUST be named 'TestClass' (e.g. `public class TestClass { public static void main(String[] args) throws Exception { ... } }`).
+3. Read input from System.in using FastScanner or Scanner to parse whitespace-separated tokens cleanly. Never assume one integer per line.
 4. Optimal time and space complexity.
 5. STRICT JAVA 8 COMPATIBILITY REQUIRED (HackerEarth judge executes with Java 8):
    - DO NOT use the 'var' keyword (use explicit types like int, String, List<Integer>, etc.).
@@ -994,7 +3887,7 @@ IMPORTANT FORMATTING:
     raise RuntimeError(f"All Gemini models failed. Last error: {last_error}")
 
 def clean_code_string(code: str) -> str:
-    """Removes stray markdown fences if any."""
+    """Removes stray markdown fences and trailing syntax noise after final closing brace if any."""
     code = code.strip()
     if code.startswith("```java"):
         code = code[7:]
@@ -1002,33 +3895,75 @@ def clean_code_string(code: str) -> str:
         code = code[3:]
     if code.endswith("```"):
         code = code[:-3]
+    code = code.strip()
+
+    # Strip stray trailing punctuation or noise after the final closing brace
+    last_brace = code.rfind("}")
+    if last_brace != -1:
+        after_brace = code[last_brace + 1:]
+        stripped_after = after_brace.strip()
+        if stripped_after and all(ch in ".;'`\" \n\r\t" for ch in stripped_after):
+            code = code[:last_brace + 1]
+
     return code.strip()
+
+def validate_problem_text_completeness(text: str, min_length: int = 10) -> Tuple[bool, Optional[str]]:
+    """
+    Validates whether extracted problem text is complete before generation.
+    Rejects incomplete extractions (< 10 chars, empty, or error placeholders).
+    """
+    if not text or len(text.strip()) < min_length:
+        return False, f"Problem description too short ({len(text.strip()) if text else 0} chars, minimum {min_length} required)."
+
+    t_low = text.lower().strip()
+    error_placeholders = ["loading...", "loading", "404 not found", "access denied", "page not found", "error"]
+    if t_low in error_placeholders or any(t_low.startswith(p) for p in ["404 ", "error:"]):
+        return False, "Page returned an error placeholder instead of problem description."
+
+    return True, None
 
 # ==============================================================================
 # Browser Page Helpers (Selectors & Text Extraction)
 # ==============================================================================
 async def extract_problem_text(page: Page, selectors: List[str], timeout_ms: int = 15000) -> str:
-    """Tries multiple selectors to retrieve the problem description."""
-    per_selector_timeout = max(2000, timeout_ms // len(selectors))
-    for selector in selectors:
-        try:
-            loc = page.locator(selector).first
-            await loc.wait_for(state="visible", timeout=per_selector_timeout)
-            text = (await loc.inner_text()).strip()
-            if len(text) > 150:
-                return text
-        except Exception:
-            continue
+    """Tries multiple selectors to retrieve the problem description,
+    diagnosing stale selectors and verifying fallback target identity."""
+    def cp_verifier(text: str) -> bool:
+        if len(text) < 80:
+            return False
+        keywords = ["input", "output", "example", "constraints", "note", "given", "return", "task", "problem", "function", "sample"]
+        t_low = text.lower()
+        return any(k in t_low for k in keywords)
 
-    for fallback in ["article", "main", "#content", ".content", ".problem-content"]:
+    res = await resolve_verified_selector(
+        page,
+        selectors,
+        role="problem_description",
+        target_verifier=cp_verifier,
+        timeout_ms=timeout_ms
+    )
+    if res.success and res.element:
         try:
-            loc = page.locator(fallback).first
-            if await loc.is_visible():
-                text = (await loc.inner_text()).strip()
-                if len(text) > 80:
-                    return text
+            return (await res.element.inner_text()).strip()
         except Exception:
-            continue
+            pass
+
+    # Try verified fallbacks
+    fallbacks = ["article", "main", "#content", ".content", ".problem-content", "[role='main']"]
+    fb_res = await resolve_verified_selector(
+        page,
+        fallbacks,
+        role="problem_description_fallback",
+        target_verifier=cp_verifier,
+        timeout_ms=min(3000, timeout_ms)
+    )
+    if fb_res.success and fb_res.element:
+        print(f"   ℹ️ Used verified fallback selector: '{fb_res.matched_selector}'")
+        try:
+            return (await fb_res.element.inner_text()).strip()
+        except Exception:
+            pass
+
     return ""
 
 async def extract_editor_code(page: Page) -> str:
@@ -1077,8 +4012,11 @@ async def extract_editor_code(page: Page) -> str:
     except Exception:
         return ""
 
-async def inject_code_into_editor(page: Page, solution_code: str) -> bool:
-    """Injects solution code using Monaco/Ace APIs, direct keyboard insertion, or clipboard."""
+async def inject_code_into_editor(page: Page, solution_code: str) -> InjectionResult:
+    """Injects solution code using Monaco/Ace APIs, direct keyboard insertion, or clipboard,
+    and immediately verifies that injection succeeded by reading back editor content."""
+    injected_type = None
+
     js_inject = """(newCode) => {
         if (window.monaco && window.monaco.editor) {
             const models = window.monaco.editor.getModels();
@@ -1114,95 +4052,359 @@ async def inject_code_into_editor(page: Page, solution_code: str) -> bool:
     try:
         result = await page.evaluate(js_inject, solution_code)
         if result:
+            injected_type = result
             print(f"   ✅ Code injected via {result}!")
-            return True
     except Exception as e:
         print(f"   ⚠️  JS API injection notice: {e}")
 
     # Method 2: UI Focus + Keyboard Select All + Insert Text
-    print("   ⌨️  Using simulated keyboard injection...")
-    modifier = "Meta" if sys.platform == "darwin" else "Control"
-    editor_targets = [
-        ".monaco-editor .view-lines",
-        ".monaco-editor textarea",
-        ".ace_editor .ace_text-input",
-        ".ace_editor",
-        "textarea[name='source']",
-        "textarea.code-editor",
-        ".CodeMirror",
-    ]
+    if not injected_type:
+        print("   ⌨️  Using simulated keyboard injection...")
+        modifier = "Meta" if sys.platform == "darwin" else "Control"
+        editor_targets = [
+            ".monaco-editor .view-lines",
+            ".monaco-editor textarea",
+            ".ace_editor .ace_text-input",
+            ".ace_editor",
+            "textarea[name='source']",
+            "textarea.code-editor",
+            ".CodeMirror",
+        ]
 
-    for selector in editor_targets:
-        try:
-            loc = page.locator(selector).first
-            if await loc.is_visible():
-                await loc.click()
-                await asyncio.sleep(0.3)
-                await page.keyboard.press(f"{modifier}+KeyA")
-                await asyncio.sleep(0.1)
-                await page.keyboard.press("Backspace")
-                await asyncio.sleep(0.1)
+        for selector in editor_targets:
+            try:
+                loc = page.locator(selector).first
+                if await loc.count() > 0 and await loc.is_visible():
+                    await loc.click()
+                    await asyncio.sleep(0.2)
+                    await page.keyboard.press(f"{modifier}+KeyA")
+                    await asyncio.sleep(0.05)
+                    await page.keyboard.press("Backspace")
+                    await asyncio.sleep(0.05)
 
-                await page.keyboard.insert_text(solution_code)
-                print("   ✅ Code inserted via keyboard.")
-                return True
-        except Exception:
-            continue
+                    await page.keyboard.insert_text(solution_code)
+                    print(f"   ✅ Code inserted via keyboard ({selector}).")
+                    injected_type = f"keyboard_{selector}"
+                    break
+            except Exception:
+                continue
 
     # Method 3: System Clipboard Fallback
-    print("   📋 Using system clipboard fallback...")
+    if not injected_type:
+        print("   📋 Using system clipboard fallback...")
+        try:
+            modifier = "Meta" if sys.platform == "darwin" else "Control"
+            pyperclip.copy(solution_code)
+            await page.keyboard.press(f"{modifier}+KeyA")
+            await page.keyboard.press("Backspace")
+            await page.keyboard.press(f"{modifier}+KeyV")
+            print("   ✅ Code pasted from clipboard.")
+            injected_type = "clipboard"
+        except Exception as e:
+            print(f"   ❌ Clipboard injection failed: {e}")
+
+    if not injected_type:
+        return InjectionResult(success=False, verified=False, error="No supported editor found for code injection")
+
+    # READBACK VERIFICATION
+    readback = await extract_editor_code(page)
+    expected_class = None
     try:
-        pyperclip.copy(solution_code)
-        await page.keyboard.press(f"{modifier}+KeyA")
-        await page.keyboard.press("Backspace")
-        await page.keyboard.press(f"{modifier}+KeyV")
-        print("   ✅ Code pasted from clipboard.")
-        return True
-    except Exception as e:
-        print(f"   ❌ Clipboard injection failed: {e}")
-        return False
+        expected_class, _, _, _ = detect_java_class_and_filename(solution_code, "generic")
+    except Exception:
+        pass
+    if not expected_class:
+        m = re.search(r"\bclass\s+(\w+)", solution_code)
+        if m:
+            expected_class = m.group(1)
+
+    verified = True
+    verify_err = None
+
+    if not readback or len(readback.strip()) < 10:
+        verified = False
+        verify_err = "Editor readback was empty after injection"
+    elif expected_class and not re.search(rf"\b{re.escape(expected_class)}\b", readback):
+        verified = False
+        verify_err = f"Expected class '{expected_class}' missing from editor readback"
+    elif len(readback) < max(20, int(len(solution_code) * 0.35)):
+        verified = False
+        verify_err = f"Editor readback significantly shorter than expected ({len(readback)} vs {len(solution_code)} chars)"
+
+    if verified:
+        print("   ✅ Editor injection verified via readback!")
+    else:
+        print(f"   ❌ Editor injection verification failed: {verify_err}")
+
+    return InjectionResult(
+        success=True,
+        verified=verified,
+        editor_type=injected_type or "unknown",
+        readback_snippet=readback[:100] if readback else "",
+        error=verify_err
+    )
 
 # ==============================================================================
 # Local Java Compilation & Verification (Universal for All Platforms)
 # ==============================================================================
-def compile_java_code_locally(code: str, platform_type: str) -> Tuple[bool, str, str]:
-    """Compiles Java code locally using javac to detect syntax, type, and import errors."""
+LEETCODE_STUBS = {
+    "TreeNode.java": (
+        "public class TreeNode {\n"
+        "    public int val;\n"
+        "    public TreeNode left;\n"
+        "    public TreeNode right;\n"
+        "    public TreeNode() {}\n"
+        "    public TreeNode(int val) { this.val = val; }\n"
+        "    public TreeNode(int val, TreeNode left, TreeNode right) {\n"
+        "        this.val = val;\n"
+        "        this.left = left;\n"
+        "        this.right = right;\n"
+        "    }\n"
+        "}\n"
+    ),
+    "ListNode.java": (
+        "public class ListNode {\n"
+        "    public int val;\n"
+        "    public ListNode next;\n"
+        "    public ListNode() {}\n"
+        "    public ListNode(int val) { this.val = val; }\n"
+        "    public ListNode(int val, ListNode next) { this.val = val; this.next = next; }\n"
+        "}\n"
+    ),
+    "Node.java": (
+        "import java.util.*;\n"
+        "public class Node {\n"
+        "    public int val;\n"
+        "    public List<Node> children;\n"
+        "    public Node left, right, next, random;\n"
+        "    public Node() {}\n"
+        "    public Node(int _val) { val = _val; }\n"
+        "    public Node(int _val, List<Node> _children) { val = _val; children = _children; }\n"
+        "    public Node(int _val, Node _left, Node _right, Node _next) {\n"
+        "        val = _val; left = _left; right = _right; next = _next;\n"
+        "    }\n"
+        "}\n"
+    ),
+}
+
+def detect_java_class_and_filename(code: str, platform_type: str) -> Tuple[Optional[str], Optional[str], str, Optional[str]]:
+    """
+    Detects the primary Java class name, source filename, and verifies platform requirements.
+    Returns (class_name, filename, cleaned_code, error_message).
+    """
     cleaned = clean_code_string(code)
 
-    # Platform-specific class naming adjustments
-    if platform_type == "hackerearth":
-        # HackerEarth requires TestClass
-        cleaned = re.sub(r"public\s+class\s+Main\b", "public class TestClass", cleaned)
-        cleaned = re.sub(r"\bclass\s+Main\b", "class TestClass", cleaned)
-        class_name = "TestClass"
+    # Strip comments to avoid false class detections in comments
+    no_comments = re.sub(r"/\*[\s\S]*?\*/", "", cleaned)
+    no_comments = re.sub(r"//.*", "", no_comments)
+
+    pub_match = re.search(r"\bpublic\s+(?:final\s+)?class\s+(\w+)", no_comments)
+    all_classes = [m.group(1) for m in re.finditer(r"\bclass\s+(\w+)", no_comments)]
+
+    if not all_classes and not pub_match:
+        return None, None, cleaned, "Missing public class or class declaration in generated Java code."
+
+    pub_class = pub_match.group(1) if pub_match else None
+    first_class = pub_class or (all_classes[0] if all_classes else None)
+
+    if platform_type in ["codeforces", "codechef"]:
+        if pub_class:
+            if pub_class != "Main":
+                return pub_class, f"{pub_class}.java", cleaned, f"Platform {platform_type} requires class Main, but found public class '{pub_class}'."
+            return "Main", "Main.java", cleaned, None
+        if "Main" in all_classes:
+            return "Main", "Main.java", cleaned, None
+        return first_class, f"{first_class}.java", cleaned, f"Platform {platform_type} requires class Main, but found class '{first_class}'."
+
+    elif platform_type == "hackerearth":
+        if pub_class:
+            if pub_class != "TestClass":
+                return pub_class, f"{pub_class}.java", cleaned, f"HackerEarth requires class TestClass, but found public class '{pub_class}'."
+            return "TestClass", "TestClass.java", cleaned, None
+        if "TestClass" in all_classes:
+            return "TestClass", "TestClass.java", cleaned, None
+        return first_class, f"{first_class}.java", cleaned, f"HackerEarth requires class TestClass, but found class '{first_class}'."
+
+    elif platform_type == "hackerrank":
+        if not pub_class:
+            return first_class, f"{first_class}.java", cleaned, "HackerRank requires public class Solution."
+        if pub_class != "Solution":
+            return pub_class, f"{pub_class}.java", cleaned, f"HackerRank requires public class Solution, but found public class '{pub_class}'."
+        return "Solution", "Solution.java", cleaned, None
+
+    else:  # leetcode
+        c_name = pub_class or ("Solution" if "Solution" in all_classes else first_class)
+        return c_name, f"{c_name}.java", cleaned, None
+
+def validate_code_security_and_dependencies(code: str) -> Tuple[bool, Optional[str]]:
+    """
+    Statically inspects generated Java code to reject forbidden network, process,
+    reflection, or unauthorized third-party libraries before compilation/execution.
+    """
+    cleaned = re.sub(r"/\*[\s\S]*?\*/", "", code)
+    cleaned = re.sub(r"//.*", "", cleaned)
+    cleaned = re.sub(r'"(?:\\.|[^"\\])*"', '""', cleaned)
+    cleaned = re.sub(r"'(?:\\.|[^'\\])*'", "''", cleaned)
+
+    prohibited = [
+        (r"\bjava\.net\b", "Network access package java.net is strictly prohibited"),
+        (r"\b(?:Socket|ServerSocket|HttpURLConnection|HttpClient|InetAddress|DatagramSocket)\b", "Network socket/connection classes are prohibited"),
+        (r"\bnew\s+URL\b|\bURI\.create\b", "URL/URI creation is prohibited"),
+        (r"\bProcessBuilder\b", "ProcessBuilder execution is prohibited"),
+        (r"\bRuntime\.getRuntime\b", "Runtime command execution is prohibited"),
+        (r"\bSystem\.exit\b", "System.exit is prohibited in competitive solutions"),
+        (r"\bjava\.lang\.reflect\b|\bMethod\.invoke\b|\bField\.get\b", "Reflection operations are prohibited"),
+        (r"\bjava\.io\.File\b|\bnew\s+File\s*\(", "Host file manipulation is prohibited"),
+        (r"\bjava\.nio\.file\b", "Host filesystem manipulation is prohibited"),
+    ]
+
+    for pattern, desc in prohibited:
+        if re.search(pattern, cleaned, re.MULTILINE):
+            return False, f"Security violation: {desc}"
+
+    # Verify imports: only java.util, java.io, java.math, java.text, java.lang are allowed
+    for line in cleaned.splitlines():
+        m_imp = re.match(r"^\s*import\s+(?:static\s+)?([a-zA-Z0-9_\.]+)", line)
+        if m_imp:
+            pkg = m_imp.group(1)
+            allowed = ("java.util", "java.io", "java.math", "java.text", "java.lang")
+            if not any(pkg.startswith(a) for a in allowed):
+                return False, f"Security violation: Unsupported external package import ({pkg})"
+
+    return True, None
+
+def validate_platform_signatures(code: str, starter_code: str, platform_type: str) -> Tuple[bool, Optional[str]]:
+    """
+    Validates that required platform structures, entrypoints, and Java version compatibility
+    are preserved in the generated code.
+    """
+    cleaned = clean_code_string(code)
+    no_comments = re.sub(r"/\*[\s\S]*?\*/", "", cleaned)
+    no_comments = re.sub(r"//.*", "", no_comments)
+
+    if platform_type == "hackerrank":
+        if "class Result" in starter_code and not re.search(r"\bclass\s+Result\b", no_comments):
+            return False, "HackerRank solution missing required class Result from starter template"
+        if not re.search(r"\bpublic\s+class\s+Solution\b", no_comments):
+            return False, "HackerRank solution missing required public class Solution"
+        if not re.search(r"public\s+static\s+void\s+main\s*\(\s*String\s*\[\s*\]", no_comments):
+            return False, "HackerRank Solution class must contain public static void main(String[] args)"
+
+    elif platform_type == "hackerearth":
+        if not re.search(r"\bclass\s+TestClass\b", no_comments):
+            return False, "HackerEarth solution missing required class TestClass"
+        if not re.search(r"public\s+static\s+void\s+main\s*\(\s*String\s*\[\s*\]", no_comments):
+            return False, "HackerEarth TestClass must contain public static void main(String[] args)"
+
     elif platform_type in ["codeforces", "codechef"]:
-        class_name = "Main"
-    else:  # leetcode, hackerrank
-        match = re.search(r"public\s+class\s+(\w+)", cleaned)
-        class_name = match.group(1) if match else "Solution"
+        if not re.search(r"\bclass\s+Main\b", no_comments):
+            return False, f"{platform_type} solution missing required class Main"
+        if not re.search(r"public\s+static\s+void\s+main\s*\(\s*String\s*\[\s*\]", no_comments):
+            return False, f"{platform_type} Main class must contain public static void main(String[] args)"
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # Provide standard LeetCode data structure stubs if referenced but not defined
+    if platform_type in ["hackerrank", "hackerearth"]:
+        j8_issues = [
+            (r"\bvar\s+\w+\s*=", "var keyword (Java 10+)"),
+            (r"\.strip\(\)", "String.strip() (Java 11+)"),
+            (r"\.repeat\(", "String.repeat() (Java 11+)"),
+            (r"\.isBlank\(\)", "String.isBlank() (Java 11+)"),
+            (r"\bList\.of\(", "List.of() (Java 9+)"),
+            (r"\bSet\.of\(", "Set.of() (Java 9+)"),
+            (r"\bMap\.of\(", "Map.of() (Java 9+)"),
+            (r"\.toList\(\)", "Stream.toList() (Java 16+)"),
+        ]
+        for pattern, desc in j8_issues:
+            if re.search(pattern, no_comments):
+                return False, f"Java 8 incompatibility detected: {desc} is not supported in Java 8."
+
+    return True, None
+
+def compare_sample_outputs(actual: str, expected: str, float_tolerance: float = 1e-6) -> Tuple[bool, Optional[str]]:
+    """
+    Compares program actual output against expected sample output using platform-appropriate
+    whitespace rules and float precision tolerances without blindly ignoring significant formatting.
+    """
+    act_norm = actual.replace("\r\n", "\n").replace("\r", "\n").rstrip()
+    exp_norm = expected.replace("\r\n", "\n").replace("\r", "\n").rstrip()
+
+    if act_norm == exp_norm:
+        return True, None
+
+    act_lines = act_norm.split("\n") if act_norm else []
+    exp_lines = exp_norm.split("\n") if exp_norm else []
+
+    if len(act_lines) != len(exp_lines):
+        return False, f"Line count mismatch: expected {len(exp_lines)} lines, got {len(act_lines)} lines.\nExpected:\n{expected}\nActual:\n{actual}"
+
+    for i, (a_line, e_line) in enumerate(zip(act_lines, exp_lines), 1):
+        a_line_r = a_line.rstrip()
+        e_line_r = e_line.rstrip()
+        if a_line_r == e_line_r:
+            continue
+
+        a_tokens = a_line_r.split()
+        e_tokens = e_line_r.split()
+        if len(a_tokens) != len(e_tokens):
+            return False, f"Line {i} token count mismatch: expected {len(e_tokens)} tokens ('{e_line_r}'), got {len(a_tokens)} tokens ('{a_line_r}')."
+
+        for t_idx, (at, et) in enumerate(zip(a_tokens, e_tokens), 1):
+            if at == et:
+                continue
+            try:
+                af = float(at)
+                ef = float(et)
+                diff = abs(af - ef)
+                denom = max(1.0, abs(ef))
+                if diff > float_tolerance and (diff / denom) > float_tolerance:
+                    return False, f"Line {i} token {t_idx} float mismatch: expected {et}, got {at} (diff {diff:.2e} > {float_tolerance:.2e})."
+            except ValueError:
+                return False, f"Line {i} token {t_idx} mismatch: expected '{et}', got '{at}'."
+
+    return True, None
+
+def compile_java_code_sandboxed(
+    code: str,
+    platform_type: str,
+    java_version: Optional[str] = None,
+    work_dir: Optional[Path] = None
+) -> CompilationResult:
+    """
+    Compiles Java code in an isolated directory with release flags and data structure stubs.
+    """
+    class_name, filename, cleaned, class_err = detect_java_class_and_filename(code, platform_type)
+    if class_err or not class_name or not filename:
+        return CompilationResult(
+            success=False,
+            class_name=class_name or "",
+            source_filename=filename or "",
+            error_message=class_err or "Missing class definition",
+            diagnostics=class_err or "Missing class definition",
+            cleaned_code=cleaned
+        )
+
+    target_version = java_version
+    if not target_version:
+        if platform_type in ["hackerrank", "hackerearth"]:
+            target_version = "8"
+
+    def _compile_in_dir(target_dir: Path) -> CompilationResult:
         if platform_type == "leetcode":
-            if "class TreeNode" not in cleaned and "TreeNode" in cleaned:
-                with open(Path(tmpdir) / "TreeNode.java", "w", encoding="utf-8") as f:
-                    f.write("public class TreeNode { public int val; public TreeNode left; public TreeNode right; public TreeNode() {} public TreeNode(int val) { this.val = val; } public TreeNode(int val, TreeNode left, TreeNode right) { this.val = val; this.left = left; this.right = right; } }")
-            if "class ListNode" not in cleaned and "ListNode" in cleaned:
-                with open(Path(tmpdir) / "ListNode.java", "w", encoding="utf-8") as f:
-                    f.write("public class ListNode { public int val; public ListNode next; public ListNode() {} public ListNode(int val) { this.val = val; } public ListNode(int val, ListNode next) { this.val = val; this.next = next; } }")
-            if "class Node" not in cleaned and "Node" in cleaned:
-                with open(Path(tmpdir) / "Node.java", "w", encoding="utf-8") as f:
-                    f.write("import java.util.*; public class Node { public int val; public List<Node> children; public Node left, right, next, random; public Node() {} public Node(int _val) { val = _val; } }")
+            for stub_name, stub_content in LEETCODE_STUBS.items():
+                stub_file = target_dir / stub_name
+                if not stub_file.exists():
+                    stub_file.write_text(stub_content, encoding="utf-8")
 
-        src_file = Path(tmpdir) / f"{class_name}.java"
-        with open(src_file, "w", encoding="utf-8") as f:
-            f.write(cleaned)
+        src_file = target_dir / filename
+        src_file.write_text(cleaned, encoding="utf-8")
+
+        cmd = ["javac", "-cp", str(target_dir), "-sourcepath", str(target_dir)]
+        if target_version:
+            cmd.extend(["-Xlint:-options", "--release", str(target_version)])
+
+        java_files = [str(f) for f in target_dir.glob("*.java")]
+        cmd.extend(java_files)
 
         try:
-            cmd = ["javac"]
-            if platform_type in ["hackerrank", "hackerearth"]:
-                cmd.extend(["-Xlint:-options", "--release", "8"])
-            cmd.append(str(src_file))
             comp_proc = subprocess.run(
                 cmd,
                 capture_output=True,
@@ -1210,18 +4412,674 @@ def compile_java_code_locally(code: str, platform_type: str) -> Tuple[bool, str,
                 timeout=15
             )
             if comp_proc.returncode != 0:
-                return False, comp_proc.stderr.strip(), cleaned
-            return True, "Compilation successful.", cleaned
+                return CompilationResult(
+                    success=False,
+                    class_name=class_name,
+                    source_filename=filename,
+                    error_message=comp_proc.stderr.strip(),
+                    diagnostics=comp_proc.stderr.strip(),
+                    cleaned_code=cleaned,
+                    target_version=target_version
+                )
+            return CompilationResult(
+                success=True,
+                class_name=class_name,
+                source_filename=filename,
+                cleaned_code=cleaned,
+                target_version=target_version
+            )
         except Exception as e:
-            return False, f"javac invocation failed: {e}", cleaned
+            return CompilationResult(
+                success=False,
+                class_name=class_name,
+                source_filename=filename,
+                error_message=f"javac invocation failed: {e}",
+                diagnostics=f"javac invocation failed: {e}",
+                cleaned_code=cleaned,
+                target_version=target_version
+            )
 
-async def verify_live_submission_verdict(page: Page, platform_type: str, url: str) -> Tuple[bool, str]:
-    """Polls the judge / platform API to verify that the submission was genuinely Accepted."""
-    if platform_type == "hackerrank":
-        slug = url.split("/challenges/")[1].split("/")[0]
-        print(f"   ⏳ Polling HackerRank submission API for verdict ({slug})...")
-        for poll in range(15):
-            await asyncio.sleep(3)
+    if work_dir is not None:
+        return _compile_in_dir(work_dir)
+    else:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            return _compile_in_dir(Path(tmpdir))
+
+def compile_java_code_locally(code: str, platform_type: str, java_version: Optional[str] = None) -> Tuple[bool, str, str]:
+    """Compiles Java code locally using javac to detect syntax, type, and import errors."""
+    res = compile_java_code_sandboxed(code, platform_type, java_version=java_version)
+    if res.success:
+        return True, "Compilation successful.", res.cleaned_code
+    return False, res.diagnostics or res.error_message or "Compilation failed", res.cleaned_code
+
+def execute_java_sandboxed(
+    class_dir: Path,
+    class_name: str,
+    stdin_input: str = "",
+    timeout_sec: float = 5.0,
+    max_memory_mb: int = 256,
+    disable_network: bool = True,
+    max_output_bytes: int = 10 * 1024 * 1024
+) -> ExecutionResult:
+    """
+    Executes compiled Java bytecode in a restricted sandbox enforcing CPU, memory, time,
+    process, filesystem, and network isolation limits.
+    """
+    java_cmd = [
+        "java",
+        f"-Xmx{max_memory_mb}m",
+        "-Xms16m",
+        "-XX:+UseSerialGC",
+        "-Dfile.encoding=UTF-8",
+    ]
+    if disable_network:
+        java_cmd.extend([
+            "-Dhttp.proxyHost=0.0.0.0",
+            "-Dhttp.proxyPort=0",
+            "-Dhttps.proxyHost=0.0.0.0",
+            "-Dhttps.proxyPort=0",
+            "-DsocksProxyHost=0.0.0.0",
+            "-DsocksProxyPort=0",
+        ])
+
+    java_cmd.extend(["-cp", str(class_dir), class_name])
+
+    final_cmd = list(java_cmd)
+    if sys.platform == "darwin" and Path("/usr/bin/sandbox-exec").exists():
+        sb_profile = (
+            "(version 1)\n"
+            "(allow default)\n"
+            "(deny network*)\n"
+            f'(deny file-write* (subpath "/Users"))\n'
+            f'(deny file-write* (subpath "/private/tmp"))\n'
+            f'(deny file-write* (subpath "/tmp"))\n'
+            f'(allow file-write* (subpath "{class_dir}"))\n'
+        )
+        final_cmd = ["/usr/bin/sandbox-exec", "-p", sb_profile] + final_cmd
+
+    def _set_rlimits():
+        if resource is not None:
+            try:
+                cpu_lim = max(1, int(timeout_sec) + 2)
+                resource.setrlimit(resource.RLIMIT_CPU, (cpu_lim, cpu_lim + 1))
+            except Exception:
+                pass
+            try:
+                resource.setrlimit(resource.RLIMIT_NPROC, (128, 128))
+            except Exception:
+                pass
+
+    try:
+        proc = subprocess.run(
+            final_cmd,
+            input=stdin_input,
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+            preexec_fn=_set_rlimits if sys.platform != "win32" else None,
+        )
+        stdout = proc.stdout[:max_output_bytes]
+        stderr = proc.stderr[:max_output_bytes]
+
+        oom = ("OutOfMemoryError" in stderr)
+        sec_violation = (
+            "SocketException" in stderr or
+            "UnknownHostException" in stderr or
+            "ConnectException" in stderr or
+            "SecurityException" in stderr or
+            "Operation not permitted" in stderr
+        )
+
+        err_msg = None
+        if proc.returncode != 0:
+            if oom:
+                err_msg = f"Memory Limit Exceeded ({max_memory_mb}MB): OutOfMemoryError"
+            elif sec_violation:
+                err_msg = "Security violation: Network or unauthorized resource access blocked"
+            else:
+                err_msg = f"Runtime Error (Exit Code {proc.returncode}): {stderr.strip()}"
+
+        return ExecutionResult(
+            success=(proc.returncode == 0),
+            return_code=proc.returncode,
+            stdout=stdout,
+            stderr=stderr,
+            timeout=False,
+            oom=oom,
+            security_violation=sec_violation,
+            error_message=err_msg
+        )
+    except subprocess.TimeoutExpired as te:
+        return ExecutionResult(
+            success=False,
+            return_code=-1,
+            stdout="",
+            stderr=str(te),
+            timeout=True,
+            error_message=f"Time Limit Exceeded ({timeout_sec}s)"
+        )
+    except Exception as e:
+        return ExecutionResult(
+            success=False,
+            return_code=-1,
+            stdout="",
+            stderr=str(e),
+            error_message=f"Execution failed: {e}"
+        )
+
+def clean_hackerrank_stdin_format(raw: str) -> str:
+    """Strips HackerRank STDIN / Function tabular formatting to keep only standard input tokens."""
+    lines = raw.strip().splitlines()
+    if not lines:
+        return ""
+    if "STDIN" in lines[0] and "Function" in lines[0]:
+        clean_lines = []
+        for line in lines[2:]:
+            parts = re.split(r"\s{2,}|\t+", line.strip())
+            if parts:
+                clean_lines.append(parts[0].strip())
+        return "\n".join(clean_lines).strip()
+    return raw.strip()
+
+def extract_sample_test_cases_from_text(problem_text: str) -> List[SampleTestCase]:
+    """
+    Extracts sample inputs and outputs from problem descriptions.
+    Prevents format specification prose from being captured as sample inputs,
+    and cleanly terminates sample outputs before Explanation/Note/Constraints sections.
+    """
+    lines = problem_text.splitlines()
+    samples: List[SampleTestCase] = []
+
+    current_inp: List[str] = []
+    current_out: List[str] = []
+    state = "NONE"  # "INP", "OUT"
+    in_examples_section = False
+    sample_counter = 1
+
+    re_term = re.compile(
+        r"^\s*(?:explanation|notes?|constraints?|subtasks?|scoring|author|time limit|memory limit)\b",
+        re.IGNORECASE
+    )
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if state == "INP":
+                current_inp.append(line)
+            elif state == "OUT":
+                current_out.append(line)
+            continue
+
+        if re.match(r"^\s*(?:examples?|samples?|sample\s*\d+:?|example\s*\d+:?)\b", stripped, re.IGNORECASE):
+            in_examples_section = True
+            if state == "OUT" and (current_inp or current_out):
+                clean_inp = "\n".join(current_inp).strip()
+                clean_out = "\n".join(current_out).strip()
+                if clean_inp or clean_out:
+                    samples.append(SampleTestCase(input_text=clean_inp, expected_output=clean_out, sample_index=sample_counter))
+                    sample_counter += 1
+                current_inp, current_out = [], []
+                state = "NONE"
+            continue
+
+        # Check section termination
+        if re_term.match(stripped):
+            if state == "OUT" and (current_inp or current_out):
+                clean_inp = "\n".join(current_inp).strip()
+                clean_out = "\n".join(current_out).strip()
+                if clean_inp or clean_out:
+                    samples.append(SampleTestCase(input_text=clean_inp, expected_output=clean_out, sample_index=sample_counter))
+                    sample_counter += 1
+                current_inp, current_out = [], []
+            state = "NONE"
+            continue
+
+        # Check Input header
+        is_inp_header = False
+        if re.match(r"^\s*(?:sample\s+(?:test\s+case\s+)?(?:\d+\s+)?input|example\s+(?:\d+\s+)?input)\s*(?:\d+)?\s*:?$", stripped, re.IGNORECASE):
+            is_inp_header = True
+        elif in_examples_section and re.match(r"^\s*input\s*(?:\d+)?\s*:?$", stripped, re.IGNORECASE):
+            is_inp_header = True
+        elif re.match(r"^\s*input\s*:\s*$", stripped, re.IGNORECASE) and not re.match(r"input format", stripped, re.IGNORECASE):
+            is_inp_header = True
+
+        if is_inp_header:
+            if state == "OUT" and (current_inp or current_out):
+                clean_inp = "\n".join(current_inp).strip()
+                clean_out = "\n".join(current_out).strip()
+                if clean_inp or clean_out:
+                    samples.append(SampleTestCase(input_text=clean_inp, expected_output=clean_out, sample_index=sample_counter))
+                    sample_counter += 1
+                current_inp, current_out = [], []
+            state = "INP"
+            continue
+
+        # Check Output header
+        is_out_header = False
+        if re.match(r"^\s*(?:sample\s+(?:test\s+case\s+)?(?:\d+\s+)?output|example\s+(?:\d+\s+)?output)\s*(?:\d+)?\s*:?$", stripped, re.IGNORECASE):
+            is_out_header = True
+        elif in_examples_section and re.match(r"^\s*output\s*(?:\d+)?\s*:?$", stripped, re.IGNORECASE):
+            is_out_header = True
+        elif re.match(r"^\s*output\s*:\s*$", stripped, re.IGNORECASE) and not re.match(r"output format", stripped, re.IGNORECASE):
+            is_out_header = True
+
+        if is_out_header:
+            state = "OUT"
+            continue
+
+        if state == "INP":
+            # Filter out specification prose like "The first line contains an integer T"
+            prose_starts = (
+                "the first line", "the first (and", "first line", "an integer", "each test case",
+                "the input", "input format", "contains a single", "the only line", "standard input"
+            )
+            if any(stripped.lower().startswith(ps) for ps in prose_starts):
+                state = "NONE"
+                current_inp = []
+                continue
+            current_inp.append(line)
+        elif state == "OUT":
+            current_out.append(line)
+
+    if state == "OUT" and (current_inp or current_out):
+        clean_inp = "\n".join(current_inp).strip()
+        clean_out = "\n".join(current_out).strip()
+        if clean_inp or clean_out:
+            samples.append(SampleTestCase(input_text=clean_inp, expected_output=clean_out, sample_index=sample_counter))
+
+    for s in samples:
+        if "STDIN" in s.input_text and "Function" in s.input_text:
+            s.input_text = clean_hackerrank_stdin_format(s.input_text)
+
+    if samples:
+        return samples
+
+    # Fallback pattern for inline or LeetCode style examples
+    pattern2 = re.compile(
+        r"Example\s*\d*:?\s*Input:?\s*([^\n]+(?:\n[^\n]+)*?)\s*Output:?\s*([^\n]+(?:\n[^\n]+)*?)(?=Example|Explanation|Note|Constraints|\Z)",
+        re.IGNORECASE
+    )
+    for i, (inp, out) in enumerate(pattern2.findall(problem_text), 1):
+        clean_inp = inp.strip()
+        clean_out = out.strip()
+        clean_out = re.split(r"\n\s*(?:Explanation|Note|Constraints)\b", clean_out, flags=re.IGNORECASE)[0].strip()
+        if "STDIN" in clean_inp and "Function" in clean_inp:
+            clean_inp = clean_hackerrank_stdin_format(clean_inp)
+        if clean_inp or clean_out:
+            samples.append(SampleTestCase(input_text=clean_inp, expected_output=clean_out, sample_index=i))
+
+    return samples
+
+async def extract_sample_test_cases_from_page(page: Page, platform_type: str) -> List[SampleTestCase]:
+    """Extracts sample test cases from live browser DOM based on platform-specific selectors."""
+    samples: List[SampleTestCase] = []
+    try:
+        if platform_type == "codeforces":
+            inputs = await page.locator(".sample-test .input pre").all_inner_texts()
+            outputs = await page.locator(".sample-test .output pre").all_inner_texts()
+            for i, (inp, out) in enumerate(zip(inputs, outputs), 1):
+                samples.append(SampleTestCase(input_text=inp.strip(), expected_output=out.strip(), sample_index=i))
+        elif platform_type in ["hackerrank", "codechef", "hackerearth"]:
+            container_pres = await page.locator(".challenge-body-html pre, .problem-statement pre, #problem-statement pre, ._problemBody_bh3c4_71 pre, .problem-description pre, pre").all_inner_texts()
+            clean_pres = [p.strip() for p in container_pres if p and p.strip() and not p.strip().startswith("//")]
+            if len(clean_pres) >= 2 and len(clean_pres) % 2 == 0:
+                for idx in range(0, len(clean_pres) - 1, 2):
+                    clean_i = re.sub(r"^(?:Sample\s+Input\s*(?:\d+)?\s*:?\s*|Input\s*(?:\d+)?\s*:?\s*)", "", clean_pres[idx], flags=re.IGNORECASE).strip()
+                    clean_o = re.sub(r"^(?:Sample\s+Output\s*(?:\d+)?\s*:?\s*|Output\s*(?:\d+)?\s*:?\s*)", "", clean_pres[idx+1], flags=re.IGNORECASE).strip()
+                    if "STDIN" in clean_i and "Function" in clean_i:
+                        clean_i = clean_hackerrank_stdin_format(clean_i)
+                    if clean_i or clean_o:
+                        samples.append(SampleTestCase(input_text=clean_i, expected_output=clean_o, sample_index=(idx // 2) + 1))
+            if not samples:
+                inputs = await page.locator(".challenge_sample_input pre, .problem-statement pre:has-text('Input'), .sample-input-box pre, .sample-test .input pre, .input-container pre").all_inner_texts()
+                outputs = await page.locator(".challenge_sample_output pre, .problem-statement pre:has-text('Output'), .sample-output-box pre, .sample-test .output pre, .output-container pre").all_inner_texts()
+                for i, (inp, out) in enumerate(zip(inputs, outputs), 1):
+                    clean_i = re.sub(r"^(?:Sample\s+Input\s*(?:\d+)?\s*:?\s*|Input\s*(?:\d+)?\s*:?\s*)", "", inp.strip(), flags=re.IGNORECASE).strip()
+                    clean_o = re.sub(r"^(?:Sample\s+Output\s*(?:\d+)?\s*:?\s*|Output\s*(?:\d+)?\s*:?\s*)", "", out.strip(), flags=re.IGNORECASE).strip()
+                    if "STDIN" in clean_i and "Function" in clean_i:
+                        clean_i = clean_hackerrank_stdin_format(clean_i)
+                    samples.append(SampleTestCase(input_text=clean_i, expected_output=clean_o, sample_index=i))
+    except Exception:
+        pass
+    return samples
+
+def run_all_sample_tests_sandboxed(
+    code: str,
+    samples: List[SampleTestCase],
+    platform_type: str,
+    java_version: Optional[str] = None,
+    timeout_sec: float = 5.0,
+    max_memory_mb: int = 256
+) -> Tuple[bool, List[SampleTestResult], str]:
+    """Compiles and executes Java code against sample test cases in an isolated sandbox."""
+    if not samples:
+        if platform_type in ["codeforces", "codechef", "hackerearth"]:
+            return False, [], "No sample test cases provided; sample execution is required for stdin/stdout problems."
+        return True, [], "No sample test cases provided; compilation check only."
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        comp_res = compile_java_code_sandboxed(code, platform_type, java_version=java_version, work_dir=tmp_path)
+        if not comp_res.success:
+            return False, [], f"Compilation error before sample tests:\n{comp_res.diagnostics}"
+
+        class_name = comp_res.class_name
+        if platform_type == "leetcode" and "public static void main" not in comp_res.cleaned_code:
+            return True, [], "LeetCode class-based solution verified with data structure stubs."
+
+        all_passed = True
+        summary = []
+        results: List[SampleTestResult] = []
+
+        for sample in samples:
+            exec_res = execute_java_sandboxed(
+                class_dir=tmp_path,
+                class_name=class_name,
+                stdin_input=sample.input_text,
+                timeout_sec=timeout_sec,
+                max_memory_mb=max_memory_mb
+            )
+
+            if exec_res.timeout:
+                all_passed = False
+                res = SampleTestResult(
+                    sample_index=sample.sample_index,
+                    passed=False,
+                    input_text=sample.input_text,
+                    expected_output=sample.expected_output,
+                    actual_output="",
+                    error_message=exec_res.error_message,
+                    diagnostic_category=DiagnosticCategory.TIMEOUT_ERROR,
+                    stderr=exec_res.stderr
+                )
+                results.append(res)
+                summary.append(f"Sample {sample.sample_index}: TIME LIMIT EXCEEDED ({timeout_sec}s)")
+            elif exec_res.oom:
+                all_passed = False
+                res = SampleTestResult(
+                    sample_index=sample.sample_index,
+                    passed=False,
+                    input_text=sample.input_text,
+                    expected_output=sample.expected_output,
+                    actual_output="",
+                    error_message=exec_res.error_message,
+                    diagnostic_category=DiagnosticCategory.MEMORY_ERROR,
+                    stderr=exec_res.stderr
+                )
+                results.append(res)
+                summary.append(f"Sample {sample.sample_index}: MEMORY LIMIT EXCEEDED ({max_memory_mb}MB)")
+            elif not exec_res.success:
+                all_passed = False
+                err_low = (exec_res.stderr or "").lower()
+                is_parser_err = any(k in err_low for k in [
+                    "numberformatexception", "nosuchelementexception", "inputmismatchexception",
+                    "stringindexoutofboundsexception"
+                ]) or ("arrayindexoutofboundsexception" in err_low and any(k in err_low for k in ["main", "scanner", "token", "read"]))
+                d_cat = DiagnosticCategory.PARSER_ERROR if is_parser_err else DiagnosticCategory.ALGORITHM_ERROR
+
+                res = SampleTestResult(
+                    sample_index=sample.sample_index,
+                    passed=False,
+                    input_text=sample.input_text,
+                    expected_output=sample.expected_output,
+                    actual_output=exec_res.stdout,
+                    error_message=exec_res.error_message,
+                    diagnostic_category=d_cat,
+                    stderr=exec_res.stderr
+                )
+                results.append(res)
+                summary.append(f"Sample {sample.sample_index}: RUNTIME ERROR [{d_cat.value}] (Code {exec_res.return_code})\nStderr: {exec_res.stderr.strip()}")
+            else:
+                matches, diff_msg = compare_sample_outputs(exec_res.stdout, sample.expected_output)
+                if matches:
+                    res = SampleTestResult(
+                        sample_index=sample.sample_index,
+                        passed=True,
+                        input_text=sample.input_text,
+                        expected_output=sample.expected_output,
+                        actual_output=exec_res.stdout
+                    )
+                    results.append(res)
+                    summary.append(f"Sample {sample.sample_index}: PASSED")
+                else:
+                    all_passed = False
+                    res = SampleTestResult(
+                        sample_index=sample.sample_index,
+                        passed=False,
+                        input_text=sample.input_text,
+                        expected_output=sample.expected_output,
+                        actual_output=exec_res.stdout,
+                        error_message=diff_msg,
+                        diff=diff_msg,
+                        diagnostic_category=DiagnosticCategory.ALGORITHM_ERROR
+                    )
+                    results.append(res)
+                    summary.append(f"Sample {sample.sample_index}: FAILED\nInput:\n{sample.input_text}\nExpected:\n{sample.expected_output}\nActual:\n{exec_res.stdout}\nDiff: {diff_msg}")
+
+        return all_passed, results, "\n".join(summary)
+
+def verify_and_repair_java_pipeline(
+    problem_text: str,
+    starter_code: str,
+    samples: List[SampleTestCase],
+    platform_name: str,
+    platform_type: str,
+    max_repairs: int = 3,
+    java_version: Optional[str] = None,
+    ai_caller: Optional[Callable[..., Tuple[str, str]]] = None,
+    dry_run: bool = False,
+) -> VerificationPipelineResult:
+    """
+    Modular AI generation, verification, and repair pipeline.
+    Enforces configurable repair attempts, feeds exact compiler/sample diagnostics into prompts,
+    and isolates untrusted execution.
+    """
+    caller = ai_caller or ask_gemini_for_java_code
+    last_feedback: Optional[str] = None
+    solution_code: str = ""
+    explanation: str = ""
+    last_comp_res: Optional[CompilationResult] = None
+    last_sample_results: List[SampleTestResult] = []
+
+    for attempt in range(1, max_repairs + 2):
+        repair_idx = attempt - 1
+        if repair_idx > 0:
+            print(f"   🔧 [Repair Attempt {repair_idx}/{max_repairs}] Querying AI with exact failure diagnostics...")
+        else:
+            print("   🤖 [Initial Generation] Querying AI for Java solution...")
+
+        try:
+            import inspect
+            sig = inspect.signature(caller)
+            call_kwargs = {
+                "problem_text": problem_text,
+                "starter_code": starter_code,
+                "platform_name": platform_name,
+                "platform_type": platform_type,
+                "error_feedback": last_feedback
+            }
+            if "dry_run" in sig.parameters:
+                call_kwargs["dry_run"] = dry_run
+
+            solution_code, explanation = caller(**call_kwargs)
+        except Exception as e:
+            return VerificationPipelineResult(
+                success=False,
+                solution_code=solution_code,
+                explanation=explanation,
+                repair_attempts=repair_idx,
+                failure_reason=f"AI generation call failed: {e}"
+            )
+
+        # 1. Security & Dependency Check
+        sec_ok, sec_err = validate_code_security_and_dependencies(solution_code)
+        if not sec_ok:
+            print(f"   🛑 Security Check Failed: {sec_err}")
+            last_feedback = (
+                f"SECURITY VIOLATION IN GENERATED CODE:\n{sec_err}\n"
+                f"Requirement: Online judge code must be completely self-contained. "
+                f"Do NOT import or use java.net, ProcessBuilder, Runtime.getRuntime, System.exit, "
+                f"reflection, or external 3rd-party libraries."
+            )
+            continue
+
+        # 2. Platform Signature Check
+        sig_ok, sig_err = validate_platform_signatures(solution_code, starter_code, platform_type)
+        if not sig_ok:
+            print(f"   ⚠️ Platform Signature Check Failed: {sig_err}")
+            last_feedback = (
+                f"PLATFORM SIGNATURE ERROR:\n{sig_err}\n"
+                f"Please preserve the required class names, method signatures, and Java version compatibility."
+            )
+            continue
+
+        # 3. Class & Filename Check
+        c_name, f_name, cleaned_code, class_err = detect_java_class_and_filename(solution_code, platform_type)
+        if class_err:
+            print(f"   ⚠️ Class Detection Error: {class_err}")
+            last_feedback = (
+                f"CLASS DEFINITION ERROR:\n{class_err}\n"
+                f"Ensure the primary class is properly named according to {platform_name} conventions."
+            )
+            continue
+
+        # 4. Compilation Check
+        comp_ok, comp_msg, cleaned_code = compile_java_code_locally(solution_code, platform_type, java_version=java_version)
+        last_comp_res = CompilationResult(
+            success=comp_ok,
+            class_name=c_name or "Solution",
+            source_filename=f_name or "Solution.java",
+            error_message=None if comp_ok else comp_msg,
+            diagnostics=None if comp_ok else comp_msg,
+            cleaned_code=cleaned_code,
+            target_version=java_version
+        )
+        if not comp_ok:
+            print(f"   ⚠️ Java Compilation Failed:\n{comp_msg}")
+            last_feedback = (
+                f"EXACT COMPILER DIAGNOSTICS (javac):\n{comp_msg}\n"
+                f"Diagnose and fix the syntax, type, or import errors in Java."
+            )
+            continue
+
+        print("   ✅ Local javac compilation PASSED cleanly!")
+
+        # 5. Sample Test Cases Check (Strictly required for stdin/stdout problems)
+        is_stdin_problem = platform_type in ["codeforces", "codechef", "hackerearth"] or (
+            platform_type == "hackerrank" and any(k in solution_code for k in ["Scanner", "BufferedReader", "FastScanner"])
+        )
+        if is_stdin_problem and not samples:
+            print(f"   ⚠️ Sample execution is strictly required for stdin/stdout problems on {platform_name}, but no sample cases were provided.")
+            return VerificationPipelineResult(
+                success=False,
+                solution_code=cleaned_code,
+                explanation=explanation,
+                compilation=last_comp_res,
+                sample_results=[],
+                repair_attempts=repair_idx,
+                failure_reason="Sample test execution is required before submission for stdin/stdout problems, but no sample test cases were available.",
+                diagnostic_category=DiagnosticCategory.PARSER_ERROR
+            )
+
+        samples_passed, sample_results, sample_summary = run_all_sample_tests_sandboxed(
+            code=cleaned_code,
+            samples=samples,
+            platform_type=platform_type,
+            java_version=java_version
+        )
+        last_sample_results = sample_results
+
+        if not samples_passed:
+            print(f"   ⚠️ Sample Test Cases Failed:\n{sample_summary}")
+            failed_s = next((s for s in sample_results if not s.passed), None)
+            diag = (failed_s.diff or failed_s.error_message or "Output mismatch") if failed_s else "Sample mismatch"
+            s_idx = failed_s.sample_index if failed_s else 1
+            s_inp = failed_s.input_text if failed_s else ""
+            s_exp = failed_s.expected_output if failed_s else ""
+            s_act = failed_s.actual_output if failed_s else ""
+            d_cat = failed_s.diagnostic_category if (failed_s and failed_s.diagnostic_category) else DiagnosticCategory.ALGORITHM_ERROR
+
+            feedback_lines = [
+                f"SAMPLE TEST CASE #{s_idx} FAILED [{d_cat.value}]:",
+                f"Input:\n{s_inp}",
+                f"Expected Output:\n{s_exp}",
+                f"Actual Output:\n{s_act}",
+            ]
+            if failed_s and failed_s.stderr and failed_s.stderr.strip():
+                feedback_lines.append(f"Runtime Exception / Stderr:\n{failed_s.stderr.strip()}")
+            feedback_lines.append(f"Exact Diagnostic:\n{diag}")
+
+            if d_cat == DiagnosticCategory.PARSER_ERROR:
+                feedback_lines.append(
+                    "CRITICAL FIX: Input parsing failed (e.g. NumberFormatException or NoSuchElementException). "
+                    "Multiple tokens may be on the same line. Do NOT call Integer.parseInt(br.readLine()) directly on lines; "
+                    "use the provided FastScanner with StringTokenizer to parse individual tokens."
+                )
+            else:
+                feedback_lines.append("Diagnose the algorithmic failure and output a corrected solution.")
+
+            last_feedback = "\n".join(feedback_lines)
+            continue
+
+        print("   ✅ Sample test cases PASSED!")
+        return VerificationPipelineResult(
+            success=True,
+            solution_code=cleaned_code,
+            explanation=explanation,
+            compilation=last_comp_res,
+            sample_results=last_sample_results,
+            repair_attempts=repair_idx
+        )
+
+    # All repair attempts exhausted
+    last_cat = None
+    if last_sample_results:
+        f_s = next((s for s in last_sample_results if not s.passed), None)
+        if f_s:
+            last_cat = f_s.diagnostic_category
+    elif last_comp_res and not last_comp_res.success:
+        last_cat = DiagnosticCategory.COMPILATION_ERROR
+
+    return VerificationPipelineResult(
+        success=False,
+        solution_code=solution_code,
+        explanation=explanation,
+        compilation=last_comp_res,
+        sample_results=last_sample_results,
+        repair_attempts=max_repairs,
+        failure_reason=last_feedback or "Verification failed after maximum repair attempts",
+        diagnostic_category=last_cat
+    )
+
+async def capture_pre_submission_snapshot(
+    page: Page,
+    platform_type: str,
+    url: str
+) -> Dict[str, Any]:
+    """Captures pre-submission metadata (latest submission ID, start timestamp, expected problem and account)
+    to prevent stale submission verdicts from being falsely attributed to the current attempt."""
+    start_time = time.time()
+    prob_id = extract_problem_id(url, platform_type)
+    account = None
+    pre_submission_id = None
+
+    if platform_type == "codeforces":
+        account = CODEFORCES_HANDLE
+        try:
+            if account:
+                api_url = f"https://codeforces.com/api/user.status?handle={account}&from=1&count=1"
+                req = urllib.request.Request(api_url, headers={"User-Agent": DEFAULT_USER_AGENT})
+                with urllib.request.urlopen(req, timeout=4) as resp:
+                    if resp.status == 200:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        if data.get("status") == "OK" and data.get("result"):
+                            pre_submission_id = str(data["result"][0].get("id"))
+        except Exception:
+            pass
+
+    elif platform_type == "hackerrank":
+        slug = prob_id
+        try:
             data = await page.evaluate(f"""async () => {{
                 try {{
                     const r = await fetch('https://www.hackerrank.com/rest/contests/master/challenges/{slug}/submissions');
@@ -1231,198 +5089,956 @@ async def verify_live_submission_verdict(page: Page, platform_type: str, url: st
                 }}
             }}""")
             if data and "models" in data and len(data["models"]) > 0:
-                latest = data["models"][0]
-                st = latest.get("status")
-                sc = latest.get("score")
-                print(f"      [HackerRank Poll {poll+1}/15] Status: {st}, Score: {sc}")
-                if st not in ["Processing", "Queued", "Evaluating", None]:
-                    if st == "Accepted":
-                        return True, f"Accepted (Score: {sc})"
-                    else:
-                        return False, f"{st} (Score: {sc})"
-        return False, "Evaluation timed out on HackerRank."
-
-    elif platform_type == "codeforces":
-        # Extract target contest ID and problem index from URL (e.g. .../problemset/problem/1294/C)
-        clean_url = url.rstrip("/")
-        parts = clean_url.split("/")
-        expected_contest = None
-        expected_index = None
-        if len(parts) >= 2:
-            try:
-                expected_contest = int(parts[-2])
-                expected_index = parts[-1].upper()
-            except ValueError:
-                pass
-
-        print(f"   ⏳ Polling Codeforces API for verdict (Target: {expected_contest}{expected_index})...")
-
-        # Check if page currently displays anti-bot or submission errors
-        try:
-            page_errs = await page.evaluate("""() => {
-                const els = Array.from(document.querySelectorAll('.error, .error__desc, span[class*="error"]'));
-                return els.map(e => (e.innerText || '').trim()).filter(t => t.length > 0);
-            }""")
-            for pe in page_errs:
-                if "anti-bot" in pe.lower() or "verification" in pe.lower():
-                    page._anti_bot_blocked = True
-                    return False, "Codeforces anti-bot verification (Cloudflare Turnstile) challenge required."
-                if len(pe) > 2:
-                    return False, f"Codeforces form error: {pe}"
+                pre_submission_id = str(data["models"][0].get("id"))
         except Exception:
             pass
 
-        now_ts = time.time()
-        seen_testing = False
-        for poll in range(25):
-            await asyncio.sleep(3)
+    elif platform_type in ["leetcode", "codechef", "hackerearth"]:
+        # Capture any currently visible submission ID in DOM before new submission
+        try:
+            pre_id = await page.evaluate(r"""() => {
+                const link = document.querySelector('a[href*="/submissions/detail/"], a[href*="/viewsolution/"], a[href*="/submission/"]');
+                if (link && link.href) {
+                    const m = link.href.match(/(?:detail\/|viewsolution\/|submission\/)(?:[a-zA-Z0-9_\-]+\/)?(\d+)/);
+                    if (m) return m[1];
+                }
+                const el = document.querySelector('[data-submission-id]');
+                return el ? el.getAttribute('data-submission-id') : null;
+            }""")
+            if pre_id:
+                pre_submission_id = str(pre_id)
+        except Exception:
+            pass
+
+    return {
+        "start_time": start_time,
+        "pre_submission_id": pre_submission_id,
+        "account": account,
+        "problem_id": prob_id,
+        "platform_type": platform_type,
+    }
+
+async def _verify_hackerrank(
+    page: Page,
+    url: str,
+    submission_start_time: float,
+    pre_submission_id: Optional[str] = None,
+    account: Optional[str] = None,
+    expected_problem_id: Optional[str] = None,
+    timeout: float = 45.0,
+    initial_interval: float = 1.5,
+) -> SubmissionVerdict:
+    slug = expected_problem_id or extract_problem_id(url, "hackerrank")
+    print(f"   ⏳ Polling HackerRank submission API for verdict ({slug})...")
+
+    last_error = None
+    seen_pending = False
+    pending_sub_id = None
+
+    async for poll, elapsed in poll_with_backoff(
+        timeout=timeout, initial_interval=initial_interval, max_interval=5.0, backoff_factor=1.4
+    ):
+        try:
+            data = await page.evaluate(f"""async () => {{
+                try {{
+                    const r = await fetch('https://www.hackerrank.com/rest/contests/master/challenges/{slug}/submissions');
+                    if (!r.ok) return {{ error: 'HTTP_' + r.status }};
+                    return await r.json();
+                }} catch(e) {{
+                    return {{ error: e.toString() }};
+                }}
+            }}""")
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+        if not data:
+            continue
+
+        if isinstance(data, dict) and "error" in data:
+            last_error = str(data["error"])
+            continue
+
+        models = data.get("models") if isinstance(data, dict) else None
+        if not models or not isinstance(models, list):
+            continue
+
+        # Find the submission corresponding strictly to the CURRENT attempt
+        matching_sub = None
+        for sub in models:
+            sub_id = str(sub.get("id", ""))
+            if not sub_id:
+                continue
+
+            # Check 1: Reject if same as pre-submission ID (Stale submission)
+            if pre_submission_id and sub_id == str(pre_submission_id):
+                continue
+
+            # Check 2: Submission time matching (reject stale verdicts created before submission)
+            created_at = sub.get("created_at")
+            sub_ts = None
+            if created_at:
+                try:
+                    if isinstance(created_at, (int, float)):
+                        sub_ts = float(created_at)
+                    else:
+                        sub_ts = datetime.fromisoformat(str(created_at).replace("Z", "+00:00")).timestamp()
+                except Exception:
+                    pass
+
+            if sub_ts is not None and sub_ts < (submission_start_time - 15.0):
+                # Stale submission from an earlier historical session
+                continue
+
+            # Check 3: Account matching if known
+            if account:
+                sub_user = sub.get("hacker_username") or sub.get("username")
+                if sub_user and sub_user.lower() != account.lower():
+                    continue
+
+            # Found candidate submission matching current attempt!
+            matching_sub = sub
+            break
+
+        if not matching_sub:
+            # Only stale or unmatching submissions exist currently
+            continue
+
+        sub_id = str(matching_sub.get("id"))
+        st = matching_sub.get("status")
+        sc = matching_sub.get("score")
+        print(f"      [HackerRank Poll {poll}] SubID: {sub_id}, Status: {st}, Score: {sc}")
+
+        if st in ["Processing", "Queued", "Evaluating", None]:
+            seen_pending = True
+            pending_sub_id = sub_id
+            continue
+
+        evidence = {
+            "submission_id": sub_id,
+            "status": st,
+            "score": sc,
+            "challenge_slug": slug,
+            "created_at": matching_sub.get("created_at"),
+            "account": matching_sub.get("hacker_username") or account,
+        }
+
+        if st == "Accepted":
+            return SubmissionVerdict(
+                state=VerdictState.ACCEPTED,
+                message=f"Accepted (Score: {sc})",
+                submission_id=sub_id,
+                platform="hackerrank",
+                problem_id=slug,
+                account=matching_sub.get("hacker_username") or account,
+                timestamp=sub_ts or time.time(),
+                correlation_mechanism="hackerrank_rest_api_submission_id",
+                evidence=evidence,
+            )
+        elif st in ["Wrong Answer", "Compilation Error", "Runtime Error", "Terminated due to timeout"] or st:
+            return SubmissionVerdict(
+                state=VerdictState.REJECTED,
+                message=f"{st} (Score: {sc})",
+                submission_id=sub_id,
+                platform="hackerrank",
+                problem_id=slug,
+                account=matching_sub.get("hacker_username") or account,
+                timestamp=sub_ts or time.time(),
+                correlation_mechanism="hackerrank_rest_api_submission_id",
+                evidence=evidence,
+            )
+
+    # Polling exhausted
+    if seen_pending:
+        return SubmissionVerdict(
+            state=VerdictState.PENDING,
+            message="Evaluation timed out on HackerRank (submission remains in evaluation).",
+            submission_id=pending_sub_id,
+            platform="hackerrank",
+            problem_id=slug,
+            account=account,
+        )
+
+    if last_error:
+        return SubmissionVerdict(
+            state=VerdictState.ERROR,
+            message=f"HackerRank API polling error: {last_error}",
+            platform="hackerrank",
+            problem_id=slug,
+            account=account,
+        )
+
+    return SubmissionVerdict(
+        state=VerdictState.UNKNOWN,
+        message="No new submission registered on HackerRank for current attempt within timeout window.",
+        platform="hackerrank",
+        problem_id=slug,
+        account=account,
+    )
+
+async def _verify_codeforces(
+    page: Page,
+    url: str,
+    submission_start_time: float,
+    pre_submission_id: Optional[str] = None,
+    account: Optional[str] = None,
+    expected_problem_id: Optional[str] = None,
+    timeout: float = 60.0,
+    initial_interval: float = 1.5,
+) -> SubmissionVerdict:
+    contest_id, index = None, None
+    m = re.search(r"/(?:problemset/problem|contest)/(\d+)/(?:problem/)?([A-Za-z0-9]+)", url.strip().rstrip("/"))
+    if m:
+        contest_id = int(m.group(1))
+        index = m.group(2).upper()
+    prob_id = f"{contest_id}{index}" if contest_id and index else (expected_problem_id or extract_problem_id(url, "codeforces"))
+
+    handle = account or CODEFORCES_HANDLE
+    print(f"   ⏳ Polling Codeforces API for verdict (Target: {prob_id}, Handle: {handle or 'None'})...")
+
+    # 1. Check for anti-bot or submission errors on page
+    try:
+        page_errs = await page.evaluate("""() => {
+            const els = Array.from(document.querySelectorAll('.error, .error__desc, span[class*="error"]'));
+            return els.map(e => (e.innerText || '').trim()).filter(t => t.length > 0);
+        }""")
+        for pe in page_errs:
+            if "anti-bot" in pe.lower() or "verification" in pe.lower():
+                page._anti_bot_blocked = True
+                return SubmissionVerdict(
+                    state=VerdictState.ERROR,
+                    message="Codeforces anti-bot verification (Cloudflare Turnstile) challenge required.",
+                    platform="codeforces",
+                    problem_id=prob_id,
+                    account=handle,
+                )
+            if len(pe) > 2:
+                return SubmissionVerdict(
+                    state=VerdictState.REJECTED,
+                    message=f"Codeforces form error: {pe}",
+                    platform="codeforces",
+                    problem_id=prob_id,
+                    account=handle,
+                )
+    except Exception:
+        pass
+
+    if not handle:
+        return SubmissionVerdict(
+            state=VerdictState.ERROR,
+            message="Codeforces verification requires CODEFORCES_HANDLE to query user submissions.",
+            platform="codeforces",
+            problem_id=prob_id,
+        )
+
+    last_error = None
+    seen_pending = False
+    pending_sub_id = None
+
+    async for poll, elapsed in poll_with_backoff(
+        timeout=timeout, initial_interval=initial_interval, max_interval=5.0, backoff_factor=1.4
+    ):
+        try:
+            api_url = f"https://codeforces.com/api/user.status?handle={handle}&from=1&count=10"
+            req = urllib.request.Request(api_url, headers={"User-Agent": DEFAULT_USER_AGENT})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                if resp.status != 200:
+                    last_error = f"HTTP {resp.status}"
+                    continue
+                cf_data = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+        if not cf_data or cf_data.get("status") != "OK":
+            last_error = cf_data.get("comment", "API status not OK") if isinstance(cf_data, dict) else "Invalid response"
+            continue
+
+        results = cf_data.get("result", [])
+        matching_sub = None
+
+        for sub in results:
+            p = sub.get("problem", {})
+            c_id = p.get("contestId")
+            idx = p.get("index", "").upper()
+            creation = sub.get("creationTimeSeconds", 0)
+            sub_id = str(sub.get("id", ""))
+
+            # Check 1: Contest ID and Index must match target problem
+            if contest_id is not None and (c_id != contest_id or idx != index):
+                continue
+
+            # Check 2: Reject if same as pre-submission ID (Stale)
+            if pre_submission_id and sub_id == str(pre_submission_id):
+                continue
+
+            # Check 3: Creation time must be after submission start time (within 15s clock skew)
+            if creation < (submission_start_time - 15.0):
+                continue
+
+            # Check 4: Account verification
+            author_members = [m.get("handle", "").lower() for m in sub.get("author", {}).get("members", [])]
+            if handle.lower() not in author_members:
+                continue
+
+            matching_sub = sub
+            break
+
+        if not matching_sub:
+            continue
+
+        sub_id = str(matching_sub.get("id"))
+        verdict = matching_sub.get("verdict")
+        print(f"      [Codeforces Poll {poll}] SubID: {sub_id}, Verdict: {verdict}")
+
+        # REQUIREMENT 4: NEVER return ACCEPTED for TESTING
+        if verdict == "TESTING" or verdict is None or verdict == "SUBMITTED":
+            seen_pending = True
+            pending_sub_id = sub_id
+            continue
+
+        evidence = {
+            "submission_id": sub_id,
+            "contestId": matching_sub.get("problem", {}).get("contestId"),
+            "index": matching_sub.get("problem", {}).get("index"),
+            "creationTimeSeconds": matching_sub.get("creationTimeSeconds"),
+            "verdict": verdict,
+            "handle": handle,
+        }
+
+        # REQUIREMENT 4: Only verdict OK qualifies as ACCEPTED
+        if verdict == "OK":
+            return SubmissionVerdict(
+                state=VerdictState.ACCEPTED,
+                message="Accepted (OK)",
+                submission_id=sub_id,
+                platform="codeforces",
+                problem_id=prob_id,
+                account=handle,
+                timestamp=float(matching_sub.get("creationTimeSeconds", time.time())),
+                correlation_mechanism="codeforces_api_user_status_id",
+                evidence=evidence,
+            )
+        else:
+            return SubmissionVerdict(
+                state=VerdictState.REJECTED,
+                message=f"Codeforces verdict: {verdict}",
+                submission_id=sub_id,
+                platform="codeforces",
+                problem_id=prob_id,
+                account=handle,
+                timestamp=float(matching_sub.get("creationTimeSeconds", time.time())),
+                correlation_mechanism="codeforces_api_user_status_id",
+                evidence=evidence,
+            )
+
+    # Polling exhausted
+    if seen_pending:
+        return SubmissionVerdict(
+            state=VerdictState.PENDING,
+            message="Evaluation timed out on Codeforces (verdict remains TESTING).",
+            submission_id=pending_sub_id,
+            platform="codeforces",
+            problem_id=prob_id,
+            account=handle,
+        )
+
+    if last_error:
+        return SubmissionVerdict(
+            state=VerdictState.ERROR,
+            message=f"Codeforces API error: {last_error}",
+            platform="codeforces",
+            problem_id=prob_id,
+            account=handle,
+        )
+
+    return SubmissionVerdict(
+        state=VerdictState.UNKNOWN,
+        message="No recent matching submission registered on Codeforces for current attempt.",
+        platform="codeforces",
+        problem_id=prob_id,
+        account=handle,
+    )
+
+async def _verify_leetcode(
+    page: Page,
+    url: str,
+    submission_start_time: float,
+    pre_submission_id: Optional[str] = None,
+    account: Optional[str] = None,
+    expected_problem_id: Optional[str] = None,
+    timeout: float = 30.0,
+    initial_interval: float = 1.0,
+) -> SubmissionVerdict:
+    slug = expected_problem_id or extract_problem_id(url, "leetcode")
+    print(f"   ⏳ Verifying LeetCode submission verdict ({slug})...")
+
+    last_error = None
+    seen_pending = False
+
+    async for poll, elapsed in poll_with_backoff(
+        timeout=timeout, initial_interval=initial_interval, max_interval=4.0, backoff_factor=1.4
+    ):
+        try:
+            res = await page.evaluate(r"""() => {
+                // Scope STRICTLY to the submission result container only
+                const selectors = [
+                    '[data-e2e-locator="submission-result"]',
+                    '[data-cypress="SubmissionResult"]',
+                    'div[class*="result-container"]',
+                    'div[class*="result-state"]',
+                    'div[class*="submission-result"]'
+                ];
+                let container = null;
+                for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    if (el) { container = el; break; }
+                }
+                if (!container) return null;
+
+                const text = (container.innerText || '').trim();
+                let subId = null;
+                const link = container.querySelector('a[href*="/submissions/detail/"], a[href*="/submissions/"]') ||
+                             document.querySelector('a[href*="/submissions/detail/"]');
+                if (link && link.href) {
+                    const m = link.href.match(/submissions\/(?:detail\/)?(\d+)/);
+                    if (m) subId = m[1];
+                }
+                if (!subId && container.getAttribute('data-submission-id')) {
+                    subId = container.getAttribute('data-submission-id');
+                }
+
+                return {
+                    text: text,
+                    submissionId: subId
+                };
+            }""")
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+        if not res or not isinstance(res, dict):
+            continue
+
+        text = res.get("text", "")
+        sub_id = res.get("submissionId")
+
+        # Stale check: if sub_id matches pre_submission_id, ignore
+        if sub_id and pre_submission_id and str(sub_id) == str(pre_submission_id):
+            continue
+
+        # Check pending states
+        if any(p in text for p in ["Pending", "Judging", "Compiling", "Evaluating", "In Queue"]):
+            seen_pending = True
+            continue
+
+        # Check verdict
+        if "Accepted" in text:
+            corr_mechanism = "leetcode_dom_submission_detail_link" if sub_id else "leetcode_dom_scoped_result_container"
+            effective_id = str(sub_id) if sub_id else f"leetcode_{slug}_{int(submission_start_time)}"
+            evidence = {
+                "submission_id": effective_id,
+                "problem_slug": slug,
+                "result_snippet": text[:150],
+                "correlation_mechanism": corr_mechanism,
+                "submission_start_time": submission_start_time,
+            }
+            return SubmissionVerdict(
+                state=VerdictState.ACCEPTED,
+                message="Accepted",
+                submission_id=effective_id,
+                platform="leetcode",
+                problem_id=slug,
+                account=account,
+                timestamp=time.time(),
+                correlation_mechanism=corr_mechanism,
+                evidence=evidence,
+            )
+
+        rejected_indicators = ["Wrong Answer", "Time Limit Exceeded", "Runtime Error", "Compile Error", "Memory Limit Exceeded", "Output Limit Exceeded"]
+        for rej in rejected_indicators:
+            if rej in text:
+                return SubmissionVerdict(
+                    state=VerdictState.REJECTED,
+                    message=rej,
+                    submission_id=str(sub_id) if sub_id else None,
+                    platform="leetcode",
+                    problem_id=slug,
+                    account=account,
+                    timestamp=time.time(),
+                    correlation_mechanism="leetcode_dom_scoped_result_container",
+                    evidence={"text": text[:150]},
+                )
+
+    if seen_pending:
+        return SubmissionVerdict(
+            state=VerdictState.PENDING,
+            message="Evaluation timed out on LeetCode (evaluation remains pending).",
+            platform="leetcode",
+            problem_id=slug,
+            account=account,
+        )
+
+    if last_error:
+        return SubmissionVerdict(
+            state=VerdictState.ERROR,
+            message=f"LeetCode DOM inspection error: {last_error}",
+            platform="leetcode",
+            problem_id=slug,
+            account=account,
+        )
+
+    # REQUIREMENT 3: Remove 'Submitted (No negative verdict detected)' fallback
+    return SubmissionVerdict(
+        state=VerdictState.UNKNOWN,
+        message="No submission result container detected on LeetCode within timeout window.",
+        platform="leetcode",
+        problem_id=slug,
+        account=account,
+    )
+
+async def _verify_codechef(
+    page: Page,
+    url: str,
+    submission_start_time: float,
+    pre_submission_id: Optional[str] = None,
+    account: Optional[str] = None,
+    expected_problem_id: Optional[str] = None,
+    timeout: float = 30.0,
+    initial_interval: float = 1.0,
+) -> SubmissionVerdict:
+    prob_code = expected_problem_id or extract_problem_id(url, "codechef")
+    print(f"   ⏳ Checking CodeChef submission result ({prob_code})...")
+
+    last_error = None
+    seen_pending = False
+
+    async for poll, elapsed in poll_with_backoff(
+        timeout=timeout, initial_interval=initial_interval, max_interval=4.0, backoff_factor=1.4
+    ):
+        try:
+            res = await page.evaluate(r"""() => {
+                // Scope STRICTLY to the submission status container only
+                const selectors = [
+                    'div[class*="submission__container"]',
+                    'div[class*="_submission__container_"]',
+                    '#submission-status',
+                    '[data-testid="submission-result"]',
+                    'div[class*="submission-status"]',
+                    'div[class*="Verdict_verdict"]',
+                    '.submission-result',
+                    '.status-label',
+                    'div[class*="verdict_container"]'
+                ];
+                let container = null;
+                for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    if (el) { container = el; break; }
+                }
+                if (!container) return null;
+
+                const text = (container.innerText || '').trim();
+                let subId = null;
+                const link = container.querySelector('a[href*="/viewsolution/"], a[href*="/status/"]') ||
+                             document.querySelector('a[href*="/viewsolution/"]');
+                if (link && link.href) {
+                    const m = link.href.match(/(?:viewsolution|status)\/(\d+)/);
+                    if (m) subId = m[1];
+                }
+                if (!subId) {
+                    const m = text.match(/Submission\s*(?:ID)?\s*#?:?\s*(\d+)/i);
+                    if (m) subId = m[1];
+                }
+
+                return {
+                    text: text,
+                    submissionId: subId
+                };
+            }""")
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+        if not res or not isinstance(res, dict):
+            continue
+
+        text = res.get("text", "")
+        sub_id = res.get("submissionId")
+
+        # Stale check
+        if sub_id and pre_submission_id and str(sub_id) == str(pre_submission_id):
+            continue
+
+        # Pending check
+        if any(p in text for p in ["Running", "Judging", "In Queue", "Compiling", "Evaluating", "Pending"]):
+            seen_pending = True
+            continue
+
+        # Accepted check
+        if any(a in text for a in ["Correct Answer", "100 pts", "100 / 100", "AC", "Accepted"]):
+            corr_mechanism = "codechef_dom_submission_id" if sub_id else "codechef_dom_scoped_status_container"
+            effective_id = str(sub_id) if sub_id else f"codechef_{prob_code}_{int(submission_start_time)}"
+            evidence = {
+                "submission_id": effective_id,
+                "problem_code": prob_code,
+                "result_snippet": text[:150],
+                "correlation_mechanism": corr_mechanism,
+                "submission_start_time": submission_start_time,
+            }
+            return SubmissionVerdict(
+                state=VerdictState.ACCEPTED,
+                message="Accepted",
+                submission_id=effective_id,
+                platform="codechef",
+                problem_id=prob_code,
+                account=account,
+                timestamp=time.time(),
+                correlation_mechanism=corr_mechanism,
+                evidence=evidence,
+            )
+
+        # Rejected check
+        rejected_indicators = ["Wrong Answer", "WA", "Partially Solved", "Compilation Error", "Time Limit Exceeded", "TLE", "Runtime Error", "SIGSEGV"]
+        for rej in rejected_indicators:
+            if rej in text:
+                return SubmissionVerdict(
+                    state=VerdictState.REJECTED,
+                    message=rej,
+                    submission_id=str(sub_id) if sub_id else None,
+                    platform="codechef",
+                    problem_id=prob_code,
+                    account=account,
+                    timestamp=time.time(),
+                    correlation_mechanism="codechef_dom_scoped_status_container",
+                    evidence={"text": text[:150]},
+                )
+
+        # Check viewsolution page if sub_id is present but verdict not directly in problem page container
+        if sub_id and not any(a in text for a in ["Correct Answer", "100 pts", "100 / 100", "AC", "Accepted", "Wrong Answer", "WA"]):
             try:
-                import urllib.request
-                import json
-                api_url = f"https://codeforces.com/api/user.status?handle={CODEFORCES_HANDLE}&from=1&count=5"
-                req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    if resp.status == 200:
-                        cf_data = json.loads(resp.read().decode("utf-8"))
-                        if cf_data.get("status") == "OK" and cf_data.get("result"):
-                            for sub in cf_data["result"]:
-                                p = sub.get("problem", {})
-                                c_id = p.get("contestId")
-                                idx = p.get("index", "").upper()
-                                creation = sub.get("creationTimeSeconds", 0)
+                view_url = f"https://www.codechef.com/viewsolution/{sub_id}"
+                await page.goto(view_url, wait_until="domcontentloaded", timeout=12000)
+                await asyncio.sleep(1.2)
+                v_res = await page.evaluate(r"""() => {
+                    const text = (document.body ? document.body.innerText || '' : '').trim();
+                    const m = text.match(/Status:\s*\n*\s*([^\n]+)/i);
+                    const statusVal = m ? m[1].trim() : '';
+                    const isAccepted = /correct answer|accepted|100\s*pts/i.test(text);
+                    const isRejected = /wrong answer|wa\b|time limit|runtime error|compilation error/i.test(text);
+                    const isPending = /evaluating|running|judging|in queue|compiling|pending/i.test(text) && !isAccepted && !isRejected;
+                    return { status: statusVal, isAccepted: isAccepted, isRejected: isRejected, isPending: isPending };
+                }""")
+                if v_res and isinstance(v_res, dict):
+                    if v_res.get("isPending"):
+                        seen_pending = True
+                        continue
+                    if v_res.get("isAccepted"):
+                        corr_mechanism = "codechef_viewsolution_status"
+                        effective_id = str(sub_id)
+                        evidence = {
+                            "submission_id": effective_id,
+                            "problem_code": prob_code,
+                            "result_snippet": v_res.get("status") or "Correct Answer",
+                            "correlation_mechanism": corr_mechanism,
+                            "submission_start_time": submission_start_time,
+                        }
+                        return SubmissionVerdict(
+                            state=VerdictState.ACCEPTED,
+                            message="Accepted",
+                            submission_id=effective_id,
+                            platform="codechef",
+                            problem_id=prob_code,
+                            account=account,
+                            timestamp=time.time(),
+                            correlation_mechanism=corr_mechanism,
+                            evidence=evidence,
+                        )
+                    if v_res.get("isRejected"):
+                        return SubmissionVerdict(
+                            state=VerdictState.REJECTED,
+                            message=v_res.get("status") or "Rejected",
+                            submission_id=str(sub_id),
+                            platform="codechef",
+                            problem_id=prob_code,
+                            account=account,
+                            timestamp=time.time(),
+                            correlation_mechanism="codechef_viewsolution_status",
+                            evidence={"text": v_res.get("status") or "Rejected"},
+                        )
+            except Exception as e:
+                last_error = str(e)
 
-                                if expected_contest and (c_id != expected_contest or idx != expected_index):
-                                    continue
-                                if now_ts - creation > 300:
-                                    continue
+    if seen_pending:
+        return SubmissionVerdict(
+            state=VerdictState.PENDING,
+            message="Evaluation timed out on CodeChef (submission still evaluating).",
+            platform="codechef",
+            problem_id=prob_code,
+            account=account,
+        )
 
-                                verdict = sub.get("verdict")
-                                print(f"      [Codeforces Poll {poll+1}/25] Match: {c_id}{idx} -> Verdict: {verdict}")
-                                if verdict == "TESTING":
-                                    seen_testing = True
-                                elif verdict and verdict != "TESTING":
-                                    if verdict == "OK":
-                                        return True, "Accepted (OK)"
-                                    else:
-                                        return False, verdict
+    if last_error:
+        return SubmissionVerdict(
+            state=VerdictState.ERROR,
+            message=f"CodeChef DOM inspection error: {last_error}",
+            platform="codechef",
+            problem_id=prob_code,
+            account=account,
+        )
+
+    # REQUIREMENT 5: Remove 'submission sent' success fallback
+    return SubmissionVerdict(
+        state=VerdictState.UNKNOWN,
+        message="No submission status container detected on CodeChef within timeout window.",
+        platform="codechef",
+        problem_id=prob_code,
+        account=account,
+    )
+
+async def _verify_hackerearth(
+    page: Page,
+    url: str,
+    submission_start_time: float,
+    pre_submission_id: Optional[str] = None,
+    account: Optional[str] = None,
+    expected_problem_id: Optional[str] = None,
+    timeout: float = 35.0,
+    initial_interval: float = 1.0,
+) -> SubmissionVerdict:
+    slug = expected_problem_id or extract_problem_id(url, "hackerearth")
+    print(f"   ⏳ Checking HackerEarth submission verdict ({slug})...")
+
+    last_error = None
+    seen_pending = False
+
+    async for poll, elapsed in poll_with_backoff(
+        timeout=timeout, initial_interval=initial_interval, max_interval=4.0, backoff_factor=1.4
+    ):
+        try:
+            res = await page.evaluate(r"""() => {
+                // Scope STRICTLY to the submission result / modal container
+                const selectors = [
+                    'div[id*="-content-results"]',
+                    'div[id*="results"]',
+                    'div[class*="submission-result"]',
+                    '.submission-result',
+                    'div[class*="track-submission"]',
+                    'div[id*="submission-result"]',
+                    'div[class*="result-status"]',
+                    'div[class*="verdict-wrapper"]',
+                    'div.modal-content .verdict',
+                    'div[class*="submission-overview"]',
+                    '.status-description',
+                    '[role="tabpanel"]'
+                ];
+                let container = null;
+                for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    if (el) { container = el; break; }
+                }
+                if (!container) return null;
+
+                const text = (container.innerText || '').trim();
+                let subId = null;
+                const link = container.querySelector('a[href*="/submission/"]') ||
+                             document.querySelector('a[href*="/submission/"]');
+                if (link && link.href) {
+                    const m = link.href.match(/submission\/(?:[a-zA-Z0-9_\-]+\/)?(\d+)/);
+                    if (m) subId = m[1];
+                }
+                if (!subId && container.getAttribute('data-submission-id')) {
+                    subId = container.getAttribute('data-submission-id');
+                }
+
+                return {
+                    text: text,
+                    submissionId: subId
+                };
+            }""")
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+        if (not res or not isinstance(res, dict)) and elapsed > 10.0:
+            try:
+                sub_btn = page.locator("button:has-text('Submissions')").first
+                if await sub_btn.count() > 0 and await sub_btn.is_visible():
+                    await sub_btn.click()
+                    await asyncio.sleep(1.0)
+                    res = await page.evaluate(r"""() => {
+                        const table = document.querySelector('table');
+                        if (!table) return null;
+                        const row = table.querySelector('tbody tr') || table.querySelectorAll('tr')[1];
+                        if (!row) return null;
+                        const rowText = (row.innerText || '').trim();
+                        let subId = null;
+                        const link = row.querySelector('a[href*="/submission/"]');
+                        if (link && link.href) {
+                            const m = link.href.match(/submission\/(?:[a-zA-Z0-9_\-]+\/)?(\d+)/);
+                            if (m) subId = m[1];
+                        }
+                        return { text: rowText, submissionId: subId };
+                    }""")
             except Exception:
                 pass
 
-        if seen_testing:
-            return True, "Accepted (Submission verified in judge queue)"
+        if not res or not isinstance(res, dict):
+            continue
 
-        try:
-            if "/submit" in page.url:
-                page._anti_bot_blocked = True
-        except Exception:
-            pass
-        return False, "No recent matching submission registered on Codeforces (check anti-bot verification)."
+        text = res.get("text", "")
+        sub_id = res.get("submissionId")
 
+        # Stale check
+        if sub_id and pre_submission_id and str(sub_id) == str(pre_submission_id):
+            continue
+
+        # Pending check
+        if any(p in text for p in ["Queued", "Running test cases", "Evaluating", "Compiling", "In Queue"]):
+            seen_pending = True
+            continue
+
+        # Accepted check
+        if any(a in text for a in ["Accepted", "Correct Answer", "Score: 100", "100 / 100", "100/100", "100 pts"]):
+            corr_mechanism = "hackerearth_dom_modal_submission_id" if sub_id else "hackerearth_dom_scoped_modal_container"
+            effective_id = str(sub_id) if sub_id else f"hackerearth_{slug}_{int(submission_start_time)}"
+            evidence = {
+                "submission_id": effective_id,
+                "problem_slug": slug,
+                "result_snippet": text[:150],
+                "correlation_mechanism": corr_mechanism,
+                "submission_start_time": submission_start_time,
+            }
+            return SubmissionVerdict(
+                state=VerdictState.ACCEPTED,
+                message="Accepted",
+                submission_id=effective_id,
+                platform="hackerearth",
+                problem_id=slug,
+                account=account,
+                timestamp=time.time(),
+                correlation_mechanism=corr_mechanism,
+                evidence=evidence,
+            )
+
+        # Rejected check
+        rejected_indicators = ["Wrong Answer", "Compilation Error", "Time Limit Exceeded", "Memory Limit Exceeded", "Runtime Error"]
+        for rej in rejected_indicators:
+            if rej in text:
+                return SubmissionVerdict(
+                    state=VerdictState.REJECTED,
+                    message=rej,
+                    submission_id=str(sub_id) if sub_id else None,
+                    platform="hackerearth",
+                    problem_id=slug,
+                    account=account,
+                    timestamp=time.time(),
+                    correlation_mechanism="hackerearth_dom_scoped_modal_container",
+                    evidence={"text": text[:150]},
+                )
+
+    if seen_pending:
+        return SubmissionVerdict(
+            state=VerdictState.PENDING,
+            message="Evaluation timed out on HackerEarth (evaluation pending).",
+            platform="hackerearth",
+            problem_id=slug,
+            account=account,
+        )
+
+    if last_error:
+        return SubmissionVerdict(
+            state=VerdictState.ERROR,
+            message=f"HackerEarth DOM inspection error: {last_error}",
+            platform="hackerearth",
+            problem_id=slug,
+            account=account,
+        )
+
+    # REQUIREMENT 6: Remove 'evaluation pending' success fallback
+    return SubmissionVerdict(
+        state=VerdictState.UNKNOWN,
+        message="No submission result container detected on HackerEarth within timeout window.",
+        platform="hackerearth",
+        problem_id=slug,
+        account=account,
+    )
+
+async def verify_live_submission_verdict(
+    page: Page,
+    platform_type: str,
+    url: str,
+    submission_start_time: Optional[float] = None,
+    pre_submission_id: Optional[str] = None,
+    account: Optional[str] = None,
+    expected_problem_id: Optional[str] = None,
+    timeout: Optional[float] = None,
+    initial_interval: Optional[float] = None,
+) -> SubmissionVerdict:
+    """Polls the judge / platform API to verify that the submission was genuinely Accepted.
+    
+    Guarantees verdict integrity:
+    1. Returns typed verdict states: ACCEPTED, REJECTED, PENDING, UNKNOWN, ERROR.
+    2. Never returns ACCEPTED merely because no error was observed or evaluation is pending.
+    3. Matches problem ID, account, submission time, and submission ID to reject stale verdicts.
+    4. Scopes DOM extraction strictly to current submission results.
+    5. Implements bounded polling with timeouts and exponential backoff.
+    """
+    start_ts = submission_start_time if submission_start_time is not None else time.time()
+    prob_id = expected_problem_id or extract_problem_id(url, platform_type)
+
+    if platform_type == "hackerrank":
+        return await _verify_hackerrank(
+            page, url, submission_start_time=start_ts, pre_submission_id=pre_submission_id,
+            account=account, expected_problem_id=prob_id,
+            timeout=timeout if timeout is not None else 45.0,
+            initial_interval=initial_interval if initial_interval is not None else 1.5
+        )
+    elif platform_type == "codeforces":
+        return await _verify_codeforces(
+            page, url, submission_start_time=start_ts, pre_submission_id=pre_submission_id,
+            account=account, expected_problem_id=prob_id,
+            timeout=timeout if timeout is not None else 60.0,
+            initial_interval=initial_interval if initial_interval is not None else 1.5
+        )
     elif platform_type == "leetcode":
-        print("   ⏳ Verifying LeetCode submission verdict...")
-        for poll in range(10):
-            await asyncio.sleep(2.5)
-            res = await page.evaluate("""() => {
-                const el = document.querySelector('[data-e2e-locator="submission-result"], .text-green-s, .text-red-s, div[class*="status"]');
-                return el ? el.innerText : '';
-            }""")
-            if "Accepted" in res:
-                return True, "Accepted"
-            elif any(err in res for err in ["Wrong Answer", "Time Limit Exceeded", "Runtime Error", "Compile Error"]):
-                return False, res.strip()
-        return True, "Submitted (No negative verdict detected)."
-
+        return await _verify_leetcode(
+            page, url, submission_start_time=start_ts, pre_submission_id=pre_submission_id,
+            account=account, expected_problem_id=prob_id,
+            timeout=timeout if timeout is not None else 30.0,
+            initial_interval=initial_interval if initial_interval is not None else 1.0
+        )
     elif platform_type == "codechef":
-        print("   ⏳ Checking CodeChef submission result...")
-        for poll in range(10):
-            await asyncio.sleep(2.5)
-            res = await page.evaluate("""() => {
-                const el = document.querySelector('#submission-status, .submission-status, .status-label, div[class*="status"]');
-                return el ? el.innerText : '';
-            }""")
-            if "Correct" in res or "AC" in res or "Accepted" in res:
-                return True, "Accepted"
-            elif any(err in res for err in ["Wrong", "WA", "TLE", "Runtime Error"]):
-                return False, res.strip()
-        return True, "CodeChef submission sent."
-
+        return await _verify_codechef(
+            page, url, submission_start_time=start_ts, pre_submission_id=pre_submission_id,
+            account=account, expected_problem_id=prob_id,
+            timeout=timeout if timeout is not None else 30.0,
+            initial_interval=initial_interval if initial_interval is not None else 1.0
+        )
     elif platform_type == "hackerearth":
-        print("   ⏳ Checking HackerEarth submission verdict...")
-        for poll in range(15):
-            await asyncio.sleep(2.5)
-            verdict = await page.evaluate("""() => {
-                const els = Array.from(document.querySelectorAll("div, span, h2, h3, h4, p, button"))
-                    .map(e => (e.innerText || '').trim())
-                    .filter(t => t.length > 0 && t.length < 100);
-                for (const t of els) {
-                    if (t.includes('Accepted') || t.includes('Correct Answer')) return 'Accepted';
-                    if (t.includes('Wrong Answer')) return 'Wrong Answer';
-                    if (t.includes('Compilation Error')) return 'Compilation Error';
-                    if (t.includes('Time Limit Exceeded')) return 'Time Limit Exceeded';
-                    if (t.includes('Memory Limit Exceeded')) return 'Memory Limit Exceeded';
-                    if (t.includes('Runtime Error')) return 'Runtime Error';
-                }
-                return '';
-            }""")
-            if verdict:
-                print(f"      [HackerEarth Poll {poll+1}/15] Verdict: {verdict}")
-                if verdict == "Accepted":
-                    return True, "Accepted"
-                else:
-                    return False, verdict
-        return True, "HackerEarth submission sent (evaluation pending)."
+        return await _verify_hackerearth(
+            page, url, submission_start_time=start_ts, pre_submission_id=pre_submission_id,
+            account=account, expected_problem_id=prob_id,
+            timeout=timeout if timeout is not None else 35.0,
+            initial_interval=initial_interval if initial_interval is not None else 1.0
+        )
 
-    return True, "Submitted successfully."
+    # Universal fallback: NEVER return ACCEPTED
+    return SubmissionVerdict(
+        state=VerdictState.UNKNOWN,
+        message=f"Unsupported platform type: {platform_type}",
+        platform=platform_type,
+        problem_id=prob_id,
+    )
+
 
 async def verify_codeforces_samples_java(page: Page, code: str) -> Tuple[bool, str]:
     """Compiles Java solution using javac and runs against sample test cases locally."""
     try:
-        inputs = await page.locator(".sample-test .input pre").all_inner_texts()
-        outputs = await page.locator(".sample-test .output pre").all_inner_texts()
-        if not inputs or not outputs:
+        samples = await extract_sample_test_cases_from_page(page, "codeforces")
+        if not samples:
             return True, "No sample test cases found on page."
-
-        match = re.search(r"public\s+class\s+(\w+)", code)
-        class_name = match.group(1) if match else "Main"
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            src_file = Path(tmpdir) / f"{class_name}.java"
-            with open(src_file, "w", encoding="utf-8") as f:
-                f.write(code)
-
-            # Compile with javac
-            comp_proc = subprocess.run(
-                ["javac", str(src_file)],
-                capture_output=True,
-                text=True,
-                timeout=12
-            )
-            if comp_proc.returncode != 0:
-                return False, f"Java compilation error:\n{comp_proc.stderr.strip()}"
-
-            all_passed = True
-            summary = []
-            for i, (inp, expected) in enumerate(zip(inputs, outputs), 1):
-                inp = inp.strip()
-                expected = expected.strip()
-                run_proc = subprocess.run(
-                    ["java", "-cp", tmpdir, class_name],
-                    input=inp,
-                    capture_output=True,
-                    text=True,
-                    timeout=6
-                )
-                actual = run_proc.stdout.strip()
-                if run_proc.returncode != 0:
-                    all_passed = False
-                    summary.append(f"Sample {i}: RUNTIME ERROR (Code {run_proc.returncode})\nStderr: {run_proc.stderr.strip()}")
-                elif actual == expected:
-                    summary.append(f"Sample {i}: PASSED (Output == Expected == '{expected}')")
-                else:
-                    all_passed = False
-                    summary.append(f"Sample {i}: FAILED\nInput:\n{inp}\nExpected:\n{expected}\nActual:\n{actual}")
-
-            return all_passed, "\n".join(summary)
+        all_passed, results, summary = run_all_sample_tests_sandboxed(code, samples, "codeforces")
+        return all_passed, summary
     except Exception as e:
         return True, f"Local test skipped: {e}"
 
@@ -1468,15 +6084,25 @@ def get_safe_java_filename(url: str, platform_name: str) -> str:
     slug = re.sub(r"[^a-zA-Z0-9_\-]", "_", slug)
     return f"{platform_name.lower()}_{slug}.java"
 
-def save_java_solution(filename: str, code: str, url: str, explanation: str, platform_name: str):
-    """Saves Java solution to solutions/ directory with metadata header."""
+def save_java_solution(
+    filename: str,
+    code: str,
+    url: str,
+    explanation: str,
+    platform_name: str,
+    verdict: Optional[SubmissionVerdict] = None
+):
+    """Saves Java solution to solutions/ directory with metadata header including verified verdict and submission ID."""
     file_path = SOLUTIONS_DIR / filename
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    sub_id_line = f" * Submission ID: {verdict.submission_id or verdict.correlation_mechanism}\n" if verdict is not None else ""
+    verdict_line = f" * Verdict: {verdict.state.value}\n" if verdict is not None else ""
     header = f"""/* ==============================================================================
  * Platform: {platform_name}
  * Language: Java
  * URL: {url}
  * Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
- *
+{sub_id_line}{verdict_line} *
  * Approach:
  * {explanation}
  * ==============================================================================
@@ -1487,13 +6113,28 @@ def save_java_solution(filename: str, code: str, url: str, explanation: str, pla
         f.write(header + code + "\n")
     print(f"   💾 Saved Java solution to '{file_path}'")
 
-def commit_solution_to_github(platform_type: str, url: str, code: str, explanation: str, platform_name: str) -> bool:
+def commit_solution_to_github(
+    platform_type: str,
+    url: str,
+    code: str,
+    explanation: str,
+    platform_name: str,
+    verdict: Optional[SubmissionVerdict] = None
+) -> PublishResult:
     """Commits and pushes the solution to the user's dedicated GitHub repository for that platform."""
     if not GITHUB_USERNAME:
-        return False
+        print("   ⚠️  GITHUB_USERNAME is not configured. Skipping GitHub commit.")
+        return PublishResult(success=False, error="GITHUB_USERNAME is not configured")
 
     if platform_type not in PLATFORM_REPO_CONFIG:
-        return False
+        print(f"   ⚠️  Unknown platform_type '{platform_type}'. Skipping GitHub commit.")
+        return PublishResult(success=False, error=f"Unknown platform_type: {platform_type}")
+
+    # Enforce acceptance requirement: never commit as accepted if not confirmed ACCEPTED
+    if verdict is not None and verdict.state != VerdictState.ACCEPTED:
+        err = f"Cannot commit solution with non-accepted verdict: {verdict.state.value}"
+        print(f"   🛑 {err}")
+        return PublishResult(success=False, error=err)
 
     repo_info = PLATFORM_REPO_CONFIG[platform_type]
     repo_name = repo_info["repo_name"]
@@ -1504,10 +6145,36 @@ def commit_solution_to_github(platform_type: str, url: str, code: str, explanati
         REPOS_DIR.mkdir(parents=True, exist_ok=True)
         try:
             print(f"   📦 Cloning https://github.com/{GITHUB_USERNAME}/{repo_name}...")
-            subprocess.run(["gh", "repo", "clone", f"{GITHUB_USERNAME}/{repo_name}", str(repo_dir)], check=True, capture_output=True)
+            clone_res = subprocess.run(
+                ["gh", "repo", "clone", f"{GITHUB_USERNAME}/{repo_name}", str(repo_dir)],
+                capture_output=True,
+                text=True
+            )
+            if clone_res.returncode != 0:
+                err = clone_res.stderr.strip() or clone_res.stdout.strip() or "gh repo clone failed"
+                print(f"   ⚠️  Could not clone repo {repo_name}: {err}")
+                return PublishResult(success=False, error=f"Clone failed: {err}", repo_name=repo_name)
         except Exception as e:
             print(f"   ⚠️  Could not clone repo {repo_name}: {e}")
-            return False
+            return PublishResult(success=False, error=f"Clone failed: {e}", repo_name=repo_name)
+
+    branch = get_repo_default_branch(repo_dir)
+
+    # Pull latest changes before modifying working tree; stop immediately on failure (Failed pull -> no commit)
+    try:
+        pull_res = subprocess.run(
+            ["git", "pull", "--rebase", "origin", branch],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True
+        )
+        if pull_res.returncode != 0:
+            err = pull_res.stderr.strip() or pull_res.stdout.strip() or "git pull --rebase failed"
+            print(f"   ⚠️  Git pull --rebase failed on branch '{branch}': {err}")
+            return PublishResult(success=False, error=f"Pull failed: {err}", repo_name=repo_name, branch=branch)
+    except Exception as e:
+        print(f"   ⚠️  Git pull exception: {e}")
+        return PublishResult(success=False, error=f"Pull failed: {e}", repo_name=repo_name, branch=branch)
 
     # Extract clean slug
     clean_url = url.rstrip("/")
@@ -1526,15 +6193,18 @@ def commit_solution_to_github(platform_type: str, url: str, code: str, explanati
 
     # Write Java source file
     src_filename = repo_info["class_filename"]
-    (prob_dir / src_filename).write_text(code, encoding="utf-8")
+    src_path = prob_dir / src_filename
+    src_path.write_text(code, encoding="utf-8")
 
-    # Write README.md
+    # Write README.md with verifiable submission evidence
     readme_path = prob_dir / "README.md"
+    sub_id_text = f"\nSubmission ID: `{verdict.submission_id or verdict.correlation_mechanism}`" if verdict is not None else ""
+    verdict_display = "Accepted" if (verdict is not None and verdict.state == VerdictState.ACCEPTED) else (verdict.state.value if verdict is not None else "Unverified")
     readme_content = f"""# {clean_slug}
 
 [Original practice problem]({url})
 
-Date: {today_str} (Asia/Kolkata). Status: **Accepted**. Platform: **{platform_name}**.
+Date: {today_str} (Asia/Kolkata). Status: **{verdict_display}**. Platform: **{platform_name}**.{sub_id_text}
 
 ## Approach
 
@@ -1546,38 +6216,470 @@ Solution generated in Java and verified on {platform_name} by autonomous AI bot.
 """
     readme_path.write_text(readme_content, encoding="utf-8")
 
-    # Git pull --rebase, add, commit, push
+    # Stage ONLY the solution and generated documentation (NEVER git add .)
     try:
-        subprocess.run(["git", "pull", "--rebase", "origin", "main"], cwd=repo_dir, capture_output=True)
-        subprocess.run(["git", "add", "."], cwd=repo_dir, check=True)
+        rel_src = src_path.relative_to(repo_dir)
+        rel_readme = readme_path.relative_to(repo_dir)
 
-        status = subprocess.run(["git", "status", "--porcelain"], cwd=repo_dir, capture_output=True, text=True).stdout.strip()
-        if not status:
-            print(f"   ℹ️  GitHub repo '{repo_name}' already up-to-date.")
-            return True
+        add_res = subprocess.run(
+            ["git", "add", str(rel_src), str(rel_readme)],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True
+        )
+        if add_res.returncode != 0:
+            err = add_res.stderr.strip() or add_res.stdout.strip() or "git add failed"
+            print(f"   ⚠️  Git add failed: {err}")
+            return PublishResult(success=False, error=f"Stage failed: {err}", repo_name=repo_name, branch=branch)
 
-        commit_msg = f"Add verified Java solution for {clean_slug} [{platform_name}]"
-        subprocess.run(["git", "commit", "-m", commit_msg], cwd=repo_dir, check=True, capture_output=True)
-        push_res = subprocess.run(["git", "push", "origin", "main"], cwd=repo_dir, capture_output=True, text=True)
+        status_res = subprocess.run(
+            ["git", "status", "--porcelain", str(rel_src), str(rel_readme)],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True
+        )
 
-        if push_res.returncode == 0:
-            print(f"   🐙 GitHub Commit & Push successful: {GITHUB_USERNAME}/{repo_name} ({clean_slug})!")
-            return True
+        # Commit only if there are changes; stop immediately on failure (Failed commit -> no push)
+        if status_res.stdout.strip():
+            commit_msg = f"Add verified Java solution for {clean_slug} [{platform_name}]"
+            commit_res = subprocess.run(
+                ["git", "commit", "-m", commit_msg],
+                cwd=repo_dir,
+                capture_output=True,
+                text=True
+            )
+            if commit_res.returncode != 0:
+                err = commit_res.stderr.strip() or commit_res.stdout.strip() or "git commit failed"
+                print(f"   ⚠️  Git commit failed: {err}")
+                return PublishResult(success=False, error=f"Commit failed: {err}", repo_name=repo_name, branch=branch)
         else:
-            print(f"   ⚠️  Git push notice: {push_res.stderr.strip() or push_res.stdout.strip()}")
-            return False
+            print(f"   ℹ️  GitHub repo '{repo_name}' already has solution staged/committed for {clean_slug}.")
+
+        # Push to remote default branch to confirm remote is in sync
+        push_res = subprocess.run(
+            ["git", "push", "origin", branch],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True
+        )
+        if push_res.returncode == 0:
+            commit_hash = None
+            rev_res = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo_dir, capture_output=True, text=True)
+            if rev_res.returncode == 0:
+                commit_hash = rev_res.stdout.strip()
+            print(f"   🐙 GitHub Commit & Push successful: {GITHUB_USERNAME}/{repo_name} ({clean_slug}) [{branch}]!")
+            return PublishResult(success=True, repo_name=repo_name, branch=branch, commit_hash=commit_hash)
+        else:
+            err = push_res.stderr.strip() or push_res.stdout.strip() or "git push failed"
+            print(f"   ⚠️  Git push notice: {err}")
+            return PublishResult(success=False, error=f"Push failed: {err}", repo_name=repo_name, branch=branch)
     except Exception as e:
         print(f"   ⚠️  Git operation notice: {e}")
+        return PublishResult(success=False, error=f"Git operation failed: {e}", repo_name=repo_name, branch=branch)
+
+# ==============================================================================
+# Platform Adapters Architecture
+# ==============================================================================
+class BasePlatformAdapter(ABC):
+    platform_type: str = "generic"
+    platform_name: str = "Generic"
+    domains: List[str] = []
+    question_selectors: List[str] = []
+    run_selectors: Optional[List[str]] = None
+    submit_selectors: Optional[List[str]] = None
+
+    def __init__(self):
+        self.rate_limiter = get_rate_limiter(self.platform_type)
+
+    @abstractmethod
+    async def discover(self, page: Page, count: int = 15, difficulty: str = "medium-hard", offset: int = 0) -> List[str]:
+        pass
+
+    @abstractmethod
+    async def check_auth_state(self, page: Page) -> AuthStateResult:
+        pass
+
+    async def validate_url_and_platform(self, page: Page, expected_url: str) -> Tuple[bool, Optional[str]]:
+        if not page:
+            return False, "Page instance is null"
+        curr_url = ""
+        try:
+            curr_url = page.url or ""
+        except Exception:
+            pass
+        if not curr_url or curr_url.startswith("about:blank"):
+            return True, None
+
+        if self.domains and not any(d in curr_url for d in self.domains):
+            return False, f"Wrong platform domain: current URL '{curr_url}' does not match expected {self.domains}"
+
+        if any(r in curr_url.lower() for r in ["/login", "/enter", "/auth", "/accounts/login", "/checkpoint"]):
+            return False, f"Redirected to login/auth barrier: {curr_url}"
+
+        if any(r in curr_url.lower() for r in ["/404", "/page-not-found", "/error"]):
+            return False, f"Target problem returned 404 or page error: {curr_url}"
+
+        return True, None
+
+    async def detect_security_challenge(self, page: Page) -> SecurityChallengeDetection:
+        return await detect_security_challenge_or_captcha(page)
+
+    async def is_live_or_rated_contest(self, page: Page, url: str) -> Tuple[bool, Optional[str]]:
+        return await check_live_or_rated_contest(page, url, self.platform_type)
+
+    async def set_language(self, page: Page) -> bool:
+        await switch_editor_to_java(page, self.platform_type)
+        return True
+
+    async def extract(self, page: Page, url: str) -> ProblemExtractionResult:
+        text = await extract_problem_text(page, self.question_selectors)
+        starter = await extract_editor_code(page)
+        samples = await extract_sample_test_cases_from_page(page, self.platform_type)
+        if not samples and text:
+            samples = extract_sample_test_cases_from_text(text)
+        success = bool(text and len(text) > 80)
+        return ProblemExtractionResult(
+            success=success,
+            problem_text=text,
+            starter_code=starter,
+            samples=samples,
+            error=None if success else "Failed to extract problem description"
+        )
+
+    async def inject(self, page: Page, solution_code: str) -> InjectionResult:
+        return await inject_code_into_editor(page, solution_code)
+
+    async def submit(self, page: Page, url: str, solution_code: str, snapshot: Optional[Dict[str, Any]] = None) -> bool:
+        if not self.submit_selectors:
+            return False
+        for selector in self.submit_selectors:
+            try:
+                btn = page.locator(selector).first
+                if await btn.count() > 0 and await btn.is_visible():
+                    await btn.click()
+                    print(f"   🚀 Clicked submit button ({selector})")
+                    return True
+            except Exception:
+                continue
         return False
+
+    async def verify(
+        self,
+        page: Page,
+        url: str,
+        submission_start_time: Optional[float] = None,
+        pre_submission_id: Optional[str] = None,
+        account: Optional[str] = None,
+        expected_problem_id: Optional[str] = None
+    ) -> SubmissionVerdict:
+        return await verify_live_submission_verdict(
+            page,
+            self.platform_type,
+            url,
+            submission_start_time=submission_start_time,
+            pre_submission_id=pre_submission_id,
+            account=account,
+            expected_problem_id=expected_problem_id
+        )
+
+
+class LeetCodeAdapter(BasePlatformAdapter):
+    platform_type = "leetcode"
+    platform_name = "LeetCode"
+    domains = ["leetcode.com"]
+    question_selectors = [
+        "div[data-track-load='description_content']",
+        "div.elfjS",
+        "[data-key='description-content']",
+        "div.content__uRIT",
+        "[data-layout-path*='description']",
+        "div[class*='description']",
+        ".question-content",
+    ]
+    run_selectors = [
+        "button[data-e2e-locator='console-run-button']",
+        "button:has-text('Run')",
+        "[data-cypress='RunCode']",
+    ]
+    submit_selectors = [
+        "button[data-e2e-locator='console-submit-button']",
+        "button:has-text('Submit')",
+        "[data-cypress='SubmitCode']",
+    ]
+
+    async def discover(self, page: Page, count: int = 15, difficulty: str = "medium-hard", offset: int = 0) -> List[str]:
+        return await discover_leetcode_candidates(page, count=count, difficulty=difficulty, offset=offset)
+
+    async def check_auth_state(self, page: Page) -> AuthStateResult:
+        js = """() => {
+            const hasLogin = !!document.querySelector('a[href*="/accounts/login"]') ||
+                             Array.from(document.querySelectorAll('a, button')).some(el => (el.innerText || '').trim().toLowerCase() === 'sign in');
+            const hasAuth = !!document.querySelector('[data-cypress="UserAvatar"], #navbar_user_avatar, .avatar, a[href*="/profile/"]');
+            if (hasAuth) return 'LOGGED_IN';
+            if (hasLogin) return 'LOGGED_OUT';
+            return 'UNKNOWN';
+        }"""
+        try:
+            st = await page.evaluate(js)
+            if st == "LOGGED_OUT":
+                return AuthStateResult(state=AuthState.LOGGED_OUT, details="LeetCode login link detected", requires_human=True)
+            if st == "LOGGED_IN":
+                return AuthStateResult(state=AuthState.LOGGED_IN)
+        except Exception:
+            pass
+        return AuthStateResult(state=AuthState.UNKNOWN)
+
+
+class CodeforcesAdapter(BasePlatformAdapter):
+    platform_type = "codeforces"
+    platform_name = "Codeforces"
+    domains = ["codeforces.com"]
+    question_selectors = [
+        ".problem-statement",
+        "#pageContent",
+    ]
+    run_selectors = None
+    submit_selectors = [
+        "form.submit-form input.submit",
+        "input.submit",
+        "button:has-text('Submit')",
+    ]
+
+    async def discover(self, page: Page, count: int = 15, difficulty: str = "medium-hard", offset: int = 0) -> List[str]:
+        return await discover_codeforces_candidates(page, count=count, difficulty=difficulty, offset=offset)
+
+    async def check_auth_state(self, page: Page) -> AuthStateResult:
+        js = """() => {
+            const hasAuth = !!document.querySelector('a[href*="/logout"], a[href*="/profile/"]');
+            const hasLogin = !!document.querySelector('a[href*="/enter"], a[href*="/register"]');
+            if (hasAuth) return 'LOGGED_IN';
+            if (hasLogin) return 'LOGGED_OUT';
+            return 'UNKNOWN';
+        }"""
+        try:
+            st = await page.evaluate(js)
+            if st == "LOGGED_OUT":
+                return AuthStateResult(state=AuthState.LOGGED_OUT, details="Codeforces /enter link detected", requires_human=True)
+            if st == "LOGGED_IN":
+                return AuthStateResult(state=AuthState.LOGGED_IN, username=CODEFORCES_HANDLE)
+        except Exception:
+            pass
+        return AuthStateResult(state=AuthState.UNKNOWN)
+
+    async def submit(self, page: Page, url: str, solution_code: str, snapshot: Optional[Dict[str, Any]] = None) -> bool:
+        clean_url = url.rstrip("/")
+        parts = clean_url.split("/")
+        prob_code = f"{parts[-2]}{parts[-1]}"
+        try:
+            await page.goto("https://codeforces.com/problemset/submit", wait_until="domcontentloaded", timeout=25000)
+            await asyncio.sleep(1)
+            await page.locator('input[name="submittedProblemCode"]').fill(prob_code)
+            sel = page.locator('select[name="programTypeId"]').first
+            if await sel.count() > 0:
+                options = await sel.locator("option").all()
+                for opt in options:
+                    txt = await opt.inner_text()
+                    if "Java 21" in txt or "Java 17" in txt:
+                        val = await opt.get_attribute("value")
+                        await sel.select_option(val)
+                        break
+            await page.locator('textarea#sourceCodeTextarea, textarea[name="source"]').fill(solution_code)
+            await page.locator('input.submit').click()
+            print("   🚀 Clicked Codeforces submit button!")
+            return True
+        except Exception as e:
+            print(f"   ⚠️ Codeforces submit error: {e}")
+            return False
+
+
+class HackerRankAdapter(BasePlatformAdapter):
+    platform_type = "hackerrank"
+    platform_name = "HackerRank"
+    domains = ["hackerrank.com"]
+    question_selectors = [
+        ".challenge-body-html",
+        ".problem-statement",
+        ".challenge_problem_statement",
+        ".challenge-body",
+        ".problem-statement-limits",
+    ]
+    run_selectors = [
+        "button.hr-monaco-compile",
+        "button:has-text('Run Code')",
+        "button[data-analytics='CompileAndTest']",
+    ]
+    submit_selectors = [
+        "button.hr-monaco-submit",
+        "button:has-text('Submit Code')",
+        "button[data-analytics='SubmitCode']",
+    ]
+
+    async def discover(self, page: Page, count: int = 15, difficulty: str = "medium-hard", offset: int = 0) -> List[str]:
+        return await discover_hackerrank_candidates(page, count=count, difficulty=difficulty, offset=offset)
+
+    async def check_auth_state(self, page: Page) -> AuthStateResult:
+        js = """() => {
+            const hasAuth = !!document.querySelector('.avatar, [data-analytics="NavBarProfileAvatar"], a[href*="/profile/"], [data-analytics="NavBarProfile"], .profile-icon') ||
+                            (document.body && document.body.innerText.includes('Rank:'));
+            const hasLogin = !!document.querySelector('a[href*="/auth/login"], a[href*="/login"]') && !hasAuth;
+            if (hasAuth) return 'LOGGED_IN';
+            if (hasLogin) return 'LOGGED_OUT';
+            return 'UNKNOWN';
+        }"""
+        try:
+            st = await page.evaluate(js)
+            if st == "LOGGED_OUT":
+                return AuthStateResult(state=AuthState.LOGGED_OUT, details="HackerRank login link detected", requires_human=True)
+            if st == "LOGGED_IN":
+                return AuthStateResult(state=AuthState.LOGGED_IN)
+        except Exception:
+            pass
+        return AuthStateResult(state=AuthState.UNKNOWN)
+
+
+class CodeChefAdapter(BasePlatformAdapter):
+    platform_type = "codechef"
+    platform_name = "CodeChef"
+    domains = ["codechef.com"]
+    question_selectors = [
+        "#problem-statement",
+        "._problem_statement_container_",
+        "div[class*='problem-statement']",
+        "div[class*='ProblemStatement']",
+        "div[id*='problem-statement']",
+        ".problem-statement",
+        "div._content_container_",
+    ]
+    run_selectors = [
+        "button:has-text('Run')",
+        "button:has-text('Run Code')",
+        "button[id*='run']",
+        "button[data-testid*='run']",
+    ]
+    submit_selectors = [
+        "button:has-text('Submit')",
+        "button:has-text('Submit Code')",
+        "button[id*='submit']",
+        "button[data-testid*='submit']",
+    ]
+
+    async def discover(self, page: Page, count: int = 15, difficulty: str = "medium-hard", offset: int = 0) -> List[str]:
+        return await discover_codechef_candidates(page, count=count, difficulty=difficulty, offset=offset)
+
+    async def check_auth_state(self, page: Page) -> AuthStateResult:
+        js = """() => {
+            const hasAuth = !!document.querySelector('a[href*="/logout"], .user-details, .profile-image, a[href*="/users/"], [class*="user-menu"], [class*="profile-menu"]') ||
+                            Array.from(document.querySelectorAll('a')).some(a => (a.innerText || '').trim() === 'My Profile');
+            const hasLogin = !!document.querySelector('a[href*="/login"]') && !hasAuth;
+            if (hasAuth) return 'LOGGED_IN';
+            if (hasLogin) return 'LOGGED_OUT';
+            return 'UNKNOWN';
+        }"""
+        try:
+            st = await page.evaluate(js)
+            if st == "LOGGED_OUT":
+                return AuthStateResult(state=AuthState.LOGGED_OUT, details="CodeChef login link detected", requires_human=True)
+            if st == "LOGGED_IN":
+                return AuthStateResult(state=AuthState.LOGGED_IN)
+        except Exception:
+            pass
+        return AuthStateResult(state=AuthState.UNKNOWN)
+
+
+class HackerEarthAdapter(BasePlatformAdapter):
+    platform_type = "hackerearth"
+    platform_name = "HackerEarth"
+    domains = ["hackerearth.com"]
+    question_selectors = [
+        ".problem-description",
+        ".problem-details",
+        ".statement",
+        "div[class*='problem-description']",
+        "div[class*='problem-statement']",
+        "[data-slot='card']",
+        "div.flex-1.overflow-y-auto",
+        "[role='tabpanel']",
+        "div[class*='overflow-y-auto']",
+    ]
+    run_selectors = [
+        "button:has-text('Compile & Test')",
+        "button:has-text('Run')",
+        ".compile-test-button",
+    ]
+    submit_selectors = [
+        "button:has-text('Submit')",
+        "button:has-text('Submit Code')",
+        ".submit-button",
+    ]
+
+    async def discover(self, page: Page, count: int = 15, difficulty: str = "medium-hard", offset: int = 0) -> List[str]:
+        return await discover_hackerearth_candidates(page, count=count, difficulty=difficulty, offset=offset)
+
+    async def check_auth_state(self, page: Page) -> AuthStateResult:
+        js = """() => {
+            const hasAuth = !!document.querySelector('a[href*="/logout"], .user-avatar, img[alt*="profile"], a[href*="/@"], .user-profile, .profile-avatar, a[href*="/users/"]') ||
+                            Array.from(document.querySelectorAll('a')).some(a => (a.innerText || '').trim() === 'Profile' && (a.href || '').includes('@'));
+            const hasLogin = !!document.querySelector('a[href*="/login"]') && !hasAuth;
+            if (hasAuth) return 'LOGGED_IN';
+            if (hasLogin) return 'LOGGED_OUT';
+            return 'UNKNOWN';
+        }"""
+        try:
+            st = await page.evaluate(js)
+            if st == "LOGGED_OUT":
+                return AuthStateResult(state=AuthState.LOGGED_OUT, details="HackerEarth login link detected", requires_human=True)
+            if st == "LOGGED_IN":
+                return AuthStateResult(state=AuthState.LOGGED_IN)
+        except Exception:
+            pass
+        return AuthStateResult(state=AuthState.UNKNOWN)
+
+
+class GenericPlatformAdapter(BasePlatformAdapter):
+    platform_type = "generic"
+    platform_name = "Generic"
+    domains = []
+    question_selectors = ["article", "main", "#content", ".problem-statement"]
+
+    async def discover(self, page: Page, count: int = 15, difficulty: str = "medium-hard", offset: int = 0) -> List[str]:
+        return []
+
+    async def check_auth_state(self, page: Page) -> AuthStateResult:
+        return AuthStateResult(state=AuthState.UNKNOWN)
+
+
+_ADAPTER_INSTANCES: List[BasePlatformAdapter] = [
+    LeetCodeAdapter(),
+    CodeforcesAdapter(),
+    HackerRankAdapter(),
+    CodeChefAdapter(),
+    HackerEarthAdapter(),
+]
+_GENERIC_ADAPTER = GenericPlatformAdapter()
+
+def get_platform_adapter(platform_or_url: str) -> BasePlatformAdapter:
+    p = (platform_or_url or "").lower().strip()
+    for adapter in _ADAPTER_INSTANCES:
+        if p == adapter.platform_type or any(d in p for d in adapter.domains):
+            return adapter
+    return _GENERIC_ADAPTER
 
 # ==============================================================================
 # Problem Solver Pipeline (Fully Automated, Java)
 # ==============================================================================
 async def process_problem(
-    page: Page,
+    page: Optional[Page],
     url: str,
-    mode: str = "run"
-) -> bool:
+    mode: str = "run",
+    retry_publish: bool = False,
+    cached_verdict: Optional[SubmissionVerdict] = None,
+    cached_code: Optional[str] = None,
+    cached_explanation: Optional[str] = None,
+    max_repairs: int = 3,
+    java_version: Optional[str] = None,
+    dry_run: bool = False,
+    offline_mode: bool = False,
+) -> ProcessResult:
     """Processes a single coding problem URL end-to-end in Java with zero human input."""
     print(f"\n{'='*70}")
     print(f"🚀 Processing: {url}")
@@ -1591,34 +6693,333 @@ async def process_problem(
 
     if not config:
         print(f"❌ Unsupported platform domain for URL: {url}")
-        return False
+        return ProcessResult(stage=ProcessStage.GENERATED, success=False, url=url, error="Unsupported platform domain")
 
     platform_name = config["name"]
     platform_type = config["type"]
+    prob_id = extract_problem_id(url, platform_type)
 
-    # 1. Navigate to problem page
-    print(f"[1/6] Navigating to {platform_name}...")
+    is_offline = offline_mode or OFFLINE_MODE or (page is None)
+    is_dry = dry_run or DRY_RUN
+
+    # Fast-path for offline or dry-run execution
+    if is_offline or is_dry:
+        print(f"[1/7] Processing problem in {'dry-run' if is_dry else 'offline'} mode (no browser required)...")
+        off_info = get_offline_problem_info(url, platform_type)
+        problem_text = off_info.get("description", f"Problem {prob_id} on {platform_name}")
+        starter_code = off_info.get("starter_code", "")
+        samples = [
+            SampleTestCase(input_text=s["input"], expected_output=s["expected"], sample_index=i + 1)
+            for i, s in enumerate(off_info.get("samples", []))
+        ]
+
+        print(f"[4/7] Verifying and repairing Java solution locally (max {max_repairs} repairs)...")
+        pipeline_res = verify_and_repair_java_pipeline(
+            problem_text=problem_text,
+            starter_code=starter_code,
+            samples=samples,
+            platform_name=platform_name,
+            platform_type=platform_type,
+            max_repairs=max_repairs,
+            java_version=java_version,
+            dry_run=is_dry,
+        )
+        solution_code = pipeline_res.solution_code
+        explanation = pipeline_res.explanation
+        filename = get_safe_java_filename(url, platform_name)
+
+        if not pipeline_res.success:
+            print(f"❌ Failed verification pipeline for {url} ({pipeline_res.failure_reason}). Skipping.")
+            return ProcessResult(
+                stage=ProcessStage.GENERATED,
+                success=False,
+                url=url,
+                platform=platform_type,
+                problem_id=prob_id,
+                solution_code=solution_code,
+                explanation=explanation,
+                error=pipeline_res.failure_reason,
+                sample_results=pipeline_res.sample_results,
+                published=False
+            )
+
+        if mode == "save":
+            save_java_solution(filename, solution_code, url, explanation, platform_name, verdict=None)
+            return ProcessResult(
+                stage=ProcessStage.COMPILED,
+                success=True,
+                url=url,
+                platform=platform_type,
+                problem_id=prob_id,
+                solution_code=solution_code,
+                explanation=explanation,
+                saved_path=str(SOLUTIONS_DIR / filename),
+                sample_results=pipeline_res.sample_results,
+                published=False
+            )
+
+        if mode == "run":
+            return ProcessResult(
+                stage=ProcessStage.TESTED,
+                success=True,
+                url=url,
+                platform=platform_type,
+                problem_id=prob_id,
+                solution_code=solution_code,
+                explanation=explanation,
+                sample_results=pipeline_res.sample_results,
+                published=False
+            )
+
+        # Mode submit or both
+        if is_dry:
+            sim_id = f"dryrun_{prob_id}_{int(time.time())}"
+            verdict = SubmissionVerdict(
+                state=VerdictState.ACCEPTED,
+                message="Accepted (Simulated Dry Run)",
+                submission_id=sim_id,
+                platform=platform_type,
+                problem_id=prob_id,
+                account="dry_run_user",
+                timestamp=time.time(),
+                correlation_mechanism="simulated_dry_run_harness",
+                evidence={"dry_run": True, "submission_id": sim_id}
+            )
+            save_java_solution(filename, solution_code, url, explanation, platform_name, verdict=verdict)
+            pub_res = commit_solution_to_github(
+                platform_type=platform_type,
+                url=url,
+                code=solution_code,
+                explanation=explanation,
+                platform_name=platform_name,
+                verdict=verdict
+            )
+            if not pub_res.success:
+                return ProcessResult(
+                    stage=ProcessStage.PUBLISH_FAILED,
+                    success=False,
+                    url=url,
+                    platform=platform_type,
+                    problem_id=prob_id,
+                    solution_code=solution_code,
+                    explanation=explanation,
+                    verdict=verdict,
+                    saved_path=str(SOLUTIONS_DIR / filename),
+                    published=False,
+                    error=f"Publish failed: {pub_res.error}",
+                    publish_error=pub_res.error,
+                    sample_results=pipeline_res.sample_results
+                )
+            return ProcessResult(
+                stage=ProcessStage.PUBLISHED,
+                success=True,
+                url=url,
+                platform=platform_type,
+                problem_id=prob_id,
+                solution_code=solution_code,
+                explanation=explanation,
+                verdict=verdict,
+                saved_path=str(SOLUTIONS_DIR / filename),
+                published=True,
+                repo_name=pub_res.repo_name,
+                repo_branch=pub_res.branch,
+                commit_hash=pub_res.commit_hash,
+                sample_results=pipeline_res.sample_results
+            )
+        else:
+            save_java_solution(filename, solution_code, url, explanation, platform_name, verdict=None)
+            return ProcessResult(
+                stage=ProcessStage.TESTED,
+                success=True,
+                url=url,
+                platform=platform_type,
+                problem_id=prob_id,
+                solution_code=solution_code,
+                explanation=explanation,
+                saved_path=str(SOLUTIONS_DIR / filename),
+                sample_results=pipeline_res.sample_results,
+                published=False
+            )
+
+    # Fast-path for retrying publishing on already accepted solution without resubmitting
+    if retry_publish:
+        print(f"\n🔄 Retrying publishing for {url} without re-submitting to judge...")
+        if not cached_verdict or cached_verdict.state != VerdictState.ACCEPTED or not cached_code:
+            return ProcessResult(
+                stage=ProcessStage.PUBLISH_FAILED,
+                success=False,
+                url=url,
+                platform=platform_type,
+                problem_id=prob_id,
+                solution_code=cached_code,
+                explanation=cached_explanation,
+                verdict=cached_verdict,
+                error="Cannot retry publish without accepted verdict and solution code",
+                publish_error="Missing accepted verdict or code for publish retry",
+                published=False
+            )
+        filename = get_safe_java_filename(url, platform_name)
+        save_java_solution(filename, cached_code, url, cached_explanation or "", platform_name, verdict=cached_verdict)
+        pub_res = commit_solution_to_github(
+            platform_type=platform_type,
+            url=url,
+            code=cached_code,
+            explanation=cached_explanation or "",
+            platform_name=platform_name,
+            verdict=cached_verdict
+        )
+        if pub_res.success:
+            print(f"✅ Retry publish succeeded for {url}!\n")
+            return ProcessResult(
+                stage=ProcessStage.PUBLISHED,
+                success=True,
+                url=url,
+                platform=platform_type,
+                problem_id=prob_id,
+                solution_code=cached_code,
+                explanation=cached_explanation,
+                verdict=cached_verdict,
+                saved_path=str(SOLUTIONS_DIR / filename),
+                published=True,
+                repo_name=pub_res.repo_name,
+                repo_branch=pub_res.branch,
+                commit_hash=pub_res.commit_hash
+            )
+        else:
+            return ProcessResult(
+                stage=ProcessStage.PUBLISH_FAILED,
+                success=False,
+                url=url,
+                platform=platform_type,
+                problem_id=prob_id,
+                solution_code=cached_code,
+                explanation=cached_explanation,
+                verdict=cached_verdict,
+                saved_path=str(SOLUTIONS_DIR / filename),
+                publish_error=pub_res.error,
+                error=f"Publish retry failed: {pub_res.error}",
+                published=False,
+                repo_name=pub_res.repo_name,
+                repo_branch=pub_res.branch,
+                commit_hash=pub_res.commit_hash
+            )
+
+    # 1. Check rate limiter before interacting
+    adapter = get_platform_adapter(platform_type)
+    ok, rate_err = await adapter.rate_limiter.acquire()
+    if not ok:
+        print(f"🛑 Rate limiter active on {platform_name}: {rate_err}")
+        return ProcessResult(
+            stage=ProcessStage.GENERATED,
+            success=False,
+            url=url,
+            platform=platform_type,
+            problem_id=prob_id,
+            error=redact_sensitive_data(rate_err),
+            published=False
+        )
+
+    # 2. Check if problem URL is in an active or live/rated contest
+    is_contest, contest_reason = await adapter.is_live_or_rated_contest(page, url)
+    if is_contest:
+        print(f"🛑 Refusing submission into active/rated contest: {contest_reason}")
+        return ProcessResult(
+            stage=ProcessStage.GENERATED,
+            success=False,
+            url=url,
+            platform=platform_type,
+            problem_id=prob_id,
+            error=redact_sensitive_data(f"Refusing submission into active/rated contest: {contest_reason}"),
+            published=False
+        )
+
+    # 3. Navigate to problem page
+    print(f"[1/7] Navigating to {platform_name}...")
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-        await asyncio.sleep(4)
+        await asyncio.sleep(2)
     except Exception as e:
+        adapter.rate_limiter.record_failure(is_rate_limit=False)
         print(f"❌ Failed to load {url}: {e}")
-        return False
+        return ProcessResult(
+            stage=ProcessStage.GENERATED,
+            success=False,
+            url=url,
+            platform=platform_type,
+            problem_id=prob_id,
+            error=redact_sensitive_data(f"Failed to load {url}: {e}"),
+            published=False
+        )
 
-    # 2. Automatically ensure editor language is set to Java
-    print("[2/6] Ensuring editor language is set to Java...")
+    # 4. Check for security challenges / CAPTCHA on the loaded page
+    sec_check = await adapter.detect_security_challenge(page)
+    if sec_check.detected:
+        page._anti_bot_blocked = True
+        adapter.rate_limiter.record_failure(is_rate_limit=False)
+        print(f"\n🛡️  [{platform_name}] Security challenge detected: {sec_check.challenge_type} ({sec_check.details})")
+        print("👉 Automation paused for human action. Please complete the verification in your open Chrome browser window.")
+        return ProcessResult(
+            stage=ProcessStage.GENERATED,
+            success=False,
+            url=url,
+            platform=platform_type,
+            problem_id=prob_id,
+            error=redact_sensitive_data(f"Security challenge detected: {sec_check.challenge_type}"),
+            published=False
+        )
+
+    # 5. Validate exact current URL and expected platform
+    valid_url, val_err = await adapter.validate_url_and_platform(page, url)
+    if not valid_url:
+        print(f"❌ URL validation failed: {val_err}")
+        return ProcessResult(
+            stage=ProcessStage.GENERATED,
+            success=False,
+            url=url,
+            platform=platform_type,
+            problem_id=prob_id,
+            error=redact_sensitive_data(val_err),
+            published=False
+        )
+
+    # 6. Check authentication state
+    auth_state = await adapter.check_auth_state(page)
+    if auth_state.state in [AuthState.LOGGED_OUT, AuthState.EXPIRED] and mode in ["submit", "both"]:
+        print(f"⚠️  [{platform_name}] User not authenticated: {auth_state.state.value} ({auth_state.details})")
+        print("👉 Submissions require an active authenticated user session. Please log in.")
+        return ProcessResult(
+            stage=ProcessStage.GENERATED,
+            success=False,
+            url=url,
+            platform=platform_type,
+            problem_id=prob_id,
+            error=redact_sensitive_data(f"Authentication required: {auth_state.state.value} ({auth_state.details})"),
+            published=False
+        )
+
+    # 7. Automatically ensure editor language is set to Java
+    print("[2/7] Ensuring editor language is set to Java...")
     await switch_editor_to_java(page, platform_type)
 
-    # 3. Extract problem description
-    print("[3/6] Extracting problem description...")
+    # 8. Extract problem description
+    print("[3/7] Extracting problem description...")
     problem_text = await extract_problem_text(page, config["question_selectors"])
-    if not problem_text:
-        print("⚠️  Waiting 4 more seconds for lazy-loaded elements...")
+    is_complete, comp_err = validate_problem_text_completeness(problem_text)
+    if not is_complete:
+        print(f"⚠️  Extracted text incomplete ({comp_err}). Waiting 4 more seconds for lazy-loaded elements...")
         await asyncio.sleep(4)
         problem_text = await extract_problem_text(page, config["question_selectors"])
-        if not problem_text:
-            print("❌ Unable to find problem description. Skipping.")
-            return False
+        is_complete, comp_err = validate_problem_text_completeness(problem_text)
+        if not is_complete:
+            print(f"❌ Problem description incomplete ({comp_err}). Skipping candidate.")
+            return ProcessResult(
+                stage=ProcessStage.GENERATED,
+                success=False,
+                url=url,
+                platform=platform_type,
+                problem_id=prob_id,
+                error=f"Incomplete problem description: {comp_err}"
+            )
 
     print(f"   📄 Extracted problem description ({len(problem_text)} characters).")
 
@@ -1629,62 +7030,74 @@ async def process_problem(
     else:
         print("   ℹ️  No starter template detected (will generate complete standalone Java code).")
 
-    # 5. Generate Java solution via Gemini with local javac verification & repair loop
-    print("[4/7] Solving in Java with Gemini AI & verifying locally...")
-    solution_code = None
-    explanation = None
-    compile_passed = False
-    last_error_log = None
+    # 5. Extract sample test cases & run modular verification and repair pipeline
+    print(f"[4/7] Verifying and repairing Java solution locally (max {max_repairs} repairs)...")
+    samples = await extract_sample_test_cases_from_page(page, platform_type)
+    if not samples:
+        samples = extract_sample_test_cases_from_text(problem_text)
 
-    for attempt in range(1, 4):
-        print(f"   [Attempt {attempt}/3] Generating Java solution...")
-        solution_code, explanation = ask_gemini_for_java_code(
-            problem_text=problem_text,
-            starter_code=starter_code,
-            platform_name=platform_name,
-            platform_type=platform_type,
-            error_feedback=last_error_log
+    pipeline_res = verify_and_repair_java_pipeline(
+        problem_text=problem_text,
+        starter_code=starter_code,
+        samples=samples,
+        platform_name=platform_name,
+        platform_type=platform_type,
+        max_repairs=max_repairs,
+        java_version=java_version,
+    )
+    solution_code = pipeline_res.solution_code
+    explanation = pipeline_res.explanation
+    filename = get_safe_java_filename(url, platform_name)
+
+    if not pipeline_res.success:
+        print(f"❌ Failed verification pipeline for {url} ({pipeline_res.failure_reason}). Skipping.")
+        is_compiled = bool(pipeline_res.compilation and pipeline_res.compilation.success)
+        fail_stage = ProcessStage.COMPILED if is_compiled else ProcessStage.GENERATED
+        return ProcessResult(
+            stage=fail_stage,
+            success=False,
+            url=url,
+            platform=platform_type,
+            problem_id=prob_id,
+            solution_code=solution_code,
+            explanation=explanation,
+            error=pipeline_res.failure_reason,
+            compiler_output=pipeline_res.compilation.diagnostics if pipeline_res.compilation else None,
+            diagnostics=pipeline_res.failure_reason,
+            sample_results=pipeline_res.sample_results,
+            published=False
         )
-
-        # Local javac compilation check
-        print(f"   🧪 Compiling generated Java solution with javac locally...")
-        compile_passed, err_msg, solution_code = compile_java_code_locally(solution_code, platform_type)
-        if compile_passed:
-            print(f"   ✅ Local javac compilation PASSED cleanly!")
-            break
-        else:
-            print(f"   ⚠️  Java compilation failed with error:\n{err_msg}")
-            last_error_log = f"Java compilation error:\n{err_msg}"
-
-    if not compile_passed or not solution_code:
-        print(f"❌ Failed to generate compiling Java code for {url} after 3 attempts. Skipping to protect repo integrity.")
-        return False
 
     print(f"   💡 Approach: {explanation}")
 
-    # Optional local sample test verification for Codeforces
-    if platform_type == "codeforces":
-        print("   🧪 Testing Java solution against sample test cases locally...")
-        passed_samples, sample_log = await verify_codeforces_samples_java(page, solution_code)
-        print(f"   {sample_log}")
-        if not passed_samples:
-            print("   ⚠️  Sample test failed! Attempting self-correction...")
-            try:
-                corr_code, corr_exp = ask_gemini_for_java_code(
-                    problem_text=problem_text,
-                    starter_code=starter_code,
-                    platform_name=platform_name,
-                    platform_type=platform_type,
-                    error_feedback=sample_log
-                )
-                c_ok, _, clean_corr = compile_java_code_locally(corr_code, platform_type)
-                if c_ok:
-                    solution_code = clean_corr
-                    explanation = corr_exp
-            except Exception:
-                pass
+    # In mode 'save', store locally only; no judge submission or GitHub commit
+    if mode == "save":
+        print("   💾 Mode 'SAVE': saving verified Java solution locally without running or submitting.")
+        save_java_solution(filename, solution_code, url, explanation, platform_name, verdict=None)
+        return ProcessResult(
+            stage=ProcessStage.COMPILED,
+            success=True,
+            url=url,
+            platform=platform_type,
+            problem_id=prob_id,
+            solution_code=solution_code,
+            explanation=explanation,
+            verdict=None,
+            saved_path=str(SOLUTIONS_DIR / filename),
+            compiler_output=pipeline_res.compilation.diagnostics if pipeline_res.compilation else None,
+            sample_results=pipeline_res.sample_results,
+            published=False
+        )
 
     # 6. Inject code into webpage editor & 7. Execute action
+    submission_snapshot = {
+        "start_time": time.time(),
+        "pre_submission_id": None,
+        "account": CODEFORCES_HANDLE if platform_type == "codeforces" else None,
+        "problem_id": extract_problem_id(url, platform_type),
+    }
+    submit_clicked = False
+
     if platform_type == "codeforces":
         if mode in ["submit", "both"]:
             print("[5/7 & 6/7] Navigating to Codeforces submit page & submitting...")
@@ -1692,7 +7105,7 @@ async def process_problem(
                 clean_url = url.rstrip("/")
                 parts = clean_url.split("/")
                 prob_code = f"{parts[-2]}{parts[-1]}"
-                
+
                 await page.goto("https://codeforces.com/problemset/submit", wait_until="domcontentloaded", timeout=25000)
                 await asyncio.sleep(2)
 
@@ -1732,14 +7145,24 @@ async def process_problem(
                     if not logged_in:
                         page._anti_bot_blocked = True
                         print("\n🛑 Login timed out. Codeforces submissions require an authenticated user account.")
-                        filename = get_safe_java_filename(url, platform_name)
                         save_java_solution(filename, solution_code, url, explanation, platform_name)
-                        return False
-                
+                        return ProcessResult(
+                            stage=ProcessStage.SUBMITTED,
+                            success=False,
+                            url=url,
+                            platform=platform_type,
+                            problem_id=prob_id,
+                            solution_code=solution_code,
+                            explanation=explanation,
+                            saved_path=str(SOLUTIONS_DIR / filename),
+                            error="Codeforces login timed out",
+                            published=False
+                        )
+
                 # Fill problem code (e.g. 1352C)
                 await page.locator('input[name="submittedProblemCode"]').fill(prob_code)
                 print(f"   📝 Entered problem code: {prob_code}")
-                
+
                 # Select Java
                 sel = page.locator('select[name="programTypeId"]').first
                 if await sel.count() > 0:
@@ -1751,7 +7174,7 @@ async def process_problem(
                             await sel.select_option(val)
                             print(f"   ☕ Selected language: {txt.strip()}")
                             break
-                            
+
                 # Fill source code
                 await page.locator('textarea#sourceCodeTextarea, textarea[name="source"]').fill(solution_code)
                 print("   📋 Pasted Java solution code.")
@@ -1763,7 +7186,6 @@ async def process_problem(
                 }""")
 
                 if has_turnstile:
-                    # Give Turnstile up to 8s to generate token automatically
                     token = ""
                     for _ in range(8):
                         token = await page.evaluate("""() => {
@@ -1803,9 +7225,23 @@ async def process_problem(
                     if not token:
                         page._anti_bot_blocked = True
                         print("\n🛑 Codeforces anti-bot verification (Cloudflare Turnstile) was not completed.")
-                        filename = get_safe_java_filename(url, platform_name)
                         save_java_solution(filename, solution_code, url, explanation, platform_name)
-                        return False
+                        return ProcessResult(
+                            stage=ProcessStage.SUBMITTED,
+                            success=False,
+                            url=url,
+                            platform=platform_type,
+                            problem_id=prob_id,
+                            solution_code=solution_code,
+                            explanation=explanation,
+                            saved_path=str(SOLUTIONS_DIR / filename),
+                            error="Codeforces anti-bot verification was not completed",
+                            published=False
+                        )
+
+                # Capture pre-submission snapshot to anchor submission time and detect stale submissions
+                submission_snapshot = await capture_pre_submission_snapshot(page, platform_type, url)
+                submit_clicked = True
 
                 # Click submit
                 await page.locator('input.submit').click()
@@ -1839,16 +7275,39 @@ async def process_problem(
                     if not token:
                         page._anti_bot_blocked = True
                         print("\n🛑 Codeforces anti-bot verification was not completed.")
-                        filename = get_safe_java_filename(url, platform_name)
                         save_java_solution(filename, solution_code, url, explanation, platform_name)
-                        return False
+                        return ProcessResult(
+                            stage=ProcessStage.SUBMITTED,
+                            success=False,
+                            url=url,
+                            platform=platform_type,
+                            problem_id=prob_id,
+                            solution_code=solution_code,
+                            explanation=explanation,
+                            saved_path=str(SOLUTIONS_DIR / filename),
+                            error="Codeforces anti-bot verification not completed on retry",
+                            published=False
+                        )
             except Exception as e:
                 print(f"   ⚠️  Codeforces submit notice: {e}")
         else:
             print("[5/7 & 6/7] Codeforces local test complete (Mode: RUN).")
     else:
         print("[5/7] Injecting Java solution into editor...")
-        await inject_code_into_editor(page, solution_code)
+        inject_res = await inject_code_into_editor(page, solution_code)
+        if not inject_res or (hasattr(inject_res, "verified") and not inject_res.verified):
+            print("   ❌ Editor injection failed verification! Aborting submission.")
+            return ProcessResult(
+                stage=ProcessStage.GENERATED,
+                success=False,
+                url=url,
+                platform=platform_type,
+                problem_id=prob_id,
+                solution_code=solution_code,
+                explanation=explanation,
+                error="Editor injection verification failed",
+                published=False
+            )
 
         # Execute action (Run / Submit) based on mode
         print(f"[6/7] Performing action (Mode: {mode.upper()})...")
@@ -1870,6 +7329,21 @@ async def process_problem(
                 await asyncio.sleep(wait_time)
 
         if mode in ["submit", "both"] and config.get("submit_selectors"):
+            is_live_c, c_err = await adapter.is_live_or_rated_contest(page, url)
+            if is_live_c:
+                print(f"🛑 Refusing submission into active/rated contest: {c_err}")
+                return ProcessResult(
+                    stage=ProcessStage.SUBMITTED,
+                    success=False,
+                    url=url,
+                    platform=platform_type,
+                    problem_id=prob_id,
+                    solution_code=solution_code,
+                    explanation=explanation,
+                    error=redact_sensitive_data(f"Refusing submission into active/rated contest: {c_err}"),
+                    published=False
+                )
+            submission_snapshot = await capture_pre_submission_snapshot(page, platform_type, url)
             submit_clicked = False
             for selector in config["submit_selectors"]:
                 btn = page.locator(selector).first
@@ -1883,49 +7357,138 @@ async def process_problem(
                     continue
 
     # 7. POST-SUBMISSION JUDGE VERIFICATION
+    verdict = None
     if mode in ["submit", "both"]:
         print("[7/7] Verifying live judge submission verdict...")
-        is_accepted, verdict_msg = await verify_live_submission_verdict(page, platform_type, url)
-        print(f"   🎯 Live verdict: {verdict_msg}")
+        if platform_type != "codeforces" and not submit_clicked:
+            print(f"   ❌ No submit button could be clicked on {platform_name}.")
+            return ProcessResult(
+                stage=ProcessStage.SUBMITTED,
+                success=False,
+                url=url,
+                platform=platform_type,
+                problem_id=prob_id,
+                solution_code=solution_code,
+                explanation=explanation,
+                error=f"No submit button could be clicked on {platform_name}",
+                published=False
+            )
 
-        if not is_accepted:
-            print(f"   ❌ Problem {url} NOT accepted by judge ({verdict_msg}).")
-            print(f"   🛑 SKIPPING GitHub commit to guarantee ZERO broken solutions in repository!")
-            return False
+        verdict = await verify_live_submission_verdict(
+            page,
+            platform_type,
+            url,
+            submission_start_time=submission_snapshot.get("start_time"),
+            pre_submission_id=submission_snapshot.get("pre_submission_id"),
+            account=submission_snapshot.get("account"),
+            expected_problem_id=submission_snapshot.get("problem_id"),
+        )
+        verdict_state, verdict_msg = verdict
+        print(f"   🎯 Live verdict: {verdict_state.value} - {verdict_msg}")
+
+        # Persist submission evidence
+        record_submission_evidence(verdict, url, platform_type, solution_code)
+
+        if verdict_state == VerdictState.ACCEPTED:
+            adapter.rate_limiter.record_success()
+
+        if verdict_state != VerdictState.ACCEPTED:
+            print(f"   ❌ Problem {url} NOT accepted by judge ({verdict_msg}) [State: {verdict_state.value}].")
+            print("   🛑 SKIPPING GitHub commit to guarantee ZERO broken solutions in repository!")
+            save_java_solution(filename, solution_code, url, explanation, platform_name, verdict=verdict)
+            return ProcessResult(
+                stage=ProcessStage.REJECTED,
+                success=False,
+                url=url,
+                platform=platform_type,
+                problem_id=prob_id,
+                solution_code=solution_code,
+                explanation=explanation,
+                verdict=verdict,
+                saved_path=str(SOLUTIONS_DIR / filename),
+                compiler_output=pipeline_res.compilation.diagnostics if pipeline_res.compilation else None,
+                diagnostics=pipeline_res.failure_reason,
+                sample_results=pipeline_res.sample_results,
+                error=verdict_msg,
+                published=False
+            )
+    else:
+        # In RUN mode, no submission was made to the judge
+        print(f"   ℹ️  Mode '{mode.upper()}': solution tested locally without judge submission. Skipping GitHub commit.")
+        save_java_solution(filename, solution_code, url, explanation, platform_name, verdict=None)
+        return ProcessResult(
+            stage=ProcessStage.TESTED,
+            success=True,
+            url=url,
+            platform=platform_type,
+            problem_id=prob_id,
+            solution_code=solution_code,
+            explanation=explanation,
+            verdict=None,
+            saved_path=str(SOLUTIONS_DIR / filename),
+            compiler_output=pipeline_res.compilation.diagnostics if pipeline_res.compilation else None,
+            diagnostics=pipeline_res.failure_reason,
+            sample_results=pipeline_res.sample_results,
+            published=False
+        )
 
     # 8. ONLY COMMIT TO GITHUB IF GENUINELY VERIFIED & ACCEPTED
-    filename = get_safe_java_filename(url, platform_name)
-    save_java_solution(filename, solution_code, url, explanation, platform_name)
+    save_java_solution(filename, solution_code, url, explanation, platform_name, verdict=verdict)
 
     print("   🐙 Committing verified solution to GitHub repo...")
-    commit_solution_to_github(platform_type, url, solution_code, explanation, platform_name)
+    pub_res = commit_solution_to_github(platform_type, url, solution_code, explanation, platform_name, verdict=verdict)
+    if not pub_res.success:
+        print(f"   ❌ GitHub publishing failed: {pub_res.error}")
+        return ProcessResult(
+            stage=ProcessStage.PUBLISH_FAILED,
+            success=False,
+            url=url,
+            platform=platform_type,
+            problem_id=prob_id,
+            solution_code=solution_code,
+            explanation=explanation,
+            verdict=verdict,
+            saved_path=str(SOLUTIONS_DIR / filename),
+            publish_error=pub_res.error,
+            compiler_output=pipeline_res.compilation.diagnostics if pipeline_res.compilation else None,
+            diagnostics=pipeline_res.failure_reason,
+            sample_results=pipeline_res.sample_results,
+            error=f"Publish failed: {pub_res.error}",
+            published=False,
+            repo_name=pub_res.repo_name,
+            repo_branch=pub_res.branch,
+            commit_hash=pub_res.commit_hash
+        )
 
     print(f"✅ Completed processing: {url} (VERIFIED ACCEPTED & COMMITTED)\n")
-    return True
+    return ProcessResult(
+        stage=ProcessStage.PUBLISHED,
+        success=True,
+        url=url,
+        platform=platform_type,
+        problem_id=prob_id,
+        solution_code=solution_code,
+        explanation=explanation,
+        verdict=verdict,
+        saved_path=str(SOLUTIONS_DIR / filename),
+        compiler_output=pipeline_res.compilation.diagnostics if pipeline_res.compilation else None,
+        diagnostics=pipeline_res.failure_reason,
+        sample_results=pipeline_res.sample_results,
+        published=True,
+        repo_name=pub_res.repo_name,
+        repo_branch=pub_res.branch,
+        commit_hash=pub_res.commit_hash
+    )
 
 async def ensure_live_page(page: Page, p_playwright=None, browser=None, context=None) -> Tuple[Any, Any, Page]:
     """Guarantees an active, responsive browser page by reconnecting over CDP if disconnected."""
-    if page:
-        try:
-            if not page.is_closed():
-                await page.evaluate("1 + 1")
-                return browser, context, page
-        except Exception:
-            pass
+    if await BrowserManager.is_healthy(page):
+        return browser, context, page
 
     print("   🔄 Browser tab or CDP connection lost. Reconnecting to Chrome via CDP (port 9222)...")
     if p_playwright:
         try:
-            if browser:
-                try:
-                    await browser.close()
-                except Exception:
-                    pass
-            browser = await p_playwright.chromium.connect_over_cdp("http://localhost:9222")
-            context = browser.contexts[0]
-            page = await context.new_page()
-            print("   ✅ Reconnected cleanly to live Chrome via CDP!")
-            return browser, context, page
+            return await BrowserManager.reconnect(p_playwright, browser, context)
         except Exception as e:
             print(f"   ⚠️ CDP reconnection notice: {e}")
             chrome_app = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" if sys.platform == "darwin" else ""
@@ -1960,21 +7523,32 @@ async def ensure_live_page(page: Page, p_playwright=None, browser=None, context=
 # Autonomous Batch Execution (Zero Human Input)
 # ==============================================================================
 async def solve_platform_quota(
-    page: Page,
+    page: Optional[Page],
     platform: str,
     target_accepted: int = 5,
     difficulty: str = "medium-hard",
     mode: str = "both",
     p_playwright = None,
     browser = None,
-    context = None
-) -> Tuple[int, Any, Any, Page]:
+    context = None,
+    max_repairs: int = 3,
+    java_version: Optional[str] = None,
+    dry_run: bool = False,
+    offline_mode: bool = False,
+    max_duration: int = 3600,
+    start_time: Optional[float] = None,
+) -> Tuple[int, Any, Any, Optional[Page]]:
     """Solves problems on the given platform until target_accepted ACCEPTED problems are achieved.
-    If a problem is not accepted by the judge, it immediately fetches a replacement problem.
+    If a problem is not accepted by the judge, it fetches replacement candidates using pagination.
+    Maintains per-platform quota independently without reallocation.
     """
     print(f"\n{'='*70}")
     print(f"🎯 STARTING QUOTA SOLVER: {platform.upper()} (Target: {target_accepted} ACCEPTED Java solutions)")
     print(f"{'='*70}")
+
+    is_dry = dry_run or DRY_RUN
+    is_offline = offline_mode or OFFLINE_MODE or (page is None)
+    batch_start = start_time or time.time()
 
     discovery_map = {
         "leetcode": discover_leetcode_candidates,
@@ -1985,77 +7559,325 @@ async def solve_platform_quota(
     }
 
     disc_func = discovery_map.get(platform)
-    if not disc_func:
+    if not disc_func and not is_offline:
         print(f"❌ Unknown platform for quota solving: {platform}")
         return 0, browser, context, page
 
-    page._anti_bot_blocked = False
-    accepted_count = 0
-    attempt_count = 0
-    max_attempts = target_accepted * 3  # Up to 3x attempts to guarantee quota fulfillment
+    db = SolvedRegistry.get_db()
+    worker_id = f"worker_{os.getpid()}_{id(asyncio.current_task()) if asyncio.current_task() else 0}"
+    SolvedRegistry._active_worker_id = worker_id
 
-    browser, context, page = await ensure_live_page(page, p_playwright, browser, context)
-    candidate_pool = await disc_func(page, count=max_attempts, difficulty=difficulty)
+    run_id = db.acquire_daily_run_lock(platform, target_quota=target_accepted, worker_id=worker_id, lock_duration_sec=float(max_duration))
+    if run_id is None:
+        today_runs = db.get_daily_summary(get_kolkata_today_str())
+        for row in today_runs:
+            if row.get("platform") == platform and row.get("status") == "COMPLETED" and row.get("accepted_count", 0) >= target_accepted:
+                acc = row.get("accepted_count", 0)
+                print(f"   ✅ Platform {platform.upper()} daily quota already satisfied today ({acc}/{target_accepted} accepted).")
+                log_event("INFO", f"Platform {platform} is already satisfied today ({acc}/{target_accepted}). Skipping duplicate run.")
+                return acc, browser, context, page
+        log_event("INFO", f"Platform {platform} is actively locked by another worker. Skipping.")
+        return 0, browser, context, page
+
+    if page:
+        page._anti_bot_blocked = False
+    accepted_count = db.get_daily_run_accepted_count(run_id)
+    attempt_count = 0
+    max_attempts = target_accepted * 4  # Bounded search limit per run
+    failed_in_run: Set[str] = set()    # Prevent repeating failed candidates in the same run
+    discovery_offset = 0
+    step_size = max(15, target_accepted * 2)
+
+    if is_offline or page is None:
+        candidate_pool = discover_offline_candidates(platform, count=target_accepted * 3, difficulty=difficulty, offset=discovery_offset)
+        discovery_offset += len(candidate_pool)
+    else:
+        browser, context, page = await ensure_live_page(page, p_playwright, browser, context)
+        candidate_pool = await disc_func(page, count=step_size, difficulty=difficulty, offset=discovery_offset)
+        discovery_offset += step_size
     pool_idx = 0
 
     while accepted_count < target_accepted and attempt_count < max_attempts:
-        page._anti_bot_blocked = False
+        if (time.time() - batch_start) >= max_duration:
+            log_event("WARNING", f"Max execution duration of {max_duration}s exceeded. Gracefully ending {platform} quota run.")
+            set_platform_quota_diagnostic(platform, f"Max execution duration ({max_duration}s) exceeded")
+            break
+        if SHUTDOWN_REQUESTED:
+            log_event("WARNING", f"SIGTERM/SIGINT received. Gracefully ending {platform} quota run.")
+            set_platform_quota_diagnostic(platform, "Process termination (SIGTERM/SIGINT) requested")
+            break
+
+        if page:
+            page._anti_bot_blocked = False
         if pool_idx >= len(candidate_pool):
-            print(f"⚠️ Exhausted initial candidate pool. Querying additional candidates for {platform}...")
-            browser, context, page = await ensure_live_page(page, p_playwright, browser, context)
-            more_candidates = await disc_func(page, count=max_attempts, difficulty=difficulty)
+            print(f"⚠️ Exhausted candidate pool. Querying next batch of candidates for {platform} (offset={discovery_offset})...")
+            if is_offline or page is None:
+                more_candidates = discover_offline_candidates(platform, count=step_size, difficulty=difficulty, offset=discovery_offset)
+            else:
+                browser, context, page = await ensure_live_page(page, p_playwright, browser, context)
+                more_candidates = await disc_func(page, count=step_size, difficulty=difficulty, offset=discovery_offset)
+            discovery_offset += step_size
             for c in more_candidates:
-                if c not in candidate_pool:
+                _, cid = normalize_problem_identity(c, platform)
+                if c not in candidate_pool and cid not in failed_in_run:
                     candidate_pool.append(c)
             if pool_idx >= len(candidate_pool):
-                print(f"❌ No more unsolved candidates available for {platform}.")
+                print(f"❌ No further unsolved candidates available for {platform}.")
+                set_platform_quota_diagnostic(platform, f"Exhausted candidate pool after {attempt_count} attempts")
                 break
 
         url = candidate_pool[pool_idx]
         pool_idx += 1
 
-        if SolvedRegistry.is_solved(platform, url):
+        _, canonical_id = normalize_problem_identity(url, platform)
+
+        # Check in-memory run failure
+        if canonical_id in failed_in_run:
+            db.increment_daily_run_counts(run_id, skipped=1)
             continue
 
+        # Check DB acceptance
+        if SolvedRegistry.is_solved(platform, canonical_id):
+            db.increment_daily_run_counts(run_id, skipped=1)
+            continue
+
+        # Check DB permanent failure
+        if db.is_permanent_failure(platform, canonical_id):
+            db.increment_daily_run_counts(run_id, skipped=1)
+            continue
+
+        # Check circuit breaker before attempting candidate
+        limiter = get_platform_limiter(platform)
+        if limiter.is_paused():
+            log_event("WARNING", f"Circuit breaker OPEN for {platform}. Platform is paused.", run_id=run_id, platform=platform, failure_code=FailureCode.RATE_LIMITED)
+            set_platform_quota_diagnostic(platform, f"Circuit breaker OPEN ({limiter.last_failure_reason or 'RATE_LIMITED cooldown'})")
+            break
+
+        prob_start = time.time()
+        # Transactional atomic claim
+        claimed = db.claim_problem(platform, canonical_id, url=url, worker_id=worker_id)
+        if not claimed:
+            print(f"   🔒 Problem {canonical_id} is claimed or already accepted. Skipping...")
+            db.increment_daily_run_counts(run_id, skipped=1)
+            continue
+
+        db.record_heartbeat(platform, canonical_id, worker_id)
         attempt_count += 1
+        db.increment_daily_run_counts(run_id, attempted=1)
         print(f"\n👉 [{platform.upper()}] Attempt {attempt_count}/{max_attempts} | Target Progress: {accepted_count}/{target_accepted} Accepted")
         print(f"   Solving: {url}")
 
-        # Ensure page and CDP connection are alive before attempting
-        browser, context, page = await ensure_live_page(page, p_playwright, browser, context)
+        if not is_offline and page is not None:
+            browser, context, page = await ensure_live_page(page, p_playwright, browser, context)
 
         try:
-            # 180s hard timeout per problem to prevent any infinite freeze
-            success = await asyncio.wait_for(process_problem(page, url, mode=mode), timeout=180)
+            result = await asyncio.wait_for(
+                process_problem(
+                    page, url, mode=mode, max_repairs=max_repairs,
+                    java_version=java_version, dry_run=is_dry, offline_mode=is_offline
+                ),
+                timeout=180
+            )
         except asyncio.TimeoutError:
             print(f"   ⏱️  Problem processing timed out after 180s for {url}. Recovering...")
-            try:
-                await page.goto("about:blank", timeout=5000)
-            except Exception:
-                pass
-            success = False
+            if page:
+                try:
+                    await page.goto("about:blank", timeout=5000)
+                except Exception:
+                    pass
+            result = ProcessResult(stage=ProcessStage.SUBMITTED, success=False, url=url, error="Processing timeout (180s)")
         except Exception as e:
             print(f"   ❌ Unhandled error processing {url}: {e}")
-            success = False
+            result = ProcessResult(stage=ProcessStage.SUBMITTED, success=False, url=url, error=str(e))
 
-        if success:
+        db.record_heartbeat(platform, canonical_id, worker_id)
+
+        # Check stages reached
+        if result.stage.value in [ProcessStage.GENERATED.value, ProcessStage.COMPILED.value, ProcessStage.TESTED.value,
+                                  ProcessStage.SUBMITTED.value, ProcessStage.ACCEPTED.value, ProcessStage.PUBLISHED.value,
+                                  ProcessStage.PUBLISH_FAILED.value]:
+            db.increment_daily_run_counts(run_id, generated=1)
+        if result.stage.value in [ProcessStage.COMPILED.value, ProcessStage.TESTED.value,
+                                  ProcessStage.SUBMITTED.value, ProcessStage.ACCEPTED.value, ProcessStage.PUBLISHED.value,
+                                  ProcessStage.PUBLISH_FAILED.value]:
+            db.increment_daily_run_counts(run_id, compiled=1)
+        if result.stage.value in [ProcessStage.TESTED.value,
+                                  ProcessStage.SUBMITTED.value, ProcessStage.ACCEPTED.value, ProcessStage.PUBLISHED.value,
+                                  ProcessStage.PUBLISH_FAILED.value]:
+            db.increment_daily_run_counts(run_id, tested=1)
+
+        # Check for publish failure on confirmed accepted solution: retry publishing without resubmitting
+        if result.stage == ProcessStage.PUBLISH_FAILED and result.verdict and result.verdict.state == VerdictState.ACCEPTED:
+            print(f"   ⚠️  Publish failed for {url} ({result.publish_error}). Retrying publish without resubmitting to judge...")
+            retry_res = await process_problem(
+                page, url, mode=mode,
+                retry_publish=True,
+                cached_verdict=result.verdict,
+                cached_code=result.solution_code,
+                cached_explanation=result.explanation,
+                max_repairs=max_repairs,
+                java_version=java_version,
+                dry_run=is_dry,
+                offline_mode=is_offline,
+            )
+            if retry_res.published:
+                result = retry_res
+
+        # Quota credit requires confirmed publication in submit/both modes
+        is_successful = (result.success and result.published) if mode in ["submit", "both"] else result.success
+
+        err_msg = result.error or (result.verdict.message if result.verdict else None)
+        f_code = classify_failure(err_msg, verdict=result.verdict.state if result.verdict else None, stage=result.stage)
+        transient = (f_code == FailureCode.TRANSIENT)
+
+        attempt_id = db.record_attempt(
+            platform=platform,
+            canonical_id=canonical_id,
+            run_id=run_id,
+            stage=result.stage,
+            mode=mode,
+            solution_code=result.solution_code,
+            explanation=result.explanation,
+            error=err_msg,
+            is_transient=transient,
+            compiler_output=result.compiler_output,
+            diagnostics=result.diagnostics
+        )
+        if result.sample_results:
+            db.record_sample_test_results(attempt_id, result.sample_results)
+
+        prob_dur = time.time() - prob_start
+
+        if is_successful:
             accepted_count += 1
-            SolvedRegistry.mark_solved(platform, url)
+            limiter.record_success()
+            db.mark_retry_completed(platform, canonical_id)
+            db.increment_daily_run_counts(run_id, accepted=1)
+            if result.published:
+                db.increment_daily_run_counts(run_id, published=1)
+                db.record_publish_job(
+                    platform=platform,
+                    canonical_id=canonical_id,
+                    attempt_id=attempt_id,
+                    repo_name=result.repo_name,
+                    branch=result.repo_branch,
+                    commit_hash=result.commit_hash,
+                    status="PUBLISHED"
+                )
+            SolvedRegistry.mark_solved(platform, url, verdict=result.verdict)
             print(f"🎉 [{platform.upper()}] Progress: {accepted_count}/{target_accepted} ACCEPTED & COMMITTED TO GITHUB!\n")
-            await asyncio.sleep(6)
+            if mode in ["submit", "both"] and result.verdict and result.verdict.state == VerdictState.ACCEPTED:
+                log_event("INFO", f"Problem accepted by judge: {canonical_id}", run_id=run_id, problem_id=canonical_id, platform=platform, attempt_id=attempt_id, state="ACCEPTED", duration=prob_dur, confirmed=True)
+            else:
+                log_event("INFO", f"Problem processed in mode={mode}: {canonical_id}", run_id=run_id, problem_id=canonical_id, platform=platform, attempt_id=attempt_id, state=result.stage.value, duration=prob_dur)
+            if not is_offline:
+                await asyncio.sleep(6)
         else:
-            if getattr(page, "_anti_bot_blocked", False):
+            failed_in_run.add(canonical_id)
+            db.increment_daily_run_counts(run_id, failed=1)
+            status_to_record = "PUBLISH_FAILED" if result.stage == ProcessStage.PUBLISH_FAILED else "FAILED"
+            db.release_problem(
+                platform=platform,
+                canonical_id=canonical_id,
+                status=status_to_record,
+                failure_reason=err_msg,
+                is_transient=transient
+            )
+            is_ai_err = any(k in (err_msg or "").lower() for k in ["gemini", "ai generation", "all gemini models failed", "resource_exhausted", "generativeai"])
+            if not is_ai_err:
+                limiter.record_failure(is_rate_limit=(f_code == FailureCode.RATE_LIMITED), reason=err_msg or "")
+            else:
+                print(f"   ℹ️ AI generation transient error ({err_msg}). Not penalizing {platform} platform rate limiter.")
+
+            # Requirement 5: Retry only transient failures automatically
+            if transient:
+                p_id = db.get_problem_id(platform, canonical_id)
+                if p_id:
+                    db.enqueue_retry(
+                        problem_id=p_id,
+                        platform=platform,
+                        canonical_id=canonical_id,
+                        url=url,
+                        failure_code=FailureCode.TRANSIENT,
+                        error_msg=err_msg or "Transient failure"
+                    )
+
+            if f_code == FailureCode.AUTH_REQUIRED:
+                limiter.trip(reason=f"Authentication barrier: {err_msg}")
+                NOTIFICATION_MANAGER.send_notification(
+                    NotificationEvent.AUTH_REQUIRED,
+                    f"Authentication Required on {platform.upper()}",
+                    f"Session expired or anti-bot challenge detected on {platform.upper()}: {err_msg}",
+                    platform=platform,
+                    details={"error": err_msg, "url": url}
+                )
+
+            log_event(
+                "ERROR",
+                f"Problem failed for {canonical_id}: {err_msg}",
+                run_id=run_id,
+                problem_id=canonical_id,
+                platform=platform,
+                attempt_id=attempt_id,
+                state=result.stage.value,
+                duration=prob_dur,
+                failure_code=f_code
+            )
+
+            if result.stage == ProcessStage.PUBLISH_FAILED:
+                db.record_publish_job(
+                    platform=platform,
+                    canonical_id=canonical_id,
+                    attempt_id=attempt_id,
+                    repo_name=result.repo_name,
+                    branch=result.repo_branch,
+                    commit_hash=result.commit_hash,
+                    status="FAILED",
+                    error=result.publish_error
+                )
+                print(f"⚠️ [{platform.upper()}] Problem was accepted by judge, but GitHub publishing failed ({result.publish_error}).")
+            else:
+                print(f"⚠️ [{platform.upper()}] Problem was NOT accepted by the judge ({result.error or 'rejected'}).")
+
+            if page and getattr(page, "_anti_bot_blocked", False):
                 page._anti_bot_blocked = False
+                limiter.trip(reason="Cloudflare Anti-Bot verification")
+                NOTIFICATION_MANAGER.send_notification(
+                    NotificationEvent.AUTH_REQUIRED,
+                    f"Anti-Bot Barrier on {platform.upper()}",
+                    f"Cloudflare / captcha detected on {platform.upper()}.",
+                    platform=platform,
+                    details={"url": url}
+                )
                 print(f"\n🛑 [{platform.upper()}] Platform is gated by Cloudflare Anti-Bot verification.")
-                print(f"🛑 Stopping {platform.upper()} attempts immediately to avoid continuous looping.")
+                print(f"🛑 Stopping {platform.upper()} attempts to avoid continuous looping.")
                 print(f"📁 Generated Java solution has been saved to: {SOLUTIONS_DIR.resolve()}\n")
                 break
-            print(f"⚠️ [{platform.upper()}] Problem was NOT accepted by the judge.")
-            print(f"🔄 Selecting next unsolved replacement problem to guarantee {target_accepted} accepted solutions...\n")
 
-        await asyncio.sleep(3)
+            print(f"🔄 Selecting next unsolved replacement candidate (offset={discovery_offset})...\n")
 
-    print(f"\n📊 [{platform.upper()}] Quota Summary: {accepted_count}/{target_accepted} problems successfully solved & committed.")
+        if not is_offline:
+            await asyncio.sleep(3)
+
+    if SHUTDOWN_REQUESTED:
+        run_status = "TERMINATED"
+        set_platform_quota_diagnostic(platform, "Process termination (SIGTERM/SIGINT) requested")
+    elif accepted_count >= target_accepted:
+        run_status = "COMPLETED"
+        set_platform_quota_diagnostic(platform, "Quota achieved")
+    else:
+        run_status = "SHORTFALL"
+        if not get_platform_quota_diagnostic(platform):
+            set_platform_quota_diagnostic(platform, f"Shortfall ({accepted_count}/{target_accepted} accepted after {attempt_count} attempts)")
+        NOTIFICATION_MANAGER.send_notification(
+            NotificationEvent.QUOTA_MISSED,
+            f"Daily Quota Missed on {platform.upper()}",
+            f"Achieved {accepted_count}/{target_accepted} verified accepted solutions on {platform.upper()} ({run_status}).",
+            platform=platform,
+            details={"accepted": accepted_count, "target": target_accepted, "shortfall": target_accepted - accepted_count}
+        )
+    db.complete_daily_run(run_id, status=run_status)
+    print(f"\n📊 [{platform.upper()}] Quota Summary: {accepted_count}/{target_accepted} verified accepted solutions ({run_status}).")
     return accepted_count, browser, context, page
 
 async def execute_batch(
@@ -2064,19 +7886,121 @@ async def execute_batch(
     difficulty: str,
     mode: str,
     file_path: Optional[str] = None,
-    headless: bool = False
-):
+    headless: bool = True,
+    max_repairs: int = 3,
+    java_version: Optional[str] = None,
+    dry_run: bool = False,
+    offline_mode: bool = False,
+    timeout: Optional[int] = None,
+    database_url: Optional[str] = None,
+) -> bool:
     """Executes a complete automated batch of problems with zero human input."""
     start_time = datetime.now()
+    batch_start_ts = time.time()
+    is_dry = dry_run or DRY_RUN
+    is_offline = offline_mode or OFFLINE_MODE
+    max_dur = timeout if timeout is not None else MAX_RUN_DURATION_SECONDS
+
+    # 1. Startup configuration validation
+    _cfg = validate_startup_configuration(
+        mode=mode,
+        platform=platform,
+        count=count,
+        difficulty=difficulty,
+        dry_run=is_dry,
+        offline_mode=is_offline,
+        timeout=max_dur
+    )
+
+    # 2. Database & Startup Crash Recovery
+    if database_url:
+        db = DatabaseManager(database_url=database_url)
+        SolvedRegistry.set_db(db)
+    else:
+        db = SolvedRegistry.get_db()
+    recovered_count = db.recover_expired_leases(lease_timeout_sec=600.0)
+    if recovered_count > 0:
+        log_event("INFO", f"Startup recovery: released {recovered_count} expired problem lease(s)")
+
     print("\n" + "=" * 70)
     print(f"🚀 STARTING AUTOMATED RUN [{start_time.strftime('%Y-%m-%d %H:%M:%S')}]")
     print(f"   Platform   : {platform.upper()}")
     count_label = f"{count} problem(s) per platform ({count * 5} total across 5 platforms)" if platform == "all" else f"{count} problem(s)"
     print(f"   Count      : {count_label}")
-    print(f"   Language   : JAVA ☕")
+    print("   Language   : JAVA ☕")
     print(f"   Difficulty : {difficulty.upper()}")
     print(f"   Mode       : {mode.upper()}")
+    print(f"   Offline    : {is_offline} | Dry Run: {is_dry}")
     print("=" * 70)
+
+    # 3. Offline or Dry-Run Execution Branch (skips Playwright & Chrome browser launch entirely)
+    if is_offline or is_dry:
+        total_accepted = 0
+        target_total = 0
+        if platform == "file" and file_path and os.path.exists(file_path):
+            with open(file_path, "r", encoding="utf-8") as f:
+                urls_to_solve = [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
+            target_total = len(urls_to_solve)
+            for idx, url in enumerate(urls_to_solve, 1):
+                res = await process_problem(
+                    None, url, mode=mode, max_repairs=max_repairs,
+                    java_version=java_version, dry_run=is_dry, offline_mode=is_offline
+                )
+                is_ok = (res.success and res.published) if mode in ["submit", "both"] else res.success
+                if is_ok:
+                    total_accepted += 1
+        elif platform == "all" or "," in platform:
+            if platform == "all":
+                all_platforms = ["leetcode", "codeforces", "hackerrank", "codechef", "hackerearth"]
+            else:
+                all_platforms = [p.strip().lower() for p in platform.split(",") if p.strip()]
+            target_total = count * len(all_platforms)
+            print(f"\n📊 Starting independent quota run: {count} verified ACCEPTED problems on EACH of the {len(all_platforms)} platforms ({target_total} total)...")
+            platform_results = {}
+            platform_targets = {}
+            for p_name in all_platforms:
+                acc, _, _, _ = await solve_platform_quota(
+                    None, p_name, target_accepted=count, difficulty=difficulty, mode=mode,
+                    max_repairs=max_repairs, java_version=java_version, dry_run=is_dry,
+                    offline_mode=is_offline, max_duration=max_dur, start_time=batch_start_ts
+                )
+                total_accepted += acc
+                platform_results[p_name] = acc
+                platform_targets[p_name] = count
+
+            print("\n" + "=" * 70)
+            print("📊 INDEPENDENT PLATFORM QUOTA REPORT")
+            print("=" * 70)
+            all_satisfied = True
+            for p_name in all_platforms:
+                achieved = platform_results.get(p_name, 0)
+                targeted = platform_targets.get(p_name, count)
+                status_mark = "✅ Achieved" if achieved >= targeted else "❌ Deficit"
+                diag_msg = ""
+                if achieved < targeted:
+                    all_satisfied = False
+                    reason = get_platform_quota_diagnostic(p_name) or "Candidate verification shortfall"
+                    diag_msg = f" - Diagnostics: {reason}"
+                print(f"   {p_name.upper():<14}: {achieved}/{targeted} accepted [{status_mark}]{diag_msg}")
+            print("=" * 70)
+            print(f"\n📊 SUMMARY: {total_accepted}/{target_total} total problems verified Accepted across all platforms.")
+            batch_success = all_satisfied
+        else:
+            target_total = count
+            total_accepted, _, _, _ = await solve_platform_quota(
+                None, platform, target_accepted=count, difficulty=difficulty, mode=mode,
+                max_repairs=max_repairs, java_version=java_version, dry_run=is_dry,
+                offline_mode=is_offline, max_duration=max_dur, start_time=batch_start_ts
+            )
+            batch_success = (total_accepted >= target_total)
+            print(f"\n📊 {platform.upper()} SUMMARY: {total_accepted}/{count} problems verified Accepted.")
+
+        elapsed = (datetime.now() - start_time).total_seconds()
+        print("\n" + "=" * 70)
+        print(f"🎉 BATCH COMPLETED IN {int(elapsed)}s!")
+        print(f"📁 Java solutions archived in: {SOLUTIONS_DIR.resolve()}")
+        print("=" * 70)
+        return batch_success
 
     # Verify internet connectivity before proceeding (e.g. after system wake)
     for net_try in range(10):
@@ -2179,13 +8103,16 @@ async def execute_batch(
         await asyncio.sleep(2)
 
         total_accepted = 0
+        target_total = 0
         if platform == "file" and file_path and os.path.exists(file_path):
             with open(file_path, "r", encoding="utf-8") as f:
                 urls_to_solve = [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
+            target_total = len(urls_to_solve)
             for idx, url in enumerate(urls_to_solve, 1):
                 browser, context, page = await ensure_live_page(page, p, browser, context)
-                success = await process_problem(page, url, mode=mode)
-                if success:
+                res = await process_problem(page, url, mode=mode, max_repairs=max_repairs, java_version=java_version)
+                is_ok = (res.success and res.published) if mode in ["submit", "both"] else res.success
+                if is_ok:
                     total_accepted += 1
                 if idx < len(urls_to_solve):
                     await asyncio.sleep(4)
@@ -2195,46 +8122,44 @@ async def execute_batch(
             else:
                 all_platforms = [p.strip().lower() for p in platform.split(",") if p.strip()]
             target_total = count * len(all_platforms)
-            print(f"\n📊 Starting autonomous quota run: {count} ACCEPTED problems on EACH of the {len(all_platforms)} platforms ({target_total} total)...")
+            print(f"\n📊 Starting independent quota run: {count} verified ACCEPTED problems on EACH of the {len(all_platforms)} platforms ({target_total} total)...")
             platform_results = {}
+            platform_targets = {}
             for p_name in all_platforms:
                 acc, browser, context, page = await solve_platform_quota(
                     page, p_name, target_accepted=count, difficulty=difficulty, mode=mode,
-                    p_playwright=p, browser=browser, context=context
+                    p_playwright=p, browser=browser, context=context,
+                    max_repairs=max_repairs, java_version=java_version
                 )
                 total_accepted += acc
                 platform_results[p_name] = acc
+                platform_targets[p_name] = count
 
-            # Fail-safe quota guarantee: If any platform encountered issues (e.g. anti-bot gate, judge maintenance),
-            # reallocate the deficit to operational platforms to GUARANTEE 100% quota fulfillment.
-            deficit = target_total - total_accepted
-            if deficit > 0:
-                print(f"\n" + "=" * 70)
-                print(f"⚠️  Quota deficit detected: {total_accepted}/{target_total} achieved ({deficit} missing).")
-                print(f"🛡️  FAIL-SAFE REALLOCATION: Solving remaining {deficit} problems on healthy platforms...")
-                print("=" * 70)
-
-                successful = [p for p in all_platforms if platform_results.get(p, 0) > 0]
-                fallback_pool = successful if successful else ["hackerrank", "codechef", "hackerearth", "leetcode"]
-
-                for p_name in fallback_pool:
-                    if total_accepted >= target_total:
-                        break
-                    needed = min(deficit, target_total - total_accepted)
-                    print(f"\n🎯 [REALLOCATION] Solving {needed} additional problem(s) on {p_name.upper()}...")
-                    extra, browser, context, page = await solve_platform_quota(
-                        page, p_name, target_accepted=needed, difficulty=difficulty, mode=mode,
-                        p_playwright=p, browser=browser, context=context
-                    )
-                    total_accepted += extra
-
-            print(f"\n🏆 COMPLETED! {total_accepted}/{target_total} total problems verified Accepted & committed to GitHub!")
+            print("\n" + "=" * 70)
+            print("📊 INDEPENDENT PLATFORM QUOTA REPORT")
+            print("=" * 70)
+            all_satisfied = True
+            for p_name in all_platforms:
+                achieved = platform_results.get(p_name, 0)
+                targeted = platform_targets.get(p_name, count)
+                status_mark = "✅ Achieved" if achieved >= targeted else "❌ Deficit"
+                diag_msg = ""
+                if achieved < targeted:
+                    all_satisfied = False
+                    reason = get_platform_quota_diagnostic(p_name) or "Candidate verification shortfall"
+                    diag_msg = f" - Diagnostics: {reason}"
+                print(f"   {p_name.upper():<14}: {achieved}/{targeted} accepted [{status_mark}]{diag_msg}")
+            print("=" * 70)
+            print(f"\n📊 SUMMARY: {total_accepted}/{target_total} total problems verified Accepted across all platforms.")
         else:
+            target_total = count
             total_accepted, browser, context, page = await solve_platform_quota(
                 page, platform, target_accepted=count, difficulty=difficulty, mode=mode,
-                p_playwright=p, browser=browser, context=context
+                p_playwright=p, browser=browser, context=context,
+                max_repairs=max_repairs, java_version=java_version
             )
-            print(f"\n🏆 {platform.upper()} COMPLETED! {total_accepted}/{count} problems verified Accepted & committed to GitHub!")
+            all_satisfied = (total_accepted >= target_total)
+            print(f"\n📊 {platform.upper()} SUMMARY: {total_accepted}/{count} problems verified Accepted.")
 
         elapsed = (datetime.now() - start_time).total_seconds()
         print("\n" + "=" * 70)
@@ -2273,6 +8198,17 @@ async def execute_batch(
             except Exception:
                 pass
 
+        if platform == "all" or "," in platform:
+            batch_success = all_satisfied
+        elif target_total > 0:
+            batch_success = (total_accepted >= target_total)
+        else:
+            batch_success = True
+
+        if not batch_success:
+            print(f"\n⚠️  Batch quota shortfall: {total_accepted}/{target_total} completed.")
+        return batch_success
+
 # ==============================================================================
 # Daily Scheduler Loop
 # ==============================================================================
@@ -2308,15 +8244,20 @@ async def run_daily_scheduler(scheduled_time_str: str, batch_coro_func):
 # ==============================================================================
 # CLI Helper Utilities & Subcommands
 # ==============================================================================
-def print_status_summary():
-    """Prints a beautiful summary table of solved problems across all platforms."""
+def print_status_summary(detailed: bool = False, db: Optional[DatabaseManager] = None):
+    """Prints a clear, human-readable summary table of verified solved problems and daily quotas."""
+    database = db or SolvedRegistry.get_db()
     all_solved = SolvedRegistry.get_all_solved(force_refresh=True)
-    print("\n" + "=" * 68)
-    print("      📊 AutoCoder AI: Solved Problems Status & Registry")
-    print("=" * 68)
-    print(f"  {'Platform':<16} {'Status':<14} {'Verified Count':>16}")
-    print("  " + "─" * 64)
-    total = 0
+    stats = database.get_all_time_stats()
+    today_str = get_kolkata_today_str()
+    daily_rows = database.get_daily_summary(today_str)
+
+    print("\n" + "=" * 76)
+    print("      📊 AutoCoder AI: Verified Solved Status & Quota Summary")
+    print(f"      Timezone: Asia/Kolkata | Date: {today_str}")
+    print("=" * 76)
+    print(f"  {'Platform':<14} {'Verified Accepted':>18} {'Confirmed Published':>20} {'Legacy Unverified':>18}")
+    print("  " + "─" * 72)
     display_names = {
         "leetcode": "LeetCode",
         "codeforces": "Codeforces",
@@ -2324,19 +8265,142 @@ def print_status_summary():
         "codechef": "CodeChef",
         "hackerearth": "HackerEarth",
     }
+    tot_acc = 0
+    tot_pub = 0
+    tot_unv = 0
     for p, name in display_names.items():
-        cnt = len(all_solved.get(p, set()))
-        total += cnt
-        status_icon = "🟢 Active" if cnt > 0 else "⚪ None yet"
-        print(f"  {name:<16} {status_icon:<14} {cnt:>12} solved")
-    print("  " + "─" * 64)
-    print(f"  {'TOTAL':<16} {'🏆 Accepted':<14} {total:>12} problems")
-    print("=" * 68)
-    print(f"  📁 Solved Registry : {HISTORY_FILE.resolve()}")
+        p_stats = stats.get(p, {})
+        acc = p_stats.get("accepted", len(all_solved.get(p, set())))
+        pub = p_stats.get("published", 0)
+        unv = p_stats.get("unverified", 0)
+        tot_acc += acc
+        tot_pub += pub
+        tot_unv += unv
+        print(f"  {name:<14} {acc:>18} {pub:>20} {unv:>18}")
+    print("  " + "─" * 72)
+    print(f"  {'TOTAL':<14} {tot_acc:>18} {tot_pub:>20} {tot_unv:>18}")
+    print("=" * 76)
+
+    print(f"\n  📅 Today's Quota Runs ({today_str} Asia/Kolkata):")
+    if daily_rows:
+        print(f"  {'Platform':<14} {'Target':>7} {'Attempted':>10} {'Generated':>10} {'Compiled':>9} {'Tested':>8} {'Accepted':>9} {'Published':>10} {'Failed':>7} {'Skipped':>8} {'Status':<10}")
+        print("  " + "─" * 108)
+        for r in daily_rows:
+            p = display_names.get(r.get("platform", ""), r.get("platform", "").upper())
+            print(f"  {p:<14} {r.get('target_quota', 0):>7} {r.get('attempted_count', 0):>10} {r.get('generated_count', 0):>10} {r.get('compiled_count', 0):>9} {r.get('tested_count', 0):>8} {r.get('accepted_count', 0):>9} {r.get('published_count', 0):>10} {r.get('failed_count', 0):>7} {r.get('skipped_count', 0):>8} {r.get('status', ''):<10}")
+    else:
+        print("  (No runs recorded yet today)")
+
+    if detailed:
+        print("\n" + "=" * 76)
+        print("      🔍 DETAILED MONITORING & RECOVERY METRICS (--detailed)")
+        print("=" * 76)
+
+        # 1. Failure Breakdown by Platform & Code
+        breakdown = database.get_failure_breakdown()
+        print("\n  ⚠️ Failure Classification Breakdown:")
+        print(f"  {'Platform':<14} {'Transient':>10} {'AuthReq':>9} {'RateLimit':>10} {'DOMChanged':>11} {'Rejected':>9} {'PubFailed':>10} {'Permanent':>10}")
+        print("  " + "─" * 88)
+        for p, name in display_names.items():
+            b = breakdown.get(p, {})
+            print(f"  {name:<14} {b.get(FailureCode.TRANSIENT.value, 0):>10} {b.get(FailureCode.AUTH_REQUIRED.value, 0):>9} {b.get(FailureCode.RATE_LIMITED.value, 0):>10} {b.get(FailureCode.PLATFORM_CHANGED.value, 0):>11} {b.get(FailureCode.JUDGE_REJECTED.value, 0):>9} {b.get(FailureCode.PUBLISH_FAILED.value, 0):>10} {b.get(FailureCode.PERMANENT.value, 0):>10}")
+
+        # 2. Circuit Breakers Status
+        print("\n  ⚡ Per-Platform Circuit Breakers:")
+        print(f"  {'Platform':<14} {'State':<12} {'Failures':>9} {'Cooldown':>12} {'Reason':<24}")
+        print("  " + "─" * 74)
+        for p, name in display_names.items():
+            lim = get_platform_limiter(p)
+            st = lim.get_status()
+            cd = f"{st['remaining_seconds']}s remaining" if st["state"] == "OPEN" else "N/A"
+            reason = st.get("reason", "")[:24]
+            print(f"  {name:<14} {st['state']:<12} {st['consecutive_failures']:>9} {cd:>12} {reason:<24}")
+
+        # 3. Persistent Retry Queue
+        q_items = database.get_all_retry_queue_items()
+        print(f"\n  🔄 Persistent Retry Queue ({len(q_items)} items):")
+        if q_items:
+            print(f"  {'ID':<5} {'Platform':<12} {'Canonical ID':<22} {'Code':<15} {'Retries':>8} {'Next Due':<14} {'Status':<10}")
+            print("  " + "─" * 90)
+            now_ts = time.time()
+            for it in q_items[:15]:
+                due_in = max(0, int(it.get("next_retry_at", 0) - now_ts))
+                due_str = f"in {due_in}s" if due_in > 0 else "DUE"
+                print(f"  {it.get('id', ''):<5} {it.get('platform', ''):<12} {it.get('canonical_id', '')[:20]:<22} {it.get('failure_code', ''):<15} {it.get('retry_count', 0):>8} {due_str:<14} {it.get('status', ''):<10}")
+        else:
+            print("  (Retry queue is empty)")
+
+        # 4. Active Worker Leases & Heartbeats
+        leases = database.get_active_leases()
+        print(f"\n  🔒 Active Worker Leases & Heartbeats ({len(leases)} active):")
+        if leases:
+            print(f"  {'ID':<5} {'Platform':<12} {'Canonical ID':<20} {'Claimed By':<16} {'Claim Age':>10} {'Heartbeat':>10} {'Health':<10}")
+            print("  " + "─" * 87)
+            now_ts = time.time()
+            for l in leases:
+                c_age = int(now_ts - l.get("claimed_at", now_ts)) if l.get("claimed_at") else 0
+                hb_age = int(now_ts - l.get("heartbeat_at", now_ts)) if l.get("heartbeat_at") else c_age
+                tout = l.get("lease_timeout") or 300.0
+                health = "EXPIRED" if hb_age > tout else "HEALTHY"
+                print(f"  {l.get('id', ''):<5} {l.get('platform', ''):<12} {l.get('canonical_id', '')[:18]:<20} {l.get('claimed_by', '')[:14]:<16} {c_age:>9}s {hb_age:>9}s {health:<10}")
+        else:
+            print("  (No in-progress leases)")
+
+    print("\n" + "=" * 76)
+    print(f"  📁 SQLite Database  : {DEFAULT_DB_FILE.resolve()}")
+    print(f"  📁 Solved Registry  : {HISTORY_FILE.resolve()}")
     print(f"  📁 Solution Files   : {SOLUTIONS_DIR.resolve()}")
     if GITHUB_USERNAME:
         print(f"  🐙 GitHub Profile   : https://github.com/{GITHUB_USERNAME}")
-    print("=" * 68 + "\n")
+    print("=" * 76 + "\n")
+
+async def handle_retry_failed(
+    dry_run: bool = True,
+    platform: Optional[str] = None,
+    max_retries: int = 3,
+    db: Optional[DatabaseManager] = None
+) -> int:
+    """CLI handler for autocoder retry-failed [--dry-run]."""
+    database = db or SolvedRegistry.get_db()
+    items = database.get_all_retry_queue_items(platform=platform)
+    now = time.time()
+
+    print("\n" + "=" * 80)
+    mode_str = "DRY-RUN SIMULATION" if dry_run else "EXECUTION"
+    print(f"      🔄 AutoCoder AI: Retry Failed Problems ({mode_str})")
+    print("=" * 80)
+
+    eligible = [it for it in items if it.get("status") in ("PENDING", "EXHAUSTED")]
+
+    if not eligible:
+        print("  ℹ️ No failed problems currently in the retry queue.")
+        print("=" * 80 + "\n")
+        return 0
+
+    print(f"  Found {len(eligible)} candidate problem(s) eligible for retry:")
+    print(f"  {'ID':<5} {'Platform':<12} {'Canonical ID':<22} {'Failure Code':<15} {'Retries':>8} {'Status':<10} {'Next Retry':<12}")
+    print("  " + "─" * 90)
+
+    for it in eligible:
+        p = it.get("platform", "").capitalize()
+        cid = it.get("canonical_id", "")[:20]
+        code = it.get("failure_code", "")
+        retries = f"{it.get('retry_count', 0)}/{it.get('max_retries', max_retries)}"
+        st = it.get("status", "")
+        next_r = it.get("next_retry_at", 0)
+        due_sec = max(0, int(next_r - now))
+        due_str = f"in {due_sec}s" if due_sec > 0 else "DUE NOW"
+        print(f"  {it.get('id', ''):<5} {p:<12} {cid:<22} {code:<15} {retries:>8} {st:<10} {due_str:<12}")
+
+    print("=" * 80)
+    if dry_run:
+        print("  ℹ️ [DRY RUN] Simulation complete. No problems were executed and database state was not modified.")
+        print("=" * 80 + "\n")
+        return len(eligible)
+
+    due_items = [it for it in eligible if it.get("status") == "PENDING" and it.get("next_retry_at", 0) <= now]
+    print(f"  🚀 Processing {len(due_items)} due retry candidate(s)...")
+    return len(due_items)
 
 def interactive_config_wizard():
     """Interactively configures or updates API keys and competitive programming handles."""
@@ -2427,8 +8491,19 @@ async def main():
     if len(sys.argv) > 1:
         cmd = sys.argv[1].lower()
         if cmd == "status":
-            print_status_summary()
-            return
+            is_detailed = "--detailed" in sys.argv or "-d" in sys.argv
+            print_status_summary(detailed=is_detailed)
+            return 0
+        elif cmd in ["retry-failed", "retry"]:
+            is_dry = "--dry-run" in sys.argv or DRY_RUN
+            plat = None
+            if "--platform" in sys.argv:
+                try:
+                    plat = sys.argv[sys.argv.index("--platform") + 1]
+                except (IndexError, ValueError):
+                    pass
+            await handle_retry_failed(dry_run=is_dry, platform=plat)
+            return 0
         elif cmd in ["config", "setup"]:
             interactive_config_wizard()
             return
@@ -2496,9 +8571,70 @@ async def main():
         action="store_true",
         help="Run browser in headless mode (recommended for scheduled/daemon execution)"
     )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Display verified solved history, daily quotas (Asia/Kolkata), and database summary"
+    )
+    parser.add_argument(
+        "--detailed",
+        action="store_true",
+        help="Include detailed breakdown of failures, circuit breakers, retry queue, and leases in status"
+    )
+    parser.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="Retry failed problems from the persistent retry queue"
+    )
+    parser.add_argument(
+        "--max-repairs",
+        type=int,
+        default=3,
+        help="Maximum AI repair attempts per problem if compilation or sample tests fail (default: 3)"
+    )
+    parser.add_argument(
+        "--java-version",
+        type=str,
+        default=None,
+        help="Target Java version for javac compilation/verification (e.g. 8, 17, 21; default: auto by platform)"
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Simulate execution end-to-end without requiring real Gemini API key or platform credentials"
+    )
+    parser.add_argument(
+        "--offline-only",
+        action="store_true",
+        help="Run in offline cloud mode without web scraping or browser dependency"
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=None,
+        help="Maximum run duration in seconds before graceful termination (default: 3600)"
+    )
+    parser.add_argument(
+        "--database-url",
+        type=str,
+        default=None,
+        help="PostgreSQL connection URL (e.g. postgresql://user:pass@host:5432/db)"
+    )
     args = parser.parse_args()
 
-    if not GEMINI_API_KEY:
+    if args.status:
+        print_status_summary(detailed=args.detailed)
+        return 0
+
+    is_dry = args.dry_run or DRY_RUN
+    is_offline = args.offline_only or OFFLINE_MODE
+
+    if args.retry_failed:
+        plat = args.platform if args.platform != "all" else None
+        await handle_retry_failed(dry_run=is_dry, platform=plat)
+        return 0
+
+    if not is_dry and not GEMINI_API_KEY:
         print("\n" + "=" * 70)
         print("❌ Error: GEMINI_API_KEY is not set!")
         print("👉 You must provide your own free Google Gemini API key to use AutoCoder AI.")
@@ -2516,30 +8652,49 @@ async def main():
         print("   Tip: Run './run.sh' for an interactive menu, or use --help for flags")
         print("=" * 70 + "\n")
 
-    async def run_batch():
-        await execute_batch(
+    async def run_batch() -> bool:
+        return await execute_batch(
             platform=args.platform,
             count=args.count,
             difficulty=args.difficulty,
             mode=args.mode,
             file_path=args.file,
-            headless=args.headless
+            headless=args.headless,
+            max_repairs=args.max_repairs,
+            java_version=args.java_version,
+            dry_run=is_dry,
+            offline_mode=is_offline,
+            timeout=args.timeout,
+            database_url=args.database_url,
         )
 
     if args.daily:
         if args.run_now:
             print("🚀 --run-now flag detected: Running first batch immediately...")
-            await run_batch()
+            ok = await run_batch()
+            if not ok:
+                print("⚠️ Initial run-now batch reported failures.")
         await run_daily_scheduler(args.daily, run_batch)
+        return 0
     else:
-        await run_batch()
+        ok = await run_batch()
+        if not ok:
+            print("\n❌ Batch execution completed with failure / quota shortfall.")
+            sys.exit(1)
+        return 0
 
 def cli():
     try:
-        asyncio.run(main())
+        ret = asyncio.run(main())
+        sys.exit(ret or 0)
+    except SystemExit as se:
+        sys.exit(se.code)
     except KeyboardInterrupt:
         print("\n👋 AutoCoder AI stopped by user. See you next time!")
         sys.exit(0)
+    except Exception as e:
+        print(f"\n❌ Fatal error: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     cli()

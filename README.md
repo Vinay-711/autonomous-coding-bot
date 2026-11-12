@@ -5,27 +5,28 @@
 [![Google Gemini](https://img.shields.io/badge/AI-Google_Gemini_2.5%2F3.1-orange.svg)](https://aistudio.google.com/)
 [![Java](https://img.shields.io/badge/Language-Java_17%2F21-red.svg)](https://www.oracle.com/java/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![CI](https://github.com/Vinay-711/autonomous-coding-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/Vinay-711/autonomous-coding-bot/actions)
 
-An autonomous AI pair programmer that **discovers unsolved competitive programming problems**, writes optimal **Java solutions** using **Google Gemini**, verifies them locally with `javac`, injects them into the browser editor, validates live judge verdicts, and **automatically commits and pushes verified solutions to GitHub**.
+An autonomous AI coding agent and scheduled cloud worker that discovers unsolved competitive programming problems, generates optimal **Java solutions** using **Google Gemini**, verifies them in a restricted local sandbox with `javac` and sample tests, injects them into web editors with readback verification, confirms strict judge verdicts, and publishes verified solutions to GitHub with independent quota tracking and crash recovery.
 
 > [!IMPORTANT]
 > **🔑 Bring Your Own API Key (BYOK)**:
-> This tool is 100% open-source and **requires each user to provide their own free Google Gemini API key**.
-> - Get your free API key in 10 seconds: [Google AI Studio](https://aistudio.google.com/) (no credit card required).
-> - Your key stays private and stored locally on your machine in `~/.autocoder/.env` (never uploaded or shared).
-> - Set it once during installation, or anytime by running `autocoder config`.
+> This tool is open-source and **requires each operator to provide their own Google Gemini API key**.
+> - Get an API key from [Google AI Studio](https://aistudio.google.com/) or configure via Google Cloud Secret Manager.
+> - Sensitive tokens and keys are never uploaded, committed, or exposed in logs; all runtime logs automatically redact API keys, tokens, session cookies, passwords, and PII.
+> - Configure via `autocoder config` or set `GEMINI_API_KEY` in your environment or Secret Manager.
 
 ---
 
 ## 🌟 Supported Platforms
 
-| Platform | Difficulty Targeting | Judge Verification | Target GitHub File |
+| Platform | Difficulty Targeting | Judge Verification Method | Canonical Target File |
 | :--- | :--- | :--- | :--- |
-| **LeetCode** | Easy / Medium / Hard | Live DOM & Result Box | `Solution.java` |
-| **Codeforces** | Rating 1200–2400 (Div 2/1) | Codeforces Official API | `Main.java` |
-| **CodeChef** | Practice / Starters | Contest/Practice Judge | `Main.java` |
-| **HackerRank** | Algorithmic Subdomains | HackerRank Submissions API | `Solution.java` |
-| **HackerEarth** | BFS / DFS / DP / Trees | HackerEarth Submission JSON | `TestClass.java` |
+| **LeetCode** | Easy / Medium / Hard | Live DOM & Result Details with Submission ID | `Solution.java` |
+| **Codeforces** | Rating 800–2400 (Div 1/2/3) | Codeforces Official API (`verdict == OK`) | `Main.java` |
+| **CodeChef** | Practice / Starters | Submission details modal & table verdict | `Main.java` |
+| **HackerRank** | Algorithmic Subdomains | Submissions API correlated to current attempt | `Solution.java` |
+| **HackerEarth** | BFS / DFS / DP / Trees | Submission container & live poll (never pending) | `TestClass.java` |
 
 ---
 
@@ -33,240 +34,106 @@ An autonomous AI pair programmer that **discovers unsolved competitive programmi
 
 ```mermaid
 flowchart TD
-    A[Start Run] --> B[Discover Unsolved Problems]
-    B --> C{Check Solved Registry}
-    C -->|Already Solved| B
-    C -->|New Problem| D[Extract Statement & Starter Code]
-    D --> E[Gemini AI Solver Engine]
-    E --> F[Local javac Compilation Check]
-    F -->|Compile Error| G[Self-Repair Feedback Loop]
-    G --> E
-    F -->|Passed| H[Inject Code into Web Editor]
-    H --> I[Submit to Platform Judge]
-    I --> J{Verify Live Verdict}
-    J -->|Wrong / TLE| K[Reject & Select Replacement]
-    K --> B
-    J -->|Accepted| L[Save Solution & Documentation]
-    L --> M[Commit & Push to GitHub Repo]
-    M --> N[Update Central Solved Registry]
+    A[Start Run] --> B[Discover Unsolved Candidates]
+    B --> C{SQLite / Postgres Deduplication}
+    C -->|Already Solved / In Progress| B
+    C -->|New Candidate| D[Acquire Atomic DB Lease]
+    D --> E[Extract Statement & Starter Code]
+    E --> F[Gemini AI Solver Engine]
+    F --> G[Sandboxed Local Compilation & Sample Test]
+    G -->|Failure / CE / WA| H{Repair Attempts < 3?}
+    H -->|Yes| I[Self-Repair with Compiler Diagnostics]
+    I --> F
+    H -->|No| J[Classify Failure & Enqueue Transient Retry]
+    G -->|Passed| K[Inject Code & Readback Verification]
+    K -->|Readback Mismatch| J
+    K -->|Verified| L{Active Contest Check}
+    L -->|Live Contest Detected| M[Halt & Refuse Submission]
+    L -->|Practice Mode| N[Submit to Platform Judge]
+    N --> O{Correlate Live Judge Verdict}
+    O -->|Rejected / Unknown / Pending| J
+    O -->|Confirmed ACCEPTED| P[Save Solution with Verdict Metadata]
+    P --> Q[Safe GitHub Commit & Push]
+    Q -->|Push Failed| R[Mark PUBLISH_FAILED & Retry Publish Later]
+    Q -->|Push Confirmed| S[Mark PUBLISHED & Credit Daily Quota]
 ```
 
 ---
 
-## ✨ Key Features
+## ✨ Verified Capabilities & Safeguards
 
-- **Autonomous Discovery**: Dynamically scans platform APIs and practice catalogs for completely unsolved problems matching your requested difficulty.
-- **Local Verification & Self-Healing**: Automatically compiles Java solutions with `javac` and tests sample inputs locally. If compilation fails, the exact compiler diagnostics are fed back into Gemini for up to 3 automated repair iterations.
-- **Modern UI & Editor Support**: Native integration with Monaco Editor, Ace Editor, CodeMirror, and modern Radix UI / Tailwind dropdowns.
-- **Zero-Broken-Code Guarantee**: Only solutions that pass local verification and receive a confirmed **Accepted** verdict from the judge are committed to GitHub.
-- **Central Solved Registry**: Maintains a persistent deduplication registry (`solved_history.json`) across all platforms and local folders so no problem is ever repeated.
-- **Cloudflare & Anti-Bot Resiliency**: Built-in desktop User-Agent masking, automated session handling, and direct Chrome DevTools Protocol (`CDP`) integration to pass Cloudflare Turnstile smoothly.
-- **Native Daily Scheduling**: Includes a one-click macOS `launchd` scheduler (and Linux cron compatibility) for hands-free daily practice.
-
----
-
-## 🚀 Quickstart: Install Terminal Command (Fastest)
-
-Install the `autocoder` global terminal command in **one step** (works on macOS & Linux from any directory):
-
-```bash
-# Option 1: 1-Line Global Installation (Recommended)
-curl -fsSL https://raw.githubusercontent.com/Vinay-711/autonomous-coding-bot/main/install.sh | bash
-```
-
-Or install from a local clone:
-```bash
-# Option 2: Local Installer
-git clone https://github.com/Vinay-711/autonomous-coding-bot.git
-cd autonomous-coding-bot
-chmod +x install.sh && ./install.sh
-```
-
-Or via Python package manager (`pipx` / `pip`):
-```bash
-# Option 3: Via pipx
-pipx install git+https://github.com/Vinay-711/autonomous-coding-bot.git
-```
-
-> 📖 **Full Guide**: See **[INSTRUCTIONS.md](INSTRUCTIONS.md)** for full documentation, examples, and troubleshooting.
+- **Judge Verdict Integrity**: Employs typed verdict states (`ACCEPTED`, `REJECTED`, `PENDING`, `UNKNOWN`, `ERROR`). Submissions are never marked accepted based on absence of errors or pending evaluations. Requires matching platform problem ID, account handle, submission timestamp, and submission ID to reject stale historical verdicts.
+- **Sandboxed Java Verification & Repair**: Solutions are compiled and tested locally using `javac` with CPU limits, memory caps (512MB), execution timeouts (10s), process limits, and network isolation. Failed compilations feed compiler diagnostics back into Gemini for up to 3 repair iterations.
+- **Safe Publishing & Structured State**: Decouples judge acceptance from publishing using `ProcessResult` (`GENERATED`, `COMPILED`, `TESTED`, `SUBMITTED`, `ACCEPTED`, `REJECTED`, `PUBLISH_FAILED`, `PUBLISHED`). Stages only the solution file and generated README (`git add .` is forbidden). Failed pushes can be retried without resubmitting to the judge.
+- **Independent Quota Isolation**: Enforces separate per-platform quotas (e.g. 5 problems per platform). If one platform encounters rate limits or authentication barriers, its shortfall is reported honestly and never masked by over-allocating to another platform. Quota boundaries follow `Asia/Kolkata` midnight.
+- **Anti-Bot & Human-in-the-Loop Policy**: Uses modular platform adapters with explicit authentication checks and URL verification. When CAPTCHA, Cloudflare challenges, or authentication barriers are detected, the bot safely pauses that platform and requests human action without attempting automated challenge bypass. Automatic submission into live rated contests is strictly blocked.
+- **Cloud-Native Deployment**: Supports containerized deployment via Google Cloud Run Jobs and Google Cloud Scheduler (daily at 18:00 Asia/Kolkata). Reads credentials from Google Cloud Secret Manager and stores durable state in PostgreSQL or SQLite with heartbeat lease recovery.
+- **Monitoring & Observability**: Emits structured JSON logs with sensitive credential redaction (API keys, GitHub tokens, JWTs, cookies, passwords, and emails). Implements persistent retry queues for transient errors, per-platform circuit breakers, and opt-in webhook notifications.
 
 ---
 
-## 💻 Available Terminal Commands
+## 🚀 Installation
 
-Once installed, simply open **any terminal window** and run:
-
-| Command | Action |
-| :--- | :--- |
-| `autocoder` | Launch the interactive menu or start the daily routine |
-| `autocoder daily` | Solve today's quota: 5 medium-hard problems on **all 5 platforms** (25 total) |
-| `autocoder solve leetcode` | Autonomous solving on **LeetCode** (`--count 5`) |
-| `autocoder solve codeforces` | Autonomous solving on **Codeforces** (`--count 5`) |
-| `autocoder solve hackerrank` | Autonomous solving on **HackerRank** (`--count 5`) |
-| `autocoder solve codechef` | Autonomous solving on **CodeChef** (`--count 5`) |
-| `autocoder solve hackerearth` | Autonomous solving on **HackerEarth** (`--count 5`) |
-| `autocoder status` | View a live summary table of verified solved problems across all platforms |
-| `autocoder chrome` | Launch Google Chrome with remote debugging on port `9222` (bypasses Cloudflare Turnstile) |
-| `autocoder schedule` | Set up or inspect the automated 6:00 PM background schedule |
-| `autocoder config` | Interactive configuration wizard to update Gemini API keys and handles |
-
----
-
-## 🎮 Interactive Menu Runner (`./run.sh`)
-
-If you prefer running interactively from within the repository:
-
-```bash
-chmod +x run.sh && ./run.sh
-```
-
-### What `run.sh` does automatically:
-1. 🔍 **Prerequisite Checks**: Verifies Python 3 and Java (`javac`) on your machine.
-2. 📦 **Virtual Environment**: Automatically creates `.venv` and manages it.
-3. 📥 **Dependency Installation**: Installs Python libraries (`google-genai`, `playwright`, etc.) and downloads Chromium.
-4. 🔑 **Interactive Setup Wizard**: Prompts you for a free Google Gemini API key (from [Google AI Studio](https://aistudio.google.com/)) and sets up `.env`.
-5. 🎮 **Interactive Menu**: Lets you pick your routine, choose specific platforms, connect to real Chrome, or install background automation with a single keypress!
-
-```text
-╔═══════════════════════════════════════════════════════════════════════╗
-║              🤖 AutoCoder AI: Autonomous Coding Agent                 ║
-║       Multi-Platform Problem Solver • Java Verification • GitHub      ║
-╚═══════════════════════════════════════════════════════════════════════╝
-
-  [1] 🌟 Run Daily Quota (Solve 5 problems on ALL 5 platforms - 25 total)
-  [2] 🎯 Solve a Single Platform (LeetCode, Codeforces, HackerRank, etc.)
-  [3] 📄 Solve custom URLs from problems.txt
-  [4] 🌐 Connect Real Chrome (Bypass Cloudflare Turnstile & anti-bot)
-  [5] ⏰ Setup Automated Daily 6:00 PM Schedule (macOS Background Service)
-  [6] ⚙️  Reconfigure API Keys & Settings
-  [0] 🚪 Exit
-```
-
----
-
-<details>
-<summary><b>🛠️ Alternative: Manual Setup (for advanced users)</b></summary>
-
-### 1. Prerequisites
-- **Python 3.10+**: Ensure Python is installed (`python3 --version`).
-- **Java JDK 17 or 21**: Ensure `javac` and `java` are available on your PATH.
-- **Google Chrome**: For browser automation and session persistence.
-- **Gemini API Key**: Get a free API key from [Google AI Studio](https://aistudio.google.com/).
-
-### 2. Manual Installation
+### Option 1: Global CLI Tool (macOS & Linux)
 ```bash
 # Clone the repository
 git clone https://github.com/Vinay-711/autonomous-coding-bot.git
 cd autonomous-coding-bot
 
-# Create and activate virtual environment
+# Run installation script
+chmod +x install.sh && ./install.sh
+```
+
+### Option 2: Clean Python Virtual Environment
+```bash
 python3 -m venv .venv
 source .venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Install Playwright browser binaries
+pip install --upgrade pip
+pip install -e .
 playwright install chromium
 ```
 
-### 3. Manual Configuration
-Copy `.env.example` to `.env` and fill in your credentials:
-```bash
-cp .env.example .env
-```
-
-Edit `.env`:
-```env
-# Google Gemini API Key
-GEMINI_API_KEY="your-gemini-api-key-here"
-
-# Your GitHub Username (optional, for auto-commit repositories)
-GITHUB_USERNAME="your-github-username"
-
-# Your Competitive Programming Handles (optional)
-CODEFORCES_HANDLE="your-cf-handle"
-LEETCODE_USERNAME="your-leetcode-username"
-HACKERRANK_USERNAME="your-hackerrank-username"
-HACKEREARTH_USERNAME="your-hackerearth-username"
-CODECHEF_USERNAME="your-codechef-username"
-```
-
-</details>
+### Option 3: Containerized Cloud Deployment
+For Google Cloud Run Jobs and Cloud Scheduler deployment, see [CLOUD_DEPLOYMENT.md](CLOUD_DEPLOYMENT.md).
 
 ---
 
-## 💻 Usage & Commands
+## 💻 CLI Commands & Usage
 
-### 🌟 Run Daily Quota (All 5 Platforms)
-Solve 5 verified problems on every platform (25 problems total):
-```bash
-# Using global command
-autocoder daily
+| Command | Description |
+| :--- | :--- |
+| `autocoder help` | Display available CLI commands, flags, and usage examples |
+| `autocoder daily [--count N] [--mode run\|submit\|both]` | Execute daily batch across all 5 platforms with independent quota accounting |
+| `autocoder solve <platform> [--count N]` | Run solver for a specific platform (`leetcode`, `codeforces`, `codechef`, `hackerrank`, `hackerearth`) |
+| `autocoder status [--detailed]` | Display database summary, solved counts, circuit breakers, and retry queue status |
+| `autocoder retry-failed [--dry-run]` | Inspect or dispatch transient failures from the persistent retry queue |
+| `autocoder config` | Interactive configuration wizard to set or update API keys, handles, and directories |
+| `autocoder schedule` | Configure local automated daily schedule (`launchd` on macOS or `cron` on Linux) |
+| `autocoder chrome` | Launch local Chrome with CDP debugging on port 9222 for manual authentication |
 
-# Or via Python
-python3 bot.py --platform all --count 5 --difficulty medium-hard --mode both
-```
-
-### 🎯 Run on a Single Platform
-```bash
-# LeetCode
-autocoder solve leetcode --count 5
-
-# Codeforces
-autocoder solve codeforces --count 5
-
-# HackerRank
-autocoder solve hackerrank --count 5
-
-# CodeChef
-autocoder solve codechef --count 5
-
-# HackerEarth
-autocoder solve hackerearth --count 5
-```
-
-### CLI Arguments
-| Argument | Options | Description |
-| :--- | :--- | :--- |
-| `--platform` | `leetcode`, `codeforces`, `hackerrank`, `codechef`, `hackerearth`, `all`, `file` | Target platform to solve. |
-| `--count` | Integer (default: `5`) | Target quota of verified **Accepted** solutions. |
-| `--difficulty` | `easy`, `medium`, `hard`, `medium-hard` | Problem difficulty level. |
-| `--mode` | `run`, `submit`, `both` | `run` (test only), `submit` (submit only), `both` (test & submit). |
-| `--headless` | Flag | Run browser in headless mode (ideal for scheduled tasks). |
+### Mode Options
+- `--mode run`: Generates, compiles, and tests solutions against sample cases locally. Never submits to online judges and never pushes to GitHub.
+- `--mode save`: Verifies solutions locally and saves code to the local filesystem without judge submission or GitHub publishing.
+- `--mode submit` or `--mode both`: Verifies locally, submits to online judge, confirms verdict, and publishes to GitHub upon confirmed acceptance.
 
 ---
 
-## 🌐 Handling Cloudflare Turnstile (Chrome CDP)
+## 🛠️ Verification & Testing
 
-For platforms with strict Cloudflare Turnstile or anti-bot checks (like Codeforces), use the included helper script to connect directly to your trusted Google Chrome browser:
+The repository includes a comprehensive test suite (138+ automated unit and release gate tests) that runs completely offline with mocked platform and judge responses:
 
 ```bash
-chmod +x connect_chrome.sh
-./connect_chrome.sh --platform codeforces --count 5 --mode both
-```
+# Run full offline test suite
+pytest -v tests/
 
-This launches your local Google Chrome with remote debugging on port `9222`, allowing the bot to interact through your existing trusted session without anti-bot blocks.
+# Run code style & lint checks
+ruff check .
 
----
+# Run dependency vulnerability audit
+pip-audit -r requirements.txt
 
-## ⏰ Automated Daily Scheduling
-
-### macOS (`launchd`)
-To schedule the bot to run automatically every day at 6:00 PM:
-```bash
-chmod +x setup_daily_schedule.sh
-./setup_daily_schedule.sh
-```
-
-- **Check status**: `launchctl list | grep codingbot`
-- **View live logs**: `tail -f logs/daily_run.log`
-- **Stop schedule**: `launchctl unload ~/Library/LaunchAgents/com.vinxy.codingbot.plist`
-
-### Linux (`cron`)
-Add the following entry using `crontab -e`:
-```cron
-0 18 * * * cd /path/to/autonomous-coding-bot && .venv/bin/python3 bot.py --platform all --count 5 --mode both --headless >> logs/daily_run.log 2>&1
+# Run Python compilation check
+python3 -m compileall bot.py tests/
 ```
 
 ---
@@ -274,21 +141,26 @@ Add the following entry using `crontab -e`:
 ## 📁 Repository Structure
 
 ```text
-├── bot.py                   # Core autonomous agent & multi-platform runner
-├── connect_chrome.sh        # Remote Chrome CDP connector for Turnstile bypass
-├── setup_daily_schedule.sh  # macOS launchd automated schedule installer
-├── requirements.txt         # Project dependencies
-├── .env.example             # Environment configuration template
-├── .gitignore               # Strict exclusion rules for secrets and sessions
-├── LICENSE                  # MIT License
-└── README.md                # Documentation & architecture guide
+├── bot.py                   # Core autonomous agent, platform adapters, and CLI entrypoint
+├── Dockerfile               # Multi-stage container build for cloud worker execution
+├── pyproject.toml           # Package configuration, CLI entrypoint, and Ruff lint rules
+├── requirements.txt         # Production runtime dependencies
+├── install.sh               # Local CLI installer
+├── run.sh                   # Interactive launcher script
+├── CLOUD_DEPLOYMENT.md      # Google Cloud Run Jobs & Cloud Scheduler guide
+├── deploy/                  # Kubernetes / Cloud Run YAML configurations and deployment scripts
+├── .github/workflows/       # GitHub Actions CI workflow (lint, security audit, test matrix)
+└── tests/                   # 100% offline mock test suite covering all release gates
 ```
 
 ---
 
-## 🛡️ Disclaimer & Ethical Use
+## 🛡️ Responsible Automation & Disclaimers
 
-This software is designed for educational, algorithmic research, and personal practice tracking purposes. Users are responsible for complying with the Terms of Service of each competitive programming platform. Automated practice submissions are distinct from rated, real-time contest participation.
+- **Algorithmic Practice Only**: AutoCoder is intended for personal practice tracking, learning, and algorithmic research.
+- **Contest Integrity**: Submissions to active, live rated contests are strictly blocked.
+- **Anti-Bot Compliance**: Does not bypass CAPTCHA, Cloudflare Turnstile, or access controls. When interactive verification is required, the platform is paused and operator intervention is requested.
+- **Truth-in-Reporting**: Daily run summaries report true counts of generated, compiled, tested, accepted, published, and failed problems without falsifying quotas or reallocating failed platform targets.
 
 ---
 

@@ -1,0 +1,22 @@
+# Cloud Scheduler Configuration for AutoCoder AI Daily Batch Run
+# Schedule: Everyday at 18:00 (6:00 PM) Asia/Kolkata
+# Target: Cloud Run Job run API with OIDC Authentication
+
+name: projects/${PROJECT_ID}/locations/${REGION}/jobs/autocoder-daily-trigger
+description: "Triggers AutoCoder daily competitive programming batch run at 18:00 IST"
+schedule: "0 18 * * *"
+timeZone: "Asia/Kolkata"
+attemptDeadline: "3600s"
+retryConfig:
+  retryCount: 1
+  maxRetryDuration: "1800s"
+  minBackoffDuration: "60s"
+  maxBackoffDuration: "300s"
+  maxDoublings: 2
+httpTarget:
+  uri: "https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT_ID}/jobs/autocoder-daily-worker:run"
+  httpMethod: POST
+  oidcToken:
+    serviceAccountEmail: "autocoder-scheduler-sa@${PROJECT_ID}.iam.gserviceaccount.com"
+    audience: "https://${REGION}-run.googleapis.com/"
+

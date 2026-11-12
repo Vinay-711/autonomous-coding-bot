@@ -77,7 +77,8 @@ cat << EOF > "$PLIST_PATH"
 </plist>
 EOF
 
-# Unload previous instance if existing
+# Unload previous instances if existing
+launchctl unload "$HOME/Library/LaunchAgents/com.vinxy.codingbot.plist" 2>/dev/null || true
 launchctl unload "$PLIST_PATH" 2>/dev/null || true
 
 # Load the new service

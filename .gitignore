@@ -16,12 +16,16 @@ logs/
 solutions/
 repos/
 solved_history.json
+*.db
+*.db-shm
+*.db-wal
 
 # Python cache and compiled files
 __pycache__/
 *.py[cod]
 *$py.class
 *.bak*
+*.egg-info/
 
 # OS specific files
 .DS_Store
@@ -29,5 +33,7 @@ Thumbs.db
 
 # Test and scratch files
 test_*.py
+!tests/
+!tests/test_*.py
 he_discovered_links.txt
 
