@@ -7542,7 +7542,14 @@ async def solve_platform_quota(
 
     run_id = db.acquire_daily_run_lock(platform, target_quota=target_accepted, worker_id=worker_id, lock_duration_sec=float(max_duration))
     if run_id is None:
-        log_event("INFO", f"Platform {platform} is already satisfied today or actively locked by another worker. Skipping.")
+        today_runs = db.get_daily_summary(get_kolkata_today_str())
+        for row in today_runs:
+            if row.get("platform") == platform and row.get("status") == "COMPLETED" and row.get("accepted_count", 0) >= target_accepted:
+                acc = row.get("accepted_count", 0)
+                print(f"   ✅ Platform {platform.upper()} daily quota already satisfied today ({acc}/{target_accepted} accepted).")
+                log_event("INFO", f"Platform {platform} is already satisfied today ({acc}/{target_accepted}). Skipping duplicate run.")
+                return acc, browser, context, page
+        log_event("INFO", f"Platform {platform} is actively locked by another worker. Skipping.")
         return 0, browser, context, page
 
     if page:
