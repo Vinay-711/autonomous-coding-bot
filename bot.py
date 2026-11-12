@@ -1203,8 +1203,8 @@ def get_chrome_executable_path() -> Optional[str]:
     return None
 
 AI_MODELS = [
-    "gemini-2.5-flash",
     "gemini-3.5-flash-lite",
+    "gemini-2.5-flash",
     "gemini-3.5-flash",
     "gemini-3.6-flash",
     "gemini-3.1-flash-lite",
@@ -4566,8 +4566,16 @@ def extract_sample_test_cases_from_text(problem_text: str) -> List[SampleTestCas
                 current_out.append(line)
             continue
 
-        if re.match(r"^\s*examples?\b", stripped, re.IGNORECASE):
+        if re.match(r"^\s*(?:examples?|samples?|sample\s*\d+:?|example\s*\d+:?)\b", stripped, re.IGNORECASE):
             in_examples_section = True
+            if state == "OUT" and (current_inp or current_out):
+                clean_inp = "\n".join(current_inp).strip()
+                clean_out = "\n".join(current_out).strip()
+                if clean_inp or clean_out:
+                    samples.append(SampleTestCase(input_text=clean_inp, expected_output=clean_out, sample_index=sample_counter))
+                    sample_counter += 1
+                current_inp, current_out = [], []
+                state = "NONE"
             continue
 
         # Check section termination
@@ -4667,10 +4675,19 @@ async def extract_sample_test_cases_from_page(page: Page, platform_type: str) ->
             for i, (inp, out) in enumerate(zip(inputs, outputs), 1):
                 samples.append(SampleTestCase(input_text=inp.strip(), expected_output=out.strip(), sample_index=i))
         elif platform_type == "codechef":
-            inputs = await page.locator(".problem-statement pre:has-text('Input')").all_inner_texts()
-            outputs = await page.locator(".problem-statement pre:has-text('Output')").all_inner_texts()
+            inputs = await page.locator(".problem-statement pre:has-text('Input'), div[class*='_problem_description_'] pre:has-text('Input'), pre:has-text('Input')").all_inner_texts()
+            outputs = await page.locator(".problem-statement pre:has-text('Output'), div[class*='_problem_description_'] pre:has-text('Output'), pre:has-text('Output')").all_inner_texts()
             for i, (inp, out) in enumerate(zip(inputs, outputs), 1):
-                samples.append(SampleTestCase(input_text=inp.strip(), expected_output=out.strip(), sample_index=i))
+                clean_i = re.sub(r"^(?:Input\s*:?\s*)", "", inp.strip(), flags=re.IGNORECASE)
+                clean_o = re.sub(r"^(?:Output\s*:?\s*)", "", out.strip(), flags=re.IGNORECASE)
+                samples.append(SampleTestCase(input_text=clean_i.strip(), expected_output=clean_o.strip(), sample_index=i))
+        elif platform_type == "hackerearth":
+            inputs = await page.locator(".sample-input-box pre, .sample-test .input pre, .input-container pre, pre:has-text('Input')").all_inner_texts()
+            outputs = await page.locator(".sample-output-box pre, .sample-test .output pre, .output-container pre, pre:has-text('Output')").all_inner_texts()
+            for i, (inp, out) in enumerate(zip(inputs, outputs), 1):
+                clean_i = re.sub(r"^(?:Sample\s+Input\s*:?\s*|Input\s*:?\s*)", "", inp.strip(), flags=re.IGNORECASE)
+                clean_o = re.sub(r"^(?:Sample\s+Output\s*:?\s*|Output\s*:?\s*)", "", out.strip(), flags=re.IGNORECASE)
+                samples.append(SampleTestCase(input_text=clean_i.strip(), expected_output=clean_o.strip(), sample_index=i))
     except Exception:
         pass
     return samples
