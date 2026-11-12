@@ -15,11 +15,24 @@ import urllib.request
 import argparse
 import subprocess
 import tempfile
+import sqlite3
+from contextlib import contextmanager
+from zoneinfo import ZoneInfo
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Tuple, List, Set, Dict, Any, Union
 from enum import Enum
 from dataclasses import dataclass, field
+
+KOLKATA_TZ = ZoneInfo("Asia/Kolkata")
+
+def get_kolkata_now() -> datetime:
+    """Returns the current datetime in Asia/Kolkata timezone."""
+    return datetime.now(KOLKATA_TZ)
+
+def get_kolkata_today_str() -> str:
+    """Returns today's date formatted as YYYY-MM-DD in Asia/Kolkata timezone."""
+    return get_kolkata_now().strftime("%Y-%m-%d")
 
 import pyperclip
 from pydantic import BaseModel, Field
@@ -88,6 +101,9 @@ class ProcessResult:
     publish_error: Optional[str] = None
     saved_path: Optional[str] = None
     published: bool = False
+    repo_name: Optional[str] = None
+    repo_branch: Optional[str] = None
+    commit_hash: Optional[str] = None
 
     def __bool__(self) -> bool:
         return self.success
@@ -435,90 +451,774 @@ class CodingAnswer(BaseModel):
 
 # ==============================================================================
 # ==============================================================================
-# Central Solved Registry (Eliminates All Repeated Questions)
+# Persistent SQLite Storage Engine & Solved Registry
 # ==============================================================================
 HISTORY_FILE = BASE_DIR / "solved_history.json"
 if not HISTORY_FILE.exists() and (CONFIG_DIR / "solved_history.json").exists():
     HISTORY_FILE = CONFIG_DIR / "solved_history.json"
 
+DEFAULT_DB_FILE = BASE_DIR / "autocoder.db"
+if not DEFAULT_DB_FILE.exists() and (CONFIG_DIR / "autocoder.db").exists():
+    DEFAULT_DB_FILE = CONFIG_DIR / "autocoder.db"
+
+TRANSIENT_ERROR_SUBSTRINGS = [
+    "timeout", "timed out", "econnreset", "connection reset",
+    "network error", "rate limit", "503", "502", "504", "temporary",
+    "cdp reconnection notice", "session closed", "target closed"
+]
+
+def is_transient_error(error_msg: Optional[str]) -> bool:
+    """Classifies whether an error message indicates a transient recoverable failure."""
+    if not error_msg:
+        return False
+    msg_low = error_msg.lower()
+    return any(sub in msg_low for sub in TRANSIENT_ERROR_SUBSTRINGS)
+
+def normalize_problem_identity(url_or_slug: str, platform: Optional[str] = None) -> Tuple[str, str]:
+    """
+    Normalizes any problem URL, slug, or identifier into a canonical (platform, canonical_id) pair.
+    Handles query strings, hash fragments, trailing slashes, subpaths (/description, /problem),
+    and platform-specific conventions.
+    """
+    raw = url_or_slug.strip()
+    detected_platform = platform.lower().strip() if platform else None
+    if not detected_platform:
+        if "leetcode.com" in raw:
+            detected_platform = "leetcode"
+        elif "codeforces.com" in raw:
+            detected_platform = "codeforces"
+        elif "hackerrank.com" in raw:
+            detected_platform = "hackerrank"
+        elif "codechef.com" in raw:
+            detected_platform = "codechef"
+        elif "hackerearth.com" in raw:
+            detected_platform = "hackerearth"
+        else:
+            detected_platform = "leetcode"
+
+    # Strip query parameters (?...) and hash fragments (#...)
+    clean = re.sub(r"[?#].*$", "", raw).rstrip("/")
+
+    if detected_platform == "leetcode":
+        m = re.search(r"/problems/([^/]+)", clean)
+        slug = m.group(1) if m else clean.split("/")[-1]
+        canonical = re.sub(r"[\s_]+", "-", slug).strip("-").lower()
+        return detected_platform, canonical
+
+    elif detected_platform == "codeforces":
+        m = re.search(r"/(?:problemset/problem|contest)/(\d+)/(?:problem/)?([A-Za-z0-9]+)", clean)
+        if m:
+            canonical = f"{m.group(1)}{m.group(2).upper()}"
+            return detected_platform, canonical
+        parts = clean.split("/")
+        if len(parts) >= 2 and parts[-2].isdigit():
+            canonical = f"{parts[-2]}{parts[-1].upper()}"
+            return detected_platform, canonical
+        slug = parts[-1]
+        m_direct = re.match(r"^(\d+)[_\-]?([A-Za-z0-9]+)$", slug)
+        if m_direct:
+            canonical = f"{m_direct.group(1)}{m_direct.group(2).upper()}"
+        else:
+            canonical = re.sub(r"[^A-Za-z0-9]", "", slug).upper()
+        return detected_platform, canonical
+
+    elif detected_platform == "hackerrank":
+        m = re.search(r"/challenges/([^/]+)", clean)
+        if m:
+            slug = m.group(1)
+        else:
+            slug = clean.split("/")[-1]
+        if slug in ["problem", "submissions", "leaderboard"]:
+            parts = clean.split("/")
+            slug = parts[-2] if len(parts) >= 2 else slug
+        canonical = re.sub(r"[\s_]+", "-", slug).strip("-").lower()
+        return detected_platform, canonical
+
+    elif detected_platform == "codechef":
+        m = re.search(r"/(?:problems|practice/course/[^/]+)/([^/]+)", clean)
+        if m:
+            slug = m.group(1)
+        else:
+            slug = clean.split("/")[-1]
+        canonical = re.sub(r"[^A-Za-z0-9_]", "", slug).strip("_").upper()
+        return detected_platform, canonical
+
+    elif detected_platform == "hackerearth":
+        m = re.search(r"/(?:algorithm|approximate)/([^/]+)", clean)
+        if m:
+            slug = m.group(1)
+        else:
+            m2 = re.search(r"/practice-problems/(?:algorithm/)?([^/]+)", clean)
+            slug = m2.group(1) if m2 else clean.split("/")[-1]
+        canonical = re.sub(r"[\s_]+", "-", slug).strip("-").lower()
+        return detected_platform, canonical
+
+    slug = clean.split("/")[-1]
+    return detected_platform, slug.lower()
+
+
+class DatabaseManager:
+    """Persistent SQLite storage engine for problems, attempts, submissions, verdicts, publish jobs, and daily runs."""
+
+    def __init__(self, db_path: Optional[Union[str, Path]] = None, auto_migrate: bool = True):
+        if db_path is not None:
+            self.db_path = Path(db_path)
+        else:
+            env_db = os.environ.get("AUTOCODER_DB_PATH")
+            self.db_path = Path(env_db) if env_db else DEFAULT_DB_FILE
+
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+        if auto_migrate:
+            self.migrate_from_solved_history_if_needed()
+
+    @contextmanager
+    def get_connection(self):
+        conn = sqlite3.connect(
+            str(self.db_path),
+            timeout=30.0,
+            isolation_level=None,
+            detect_types=sqlite3.PARSE_DECLTYPES
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA journal_mode = WAL")
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    def _init_db(self):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS problems (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    platform TEXT NOT NULL,
+                    canonical_id TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    title TEXT,
+                    difficulty TEXT,
+                    status TEXT NOT NULL DEFAULT 'DISCOVERED',
+                    claimed_by TEXT,
+                    claimed_at REAL,
+                    failure_reason TEXT,
+                    failure_count INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(platform, canonical_id)
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS daily_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_date TEXT NOT NULL,
+                    platform TEXT NOT NULL,
+                    target_quota INTEGER NOT NULL,
+                    attempted_count INTEGER DEFAULT 0,
+                    generated_count INTEGER DEFAULT 0,
+                    compiled_count INTEGER DEFAULT 0,
+                    accepted_count INTEGER DEFAULT 0,
+                    published_count INTEGER DEFAULT 0,
+                    failed_count INTEGER DEFAULT 0,
+                    skipped_count INTEGER DEFAULT 0,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    status TEXT NOT NULL DEFAULT 'IN_PROGRESS'
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS attempts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    problem_id INTEGER NOT NULL REFERENCES problems(id),
+                    run_id INTEGER REFERENCES daily_runs(id),
+                    platform TEXT NOT NULL,
+                    canonical_id TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    solution_code TEXT,
+                    explanation TEXT,
+                    error TEXT,
+                    is_transient INTEGER DEFAULT 0,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS submissions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    attempt_id INTEGER REFERENCES attempts(id),
+                    problem_id INTEGER NOT NULL REFERENCES problems(id),
+                    platform TEXT NOT NULL,
+                    canonical_id TEXT NOT NULL,
+                    submission_id TEXT,
+                    account TEXT,
+                    correlation_mechanism TEXT,
+                    submitted_at TEXT NOT NULL,
+                    payload TEXT
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS judge_verdicts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    submission_id_ref INTEGER REFERENCES submissions(id),
+                    problem_id INTEGER NOT NULL REFERENCES problems(id),
+                    platform TEXT NOT NULL,
+                    canonical_id TEXT NOT NULL,
+                    verdict_state TEXT NOT NULL,
+                    message TEXT,
+                    submission_id TEXT,
+                    evidence TEXT,
+                    verified_at TEXT NOT NULL
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS publish_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    problem_id INTEGER NOT NULL REFERENCES problems(id),
+                    attempt_id INTEGER REFERENCES attempts(id),
+                    platform TEXT NOT NULL,
+                    canonical_id TEXT NOT NULL,
+                    repo_name TEXT,
+                    branch TEXT,
+                    commit_hash TEXT,
+                    status TEXT NOT NULL,
+                    error TEXT,
+                    published_at TEXT NOT NULL
+                )
+            """)
+            cursor.execute("CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY, migrated_at TEXT)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_problems_lookup ON problems(platform, canonical_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_problems_status ON problems(status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_daily_runs_lookup ON daily_runs(run_date, platform)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_judge_verdicts_lookup ON judge_verdicts(platform, canonical_id)")
+            cursor.execute("COMMIT")
+
+    def migrate_from_solved_history_if_needed(self, history_file: Optional[Path] = None, submissions_file: Optional[Path] = None):
+        """
+        Migrates legacy solved_history.json into the SQLite problems and judge_verdicts tables.
+        Entries without confirmed judge evidence in submissions.jsonl are strictly marked UNVERIFIED.
+        """
+        h_file = history_file or HISTORY_FILE
+        s_file = submissions_file or SUBMISSIONS_LOG_FILE
+
+        if not h_file.exists():
+            return
+
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM migrations WHERE name = 'solved_history_migration'")
+            if cursor.fetchone():
+                return  # Migration already completed
+
+            cursor.execute("BEGIN IMMEDIATE")
+
+            # 1. Parse verified evidence from submissions.jsonl if present
+            verified_evidence: Dict[Tuple[str, str], Dict[str, Any]] = {}
+            if s_file.exists():
+                try:
+                    with open(s_file, "r", encoding="utf-8") as sf:
+                        for line in sf:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                entry = json.loads(line)
+                                if entry.get("verdict") == "ACCEPTED":
+                                    p = entry.get("platform")
+                                    u = entry.get("url")
+                                    if p and u:
+                                        _, cid = normalize_problem_identity(u, p)
+                                        verified_evidence[(p, cid)] = entry
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+            # 2. Parse solved_history.json
+            now_iso = get_kolkata_now().isoformat()
+            try:
+                with open(h_file, "r", encoding="utf-8") as f:
+                    history_data = json.load(f)
+            except Exception:
+                history_data = {}
+
+            migrated_count = 0
+            for plat, slugs in history_data.items():
+                for s in slugs:
+                    _, cid = normalize_problem_identity(s, plat)
+                    evidence = verified_evidence.get((plat, cid))
+
+                    status = "ACCEPTED" if evidence else "UNVERIFIED"
+                    url = evidence.get("url") if evidence else f"https://{plat}.com/legacy/{cid}"
+
+                    cursor.execute(
+                        """
+                        INSERT OR IGNORE INTO problems (platform, canonical_id, url, status, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (plat, cid, url, status, now_iso, now_iso)
+                    )
+                    cursor.execute("SELECT id FROM problems WHERE platform = ? AND canonical_id = ?", (plat, cid))
+                    prob_row = cursor.fetchone()
+                    if prob_row:
+                        prob_id = prob_row[0]
+                        verdict_state = "ACCEPTED" if evidence else "UNVERIFIED"
+                        msg = evidence.get("message", "Accepted") if evidence else "Legacy solved_history.json entry without judge evidence"
+                        sub_id = evidence.get("submission_id") if evidence else None
+                        ev_json = json.dumps(evidence) if evidence else None
+
+                        cursor.execute(
+                            """
+                            INSERT INTO judge_verdicts (problem_id, platform, canonical_id, verdict_state, message, submission_id, evidence, verified_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (prob_id, plat, cid, verdict_state, msg, sub_id, ev_json, now_iso)
+                        )
+                        migrated_count += 1
+
+            cursor.execute(
+                "INSERT INTO migrations (name, migrated_at) VALUES ('solved_history_migration', ?)",
+                (now_iso,)
+            )
+            cursor.execute("COMMIT")
+
+    def is_accepted(self, platform: str, url_or_slug: str) -> bool:
+        """Returns True ONLY if the problem has confirmed judge ACCEPTED verdict."""
+        plat, cid = normalize_problem_identity(url_or_slug, platform)
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT p.status, jv.verdict_state
+                FROM problems p
+                LEFT JOIN judge_verdicts jv ON jv.problem_id = p.id AND jv.verdict_state = 'ACCEPTED'
+                WHERE p.platform = ? AND p.canonical_id = ?
+                LIMIT 1
+                """,
+                (plat, cid)
+            )
+            row = cursor.fetchone()
+            if not row:
+                return False
+            status, verdict_state = row[0], row[1]
+            return (status == "ACCEPTED" or verdict_state == "ACCEPTED")
+
+    def is_permanent_failure(self, platform: str, url_or_slug: str, max_failures: int = 3) -> bool:
+        """Returns True if the problem has permanently failed or exceeded max retry attempts."""
+        plat, cid = normalize_problem_identity(url_or_slug, platform)
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT status, failure_count FROM problems WHERE platform = ? AND canonical_id = ?",
+                (plat, cid)
+            )
+            row = cursor.fetchone()
+            if not row:
+                return False
+            status, fail_cnt = row[0], (row[1] or 0)
+            if status in ["FAILED", "REJECTED"]:
+                return True
+            if fail_cnt >= max_failures:
+                return True
+            return False
+
+    def get_accepted_canonical_ids(self, platform: str) -> Set[str]:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT canonical_id FROM problems
+                WHERE platform = ? AND status = 'ACCEPTED'
+                """,
+                (platform,)
+            )
+            return {row[0] for row in cursor.fetchall()}
+
+    def claim_problem(
+        self,
+        platform: str,
+        canonical_id: str,
+        url: str,
+        worker_id: str = "default",
+        lease_timeout_sec: float = 600.0
+    ) -> bool:
+        """
+        Atomically claims a problem for processing using a SQLite transaction with BEGIN IMMEDIATE.
+        Returns True if claim acquired; False if already accepted or actively claimed by another worker.
+        """
+        now = time.time()
+        now_iso = get_kolkata_now().isoformat()
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute(
+                "SELECT id, status, claimed_by, claimed_at FROM problems WHERE platform = ? AND canonical_id = ?",
+                (platform, canonical_id)
+            )
+            row = cursor.fetchone()
+            if row is None:
+                cursor.execute(
+                    """
+                    INSERT INTO problems (platform, canonical_id, url, status, claimed_by, claimed_at, created_at, updated_at)
+                    VALUES (?, ?, ?, 'IN_PROGRESS', ?, ?, ?, ?)
+                    """,
+                    (platform, canonical_id, url, worker_id, now, now_iso, now_iso)
+                )
+                cursor.execute("COMMIT")
+                return True
+
+            prob_id, status, claimed_by, claimed_at = row[0], row[1], row[2], row[3]
+            if status == "ACCEPTED":
+                cursor.execute("COMMIT")
+                return False
+
+            if status == "IN_PROGRESS":
+                if claimed_by != worker_id and claimed_at and (now - claimed_at) < lease_timeout_sec:
+                    cursor.execute("COMMIT")
+                    return False
+
+            cursor.execute(
+                """
+                UPDATE problems
+                SET status = 'IN_PROGRESS', claimed_by = ?, claimed_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (worker_id, now, now_iso, prob_id)
+            )
+            cursor.execute("COMMIT")
+            return True
+
+    def release_problem(
+        self,
+        platform: str,
+        canonical_id: str,
+        status: str,
+        failure_reason: Optional[str] = None,
+        is_transient: bool = False
+    ):
+        """Releases or updates the problem status after an attempt finishes."""
+        plat, cid = normalize_problem_identity(canonical_id, platform)
+        now_iso = get_kolkata_now().isoformat()
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute(
+                "SELECT id, failure_count FROM problems WHERE platform = ? AND canonical_id = ?",
+                (plat, cid)
+            )
+            row = cursor.fetchone()
+            if not row:
+                fail_cnt = 1
+                effective_status = "TRANSIENT_FAILURE" if (is_transient and fail_cnt < 3) else status
+                cursor.execute(
+                    """
+                    INSERT INTO problems (platform, canonical_id, url, status, failure_reason, failure_count, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (plat, cid, f"https://{plat}.com/problem/{cid}", effective_status, failure_reason, fail_cnt, now_iso, now_iso)
+                )
+                cursor.execute("COMMIT")
+                return
+
+            prob_id, fail_cnt = row[0], (row[1] or 0)
+            fail_cnt += 1
+            effective_status = "TRANSIENT_FAILURE" if (is_transient and fail_cnt < 3) else status
+
+            cursor.execute(
+                """
+                UPDATE problems
+                SET status = ?, claimed_by = NULL, claimed_at = NULL,
+                    failure_reason = ?, failure_count = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (effective_status, failure_reason, fail_cnt, now_iso, prob_id)
+            )
+            cursor.execute("COMMIT")
+
+    def mark_problem_accepted(
+        self,
+        platform: str,
+        canonical_id: str,
+        url: str,
+        verdict: Optional[SubmissionVerdict] = None
+    ):
+        """Records confirmed acceptance in both problems and judge_verdicts tables."""
+        now_iso = get_kolkata_now().isoformat()
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute(
+                """
+                INSERT INTO problems (platform, canonical_id, url, status, created_at, updated_at)
+                VALUES (?, ?, ?, 'ACCEPTED', ?, ?)
+                ON CONFLICT(platform, canonical_id) DO UPDATE SET
+                    status = 'ACCEPTED',
+                    claimed_by = NULL,
+                    claimed_at = NULL,
+                    updated_at = excluded.updated_at
+                """,
+                (platform, canonical_id, url, now_iso, now_iso)
+            )
+            cursor.execute("SELECT id FROM problems WHERE platform = ? AND canonical_id = ?", (platform, canonical_id))
+            prob_id = cursor.fetchone()[0]
+
+            sub_id = verdict.submission_id if verdict else None
+            msg = verdict.message if verdict else "Accepted"
+            ev_str = json.dumps(verdict.evidence) if (verdict and verdict.evidence) else None
+
+            cursor.execute(
+                """
+                INSERT INTO judge_verdicts (problem_id, platform, canonical_id, verdict_state, message, submission_id, evidence, verified_at)
+                VALUES (?, ?, ?, 'ACCEPTED', ?, ?, ?, ?)
+                """,
+                (prob_id, platform, canonical_id, msg, sub_id, ev_str, now_iso)
+            )
+            cursor.execute("COMMIT")
+
+    def get_or_create_daily_run(self, platform: str, target_quota: int, run_date: Optional[str] = None) -> int:
+        r_date = run_date or get_kolkata_today_str()
+        now_iso = get_kolkata_now().isoformat()
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute(
+                "SELECT id FROM daily_runs WHERE run_date = ? AND platform = ? ORDER BY id DESC LIMIT 1",
+                (r_date, platform)
+            )
+            row = cursor.fetchone()
+            if row:
+                cursor.execute("COMMIT")
+                return row[0]
+
+            cursor.execute(
+                """
+                INSERT INTO daily_runs (run_date, platform, target_quota, started_at, status)
+                VALUES (?, ?, ?, ?, 'IN_PROGRESS')
+                """,
+                (r_date, platform, target_quota, now_iso)
+            )
+            run_id = cursor.lastrowid
+            cursor.execute("COMMIT")
+            return run_id
+
+    def increment_daily_run_counts(
+        self,
+        run_id: int,
+        attempted: int = 0,
+        generated: int = 0,
+        compiled: int = 0,
+        accepted: int = 0,
+        published: int = 0,
+        failed: int = 0,
+        skipped: int = 0,
+    ):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute(
+                """
+                UPDATE daily_runs
+                SET attempted_count = attempted_count + ?,
+                    generated_count = generated_count + ?,
+                    compiled_count = compiled_count + ?,
+                    accepted_count = accepted_count + ?,
+                    published_count = published_count + ?,
+                    failed_count = failed_count + ?,
+                    skipped_count = skipped_count + ?
+                WHERE id = ?
+                """,
+                (attempted, generated, compiled, accepted, published, failed, skipped, run_id)
+            )
+            cursor.execute("COMMIT")
+
+    def complete_daily_run(self, run_id: int, status: str = "COMPLETED"):
+        now_iso = get_kolkata_now().isoformat()
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute(
+                "UPDATE daily_runs SET completed_at = ?, status = ? WHERE id = ?",
+                (now_iso, status, run_id)
+            )
+            cursor.execute("COMMIT")
+
+    def record_attempt(
+        self,
+        platform: str,
+        canonical_id: str,
+        run_id: Optional[int],
+        stage: ProcessStage,
+        mode: str,
+        solution_code: Optional[str] = None,
+        explanation: Optional[str] = None,
+        error: Optional[str] = None,
+        is_transient: bool = False
+    ) -> int:
+        now_iso = get_kolkata_now().isoformat()
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute("SELECT id FROM problems WHERE platform = ? AND canonical_id = ?", (platform, canonical_id))
+            row = cursor.fetchone()
+            prob_id = row[0] if row else 0
+
+            cursor.execute(
+                """
+                INSERT INTO attempts (problem_id, run_id, platform, canonical_id, stage, mode, solution_code, explanation, error, is_transient, started_at, finished_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (prob_id, run_id, platform, canonical_id, stage.value, mode, solution_code, explanation, error, 1 if is_transient else 0, now_iso, now_iso)
+            )
+            attempt_id = cursor.lastrowid
+            cursor.execute("COMMIT")
+            return attempt_id
+
+    def record_publish_job(
+        self,
+        platform: str,
+        canonical_id: str,
+        attempt_id: Optional[int],
+        repo_name: Optional[str],
+        branch: Optional[str],
+        commit_hash: Optional[str],
+        status: str,
+        error: Optional[str] = None
+    ) -> int:
+        now_iso = get_kolkata_now().isoformat()
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            cursor.execute("SELECT id FROM problems WHERE platform = ? AND canonical_id = ?", (platform, canonical_id))
+            row = cursor.fetchone()
+            prob_id = row[0] if row else 0
+
+            cursor.execute(
+                """
+                INSERT INTO publish_jobs (problem_id, attempt_id, platform, canonical_id, repo_name, branch, commit_hash, status, error, published_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (prob_id, attempt_id, platform, canonical_id, repo_name, branch, commit_hash, status, error, now_iso)
+            )
+            job_id = cursor.lastrowid
+            cursor.execute("COMMIT")
+            return job_id
+
+    def get_daily_summary(self, run_date: Optional[str] = None) -> List[Dict[str, Any]]:
+        r_date = run_date or get_kolkata_today_str()
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT platform, target_quota, attempted_count, generated_count, compiled_count,
+                       accepted_count, published_count, failed_count, skipped_count, status
+                FROM daily_runs
+                WHERE run_date = ?
+                ORDER BY platform
+                """,
+                (r_date,)
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_all_time_stats(self) -> Dict[str, Dict[str, int]]:
+        platforms = ["leetcode", "codeforces", "hackerrank", "codechef", "hackerearth"]
+        res = {p: {"accepted": 0, "published": 0, "unverified": 0, "failed": 0, "discovered": 0} for p in platforms}
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT platform, COUNT(DISTINCT canonical_id)
+                FROM problems
+                WHERE status = 'ACCEPTED'
+                GROUP BY platform
+                """
+            )
+            for plat, cnt in cursor.fetchall():
+                if plat in res:
+                    res[plat]["accepted"] = cnt
+
+            cursor.execute(
+                """
+                SELECT platform, COUNT(DISTINCT canonical_id)
+                FROM publish_jobs
+                WHERE status = 'PUBLISHED'
+                GROUP BY platform
+                """
+            )
+            for plat, cnt in cursor.fetchall():
+                if plat in res:
+                    res[plat]["published"] = cnt
+
+            cursor.execute(
+                """
+                SELECT platform, COUNT(DISTINCT canonical_id)
+                FROM problems
+                WHERE status = 'UNVERIFIED'
+                GROUP BY platform
+                """
+            )
+            for plat, cnt in cursor.fetchall():
+                if plat in res:
+                    res[plat]["unverified"] = cnt
+
+            cursor.execute(
+                """
+                SELECT platform, COUNT(DISTINCT canonical_id)
+                FROM problems
+                WHERE status IN ('FAILED', 'REJECTED')
+                GROUP BY platform
+                """
+            )
+            for plat, cnt in cursor.fetchall():
+                if plat in res:
+                    res[plat]["failed"] = cnt
+
+        return res
+
+
 class SolvedRegistry:
-    """Central registry tracking all solved problems across all platforms, local folders, and git repos."""
-    _cache: Optional[dict] = None
+    """Central registry tracking all solved problems backed by persistent SQLite storage."""
+    _db: Optional[DatabaseManager] = None
 
     @classmethod
-    def normalize(cls, s: str) -> str:
-        s = s.strip().lower()
-        s = re.sub(r"^https?://[^/]+/", "", s)
-        s = re.sub(r"^(problems|challenges|practice-problems/algorithm|problemset/problem)/\??", "", s)
-        s = re.sub(r"/problem/?$", "", s)
-        s = re.sub(r"[^a-z0-9_]", "_", s)
-        s = re.sub(r"_+", "_", s).strip("_")
-        return s
+    def get_db(cls) -> DatabaseManager:
+        if cls._db is None:
+            cls._db = DatabaseManager()
+        return cls._db
+
+    @classmethod
+    def set_db(cls, db: DatabaseManager):
+        cls._db = db
+
+    @classmethod
+    def normalize(cls, s: str, platform: Optional[str] = None) -> str:
+        plat, canon = normalize_problem_identity(s, platform)
+        return canon
 
     @classmethod
     def get_all_solved(cls, force_refresh: bool = False) -> dict:
-        if cls._cache is not None and not force_refresh:
-            return cls._cache
-
+        """Returns verified accepted problems per platform from SQLite database (no file/directory false positives)."""
+        db = cls.get_db()
         platforms = ["leetcode", "codeforces", "hackerrank", "codechef", "hackerearth"]
-        solved = {p: set() for p in platforms}
-
-        # 1. Load from persistent history file
-        if HISTORY_FILE.exists():
-            try:
-                with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    for p, slugs in data.items():
-                        if p in solved:
-                            for s in slugs:
-                                solved[p].add(cls.normalize(s))
-            except Exception:
-                pass
-
-        # 2. Load from local solutions/ folder
-        for f in SOLUTIONS_DIR.glob("*.*"):
-            if f.suffix in [".java", ".py"]:
-                name = f.stem.lower()
-                for p in platforms:
-                    if name.startswith(f"{p}_"):
-                        slug = name[len(p)+1:]
-                        solved[p].add(cls.normalize(slug))
-
-        # 3. Load from all 5 GitHub repositories (repos/*/solutions/**)
-        for p in platforms:
-            repo_solutions = REPOS_DIR / f"{p}-daily" / "solutions"
-            if repo_solutions.exists():
-                for sub in repo_solutions.glob("*/*"):
-                    if sub.is_dir():
-                        solved[p].add(cls.normalize(sub.name))
-
-        cls._cache = solved
-        return cls._cache
+        return {p: db.get_accepted_canonical_ids(p) for p in platforms}
 
     @classmethod
     def is_solved(cls, platform: str, slug_or_url: str) -> bool:
-        norm = cls.normalize(slug_or_url)
-        all_solved = cls.get_all_solved()
-        return norm in all_solved.get(platform, set())
+        """Returns True ONLY if the problem has confirmed judge ACCEPTED verdict in SQLite database."""
+        return cls.get_db().is_accepted(platform, slug_or_url)
 
     @classmethod
-    def mark_solved(cls, platform: str, slug_or_url: str):
-        norm = cls.normalize(slug_or_url)
-        all_solved = cls.get_all_solved()
-        if platform not in all_solved:
-            all_solved[platform] = set()
-        all_solved[platform].add(norm)
-        cls._cache = all_solved
-        try:
-            with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-                json.dump({p: sorted(list(s)) for p, s in all_solved.items()}, f, indent=2)
-        except Exception:
-            try:
-                fallback_file = CONFIG_DIR / "solved_history.json"
-                with open(fallback_file, "w", encoding="utf-8") as f:
-                    json.dump({p: sorted(list(s)) for p, s in all_solved.items()}, f, indent=2)
-            except Exception as e:
-                print(f"⚠️ Failed to write to solved_history.json: {e}")
+    def is_accepted(cls, platform: str, slug_or_url: str) -> bool:
+        """Explicit alias for is_solved verifying confirmed judge ACCEPTED verdict."""
+        return cls.get_db().is_accepted(platform, slug_or_url)
+
+    @classmethod
+    def mark_solved(cls, platform: str, slug_or_url: str, verdict: Optional[SubmissionVerdict] = None):
+        """Marks a problem as accepted in the SQLite database with verified verdict."""
+        plat, canon = normalize_problem_identity(slug_or_url, platform)
+        cls.get_db().mark_problem_accepted(plat, canon, slug_or_url, verdict=verdict)
+
 
 def get_existing_solved_slugs() -> Set[str]:
     """Backward compatibility helper."""
@@ -527,10 +1227,11 @@ def get_existing_solved_slugs() -> Set[str]:
         all_s.update(s_set)
     return all_s
 
-async def discover_leetcode_candidates(page: Page, count: int = 15, difficulty: str = "medium-hard") -> List[str]:
+async def discover_leetcode_candidates(page: Page, count: int = 15, difficulty: str = "medium-hard", offset: int = 0) -> List[str]:
     """Queries LeetCode GraphQL directly for free, completely unsolved problems for user."""
-    print(f"\n🔍 [LeetCode] Finding up to {count} unsolved problems (Difficulty: {difficulty.upper()})...")
+    print(f"\n🔍 [LeetCode] Finding up to {count} unsolved problems (Difficulty: {difficulty.upper()}, Offset: {offset})...")
     candidates = []
+    db = SolvedRegistry.get_db()
 
     diff_list = []
     if difficulty.lower() == "hard":
@@ -549,7 +1250,7 @@ async def discover_leetcode_candidates(page: Page, count: int = 15, difficulty: 
         for diff in diff_list:
             if len(candidates) >= count:
                 break
-            gql_query = """async (diff) => {
+            gql_query = """async ({diff, skip, limit}) => {
                 const query = `
                     query problemsetQuestionList($categorySlug: String, $limit: Int, $skip: Int, $filters: QuestionListFilterInput) {
                         problemsetQuestionList: questionList(
@@ -576,8 +1277,8 @@ async def discover_leetcode_candidates(page: Page, count: int = 15, difficulty: 
                         query: query,
                         variables: {
                             categorySlug: "",
-                            skip: 0,
-                            limit: 50,
+                            skip: skip,
+                            limit: limit,
                             filters: {
                                 difficulty: diff,
                                 status: "NOT_STARTED"
@@ -589,7 +1290,7 @@ async def discover_leetcode_candidates(page: Page, count: int = 15, difficulty: 
                 const d = await resp.json();
                 return d.data?.problemsetQuestionList?.questions || [];
             }"""
-            questions = await page.evaluate(gql_query, diff)
+            questions = await page.evaluate(gql_query, {"diff": diff, "skip": offset, "limit": max(50, count * 2)})
             for q in questions:
                 if q.get("paidOnly"):
                     continue
@@ -598,7 +1299,7 @@ async def discover_leetcode_candidates(page: Page, count: int = 15, difficulty: 
                 slug = q.get("titleSlug")
                 if not slug:
                     continue
-                if SolvedRegistry.is_solved("leetcode", slug):
+                if SolvedRegistry.is_solved("leetcode", slug) or db.is_permanent_failure("leetcode", slug):
                     continue
                 full_url = f"https://leetcode.com/problems/{slug}/"
                 if full_url not in candidates:
@@ -611,10 +1312,11 @@ async def discover_leetcode_candidates(page: Page, count: int = 15, difficulty: 
     print(f"   ✅ Discovered {len(candidates)} completely unsolved LeetCode candidates.")
     return candidates
 
-async def discover_codeforces_candidates(page: Page, count: int = 15, difficulty: str = "medium-hard") -> List[str]:
+async def discover_codeforces_candidates(page: Page, count: int = 15, difficulty: str = "medium-hard", offset: int = 0) -> List[str]:
     """Finds unsolved Codeforces problems in Medium/Hard ratings, excluding any already solved by user."""
-    print(f"\n🔍 [Codeforces] Finding up to {count} unsolved problems (Difficulty: {difficulty.upper()})...")
+    print(f"\n🔍 [Codeforces] Finding up to {count} unsolved problems (Difficulty: {difficulty.upper()}, Offset: {offset})...")
     candidates = []
+    db = SolvedRegistry.get_db()
 
     try:
         try:
@@ -642,6 +1344,7 @@ async def discover_codeforces_candidates(page: Page, count: int = 15, difficulty
             stats = {(s["contestId"], s["index"]): s["solvedCount"] for s in res["result"]["problemStatistics"]}
             sorted_probs = sorted(probs, key=lambda p: stats.get((p["contestId"], p["index"]), 0), reverse=True)
 
+            matching_probs = []
             for p in sorted_probs:
                 rating = p.get("rating", 1200)
                 if difficulty.lower() in ["medium-hard", "hard-medium"]:
@@ -656,9 +1359,12 @@ async def discover_codeforces_candidates(page: Page, count: int = 15, difficulty
                 elif difficulty.lower() == "easy":
                     if rating > 1000:
                         continue
+                matching_probs.append(p)
 
+            paged_probs = matching_probs[offset:]
+            for p in paged_probs:
                 slug = f"{p['contestId']}_{p['index']}"
-                if SolvedRegistry.is_solved("codeforces", slug):
+                if SolvedRegistry.is_solved("codeforces", slug) or db.is_permanent_failure("codeforces", slug):
                     continue
 
                 url = f"https://codeforces.com/problemset/problem/{p['contestId']}/{p['index']}"
@@ -727,9 +1433,10 @@ async def discover_codeforces_candidates(page: Page, count: int = 15, difficulty
                 "https://codeforces.com/problemset/problem/1360/C",
                 "https://codeforces.com/problemset/problem/1374/C",
             ]
-        for u in catalog_fallback:
+        paged_catalog = catalog_fallback[offset:]
+        for u in paged_catalog:
             slug = u.rstrip("/").split("/")[-2] + "_" + u.rstrip("/").split("/")[-1]
-            if not SolvedRegistry.is_solved("codeforces", slug) and u not in candidates:
+            if not SolvedRegistry.is_solved("codeforces", slug) and not db.is_permanent_failure("codeforces", slug) and u not in candidates:
                 candidates.append(u)
             if len(candidates) >= count:
                 break
@@ -737,10 +1444,11 @@ async def discover_codeforces_candidates(page: Page, count: int = 15, difficulty
     print(f"   ✅ Discovered {len(candidates)} completely unsolved Codeforces candidates.")
     return candidates
 
-async def discover_hackerrank_candidates(page: Page, count: int = 15, difficulty: str = "medium-hard") -> List[str]:
+async def discover_hackerrank_candidates(page: Page, count: int = 15, difficulty: str = "medium-hard", offset: int = 0) -> List[str]:
     """Finds unsolved HackerRank challenges (Medium/Hard) using API with pagination and fallback catalog."""
-    print(f"\n🔍 [HackerRank] Finding up to {count} unsolved challenges (Difficulty: {difficulty.upper()})...")
+    print(f"\n🔍 [HackerRank] Finding up to {count} unsolved challenges (Difficulty: {difficulty.upper()}, Offset: {offset})...")
     candidates = []
+    db = SolvedRegistry.get_db()
 
     diff_params = ""
     if difficulty.lower() == "hard":
@@ -756,17 +1464,17 @@ async def discover_hackerrank_candidates(page: Page, count: int = 15, difficulty
     for track in tracks:
         if len(candidates) >= count:
             break
-        for offset in [0, 50, 100, 150]:
+        for page_offset in [offset, offset + 50, offset + 100, offset + 150]:
             if len(candidates) >= count:
                 break
             try:
-                api_url = f"https://www.hackerrank.com/rest/contests/master/tracks/{track}/challenges?offset={offset}&limit=50{diff_params}"
+                api_url = f"https://www.hackerrank.com/rest/contests/master/tracks/{track}/challenges?offset={page_offset}&limit=50{diff_params}"
                 req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
                 with urllib.request.urlopen(req, timeout=8) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                     for m in data.get("models", []):
                         slug = m.get("slug")
-                        if not slug or SolvedRegistry.is_solved("hackerrank", slug):
+                        if not slug or SolvedRegistry.is_solved("hackerrank", slug) or db.is_permanent_failure("hackerrank", slug):
                             continue
                         u = f"https://www.hackerrank.com/challenges/{slug}/problem"
                         if u not in candidates:
@@ -774,7 +1482,7 @@ async def discover_hackerrank_candidates(page: Page, count: int = 15, difficulty
                         if len(candidates) >= count:
                             break
             except Exception as e:
-                print(f"   ⚠️  HackerRank API ({track}, offset {offset}) note: {e}")
+                print(f"   ⚠️  HackerRank API ({track}, offset {page_offset}) note: {e}")
                 continue
 
     # Fallback catalog of verified active HackerRank challenges across tracks
@@ -791,8 +1499,9 @@ async def discover_hackerrank_candidates(page: Page, count: int = 15, difficulty
             "simple-array-sum", "compare-the-triplets", "a-very-big-sum", "diagonal-difference",
             "plus-minus", "staircase", "mini-max-sum", "birthday-cake-candles", "time-conversion"
         ]
-        for slug in curated_hr:
-            if not SolvedRegistry.is_solved("hackerrank", slug):
+        paged_curated = curated_hr[offset:]
+        for slug in paged_curated:
+            if not SolvedRegistry.is_solved("hackerrank", slug) and not db.is_permanent_failure("hackerrank", slug):
                 u = f"https://www.hackerrank.com/challenges/{slug}/problem"
                 if u not in candidates:
                     candidates.append(u)
@@ -802,17 +1511,20 @@ async def discover_hackerrank_candidates(page: Page, count: int = 15, difficulty
     print(f"   ✅ Discovered {len(candidates)} completely unsolved HackerRank candidates.")
     return candidates
 
-async def discover_codechef_candidates(page: Page, count: int = 15, difficulty: str = "medium-hard") -> List[str]:
+async def discover_codechef_candidates(page: Page, count: int = 15, difficulty: str = "medium-hard", offset: int = 0) -> List[str]:
     """Finds unsolved CodeChef problems in Medium/Hard ratings via API pagination."""
-    print(f"\n🔍 [CodeChef] Finding up to {count} unsolved problems (Difficulty: {difficulty.upper()})...")
+    print(f"\n🔍 [CodeChef] Finding up to {count} unsolved problems (Difficulty: {difficulty.upper()}, Offset: {offset})...")
     candidates = []
+    db = SolvedRegistry.get_db()
 
+    page_shift = offset // 50
     if difficulty.lower() == "easy":
-        pages_to_check = [0, 1, 2, 3, 4, 5, 6, 7]
+        base_pages = [0, 1, 2, 3, 4, 5, 6, 7]
     elif difficulty.lower() in ["medium-hard", "hard-medium", "medium"]:
-        pages_to_check = [10, 20, 30, 40, 50, 60]
+        base_pages = [10, 20, 30, 40, 50, 60]
     else:
-        pages_to_check = [20, 40, 60, 80]
+        base_pages = [20, 40, 60, 80]
+    pages_to_check = [p + page_shift for p in base_pages]
     for p_num in pages_to_check:
         if len(candidates) >= count:
             break
@@ -840,7 +1552,7 @@ async def discover_codechef_candidates(page: Page, count: int = 15, difficulty: 
                         continue
 
                     code = p.get("code")
-                    if not code or SolvedRegistry.is_solved("codechef", code):
+                    if not code or SolvedRegistry.is_solved("codechef", code) or db.is_permanent_failure("codechef", code):
                         continue
                     u = f"https://www.codechef.com/problems/{code}"
                     if u not in candidates:
@@ -858,8 +1570,9 @@ async def discover_codechef_candidates(page: Page, count: int = 15, difficulty: 
             "JOHNY", "CLEANUP", "HORSES", "CSUB", "CNOTE",
             "RAINBOWA", "SALARY", "CHN15A", "FRGTNLNG", "COPS"
         ]
-        for c in curated_cc:
-            if not SolvedRegistry.is_solved("codechef", c):
+        paged_curated = curated_cc[offset:]
+        for c in paged_curated:
+            if not SolvedRegistry.is_solved("codechef", c) and not db.is_permanent_failure("codechef", c):
                 u = f"https://www.codechef.com/problems/{c}"
                 if u not in candidates:
                     candidates.append(u)
@@ -869,10 +1582,11 @@ async def discover_codechef_candidates(page: Page, count: int = 15, difficulty: 
     print(f"   ✅ Discovered {len(candidates)} completely unsolved CodeChef candidates.")
     return candidates
 
-async def discover_hackerearth_candidates(page: Page, count: int = 15, difficulty: str = "medium-hard") -> List[str]:
+async def discover_hackerearth_candidates(page: Page, count: int = 15, difficulty: str = "medium-hard", offset: int = 0) -> List[str]:
     """Finds unsolved HackerEarth problems (Medium/Hard) using curated pool and live track crawling."""
-    print(f"\n🔍 [HackerEarth] Finding up to {count} unsolved problems (Difficulty: {difficulty.upper()})...")
+    print(f"\n🔍 [HackerEarth] Finding up to {count} unsolved problems (Difficulty: {difficulty.upper()}, Offset: {offset})...")
     candidates = []
+    db = SolvedRegistry.get_db()
 
     # Curated catalog of verified, active algorithmic challenges across topics
     if difficulty.lower() == "easy":
@@ -945,9 +1659,10 @@ async def discover_hackerearth_candidates(page: Page, count: int = 15, difficult
         "https://www.hackerearth.com/practice/data-structures/trees/binary-search-tree/practice-problems/algorithm/mst-revisited-3f9d614c/",
     ]
 
-    for u in catalog:
+    paged_catalog = catalog[offset:]
+    for u in paged_catalog:
         slug = u.rstrip("/").split("/")[-1]
-        if not SolvedRegistry.is_solved("hackerearth", slug):
+        if not SolvedRegistry.is_solved("hackerearth", slug) and not db.is_permanent_failure("hackerearth", slug):
             if u not in candidates:
                 candidates.append(u)
         if len(candidates) >= count:
@@ -1002,7 +1717,7 @@ async def discover_hackerearth_candidates(page: Page, count: int = 15, difficult
                 }''')
                 for link in dom_links:
                     slug = link.rstrip("/").split("/")[-1]
-                    if not SolvedRegistry.is_solved("hackerearth", slug) and link not in candidates:
+                    if not SolvedRegistry.is_solved("hackerearth", slug) and not db.is_permanent_failure("hackerearth", slug) and link not in candidates:
                         candidates.append(link)
                     if len(candidates) >= count:
                         break
@@ -2716,7 +3431,10 @@ async def process_problem(
                 explanation=cached_explanation,
                 verdict=cached_verdict,
                 saved_path=str(SOLUTIONS_DIR / filename),
-                published=True
+                published=True,
+                repo_name=pub_res.repo_name,
+                repo_branch=pub_res.branch,
+                commit_hash=pub_res.commit_hash
             )
         else:
             return ProcessResult(
@@ -2731,7 +3449,10 @@ async def process_problem(
                 saved_path=str(SOLUTIONS_DIR / filename),
                 publish_error=pub_res.error,
                 error=f"Publish retry failed: {pub_res.error}",
-                published=False
+                published=False,
+                repo_name=pub_res.repo_name,
+                repo_branch=pub_res.branch,
+                commit_hash=pub_res.commit_hash
             )
 
     # 1. Navigate to problem page
@@ -3166,7 +3887,10 @@ async def process_problem(
             saved_path=str(SOLUTIONS_DIR / filename),
             publish_error=pub_res.error,
             error=f"Publish failed: {pub_res.error}",
-            published=False
+            published=False,
+            repo_name=pub_res.repo_name,
+            repo_branch=pub_res.branch,
+            commit_hash=pub_res.commit_hash
         )
 
     print(f"✅ Completed processing: {url} (VERIFIED ACCEPTED & COMMITTED)\n")
@@ -3180,7 +3904,10 @@ async def process_problem(
         explanation=explanation,
         verdict=verdict,
         saved_path=str(SOLUTIONS_DIR / filename),
-        published=True
+        published=True,
+        repo_name=pub_res.repo_name,
+        repo_branch=pub_res.branch,
+        commit_hash=pub_res.commit_hash
     )
 
 async def ensure_live_page(page: Page, p_playwright=None, browser=None, context=None) -> Tuple[Any, Any, Page]:
@@ -3250,7 +3977,8 @@ async def solve_platform_quota(
     context = None
 ) -> Tuple[int, Any, Any, Page]:
     """Solves problems on the given platform until target_accepted ACCEPTED problems are achieved.
-    If a problem is not accepted by the judge, it immediately fetches a replacement problem.
+    If a problem is not accepted by the judge, it fetches replacement candidates using pagination.
+    Maintains per-platform quota independently without reallocation.
     """
     print(f"\n{'='*70}")
     print(f"🎯 STARTING QUOTA SOLVER: {platform.upper()} (Target: {target_accepted} ACCEPTED Java solutions)")
@@ -3269,43 +3997,73 @@ async def solve_platform_quota(
         print(f"❌ Unknown platform for quota solving: {platform}")
         return 0, browser, context, page
 
+    db = SolvedRegistry.get_db()
+    run_id = db.get_or_create_daily_run(platform, target_accepted)
+    worker_id = f"worker_{os.getpid()}_{id(asyncio.current_task()) if asyncio.current_task() else 0}"
+
     page._anti_bot_blocked = False
     accepted_count = 0
     attempt_count = 0
-    max_attempts = target_accepted * 3  # Up to 3x attempts to guarantee quota fulfillment
+    max_attempts = target_accepted * 4  # Bounded search limit per run
+    failed_in_run: Set[str] = set()    # Prevent repeating failed candidates in the same run
+    discovery_offset = 0
+    step_size = max(15, target_accepted * 2)
 
     browser, context, page = await ensure_live_page(page, p_playwright, browser, context)
-    candidate_pool = await disc_func(page, count=max_attempts, difficulty=difficulty)
+    candidate_pool = await disc_func(page, count=step_size, difficulty=difficulty, offset=discovery_offset)
+    discovery_offset += step_size
     pool_idx = 0
 
     while accepted_count < target_accepted and attempt_count < max_attempts:
         page._anti_bot_blocked = False
         if pool_idx >= len(candidate_pool):
-            print(f"⚠️ Exhausted initial candidate pool. Querying additional candidates for {platform}...")
+            print(f"⚠️ Exhausted candidate pool. Querying next batch of candidates for {platform} (offset={discovery_offset})...")
             browser, context, page = await ensure_live_page(page, p_playwright, browser, context)
-            more_candidates = await disc_func(page, count=max_attempts, difficulty=difficulty)
+            more_candidates = await disc_func(page, count=step_size, difficulty=difficulty, offset=discovery_offset)
+            discovery_offset += step_size
             for c in more_candidates:
-                if c not in candidate_pool:
+                _, cid = normalize_problem_identity(c, platform)
+                if c not in candidate_pool and cid not in failed_in_run:
                     candidate_pool.append(c)
             if pool_idx >= len(candidate_pool):
-                print(f"❌ No more unsolved candidates available for {platform}.")
+                print(f"❌ No further unsolved candidates available for {platform}.")
                 break
 
         url = candidate_pool[pool_idx]
         pool_idx += 1
 
-        if SolvedRegistry.is_solved(platform, url):
+        _, canonical_id = normalize_problem_identity(url, platform)
+
+        # Check in-memory run failure
+        if canonical_id in failed_in_run:
+            db.increment_daily_run_counts(run_id, skipped=1)
+            continue
+
+        # Check DB acceptance
+        if SolvedRegistry.is_solved(platform, canonical_id):
+            db.increment_daily_run_counts(run_id, skipped=1)
+            continue
+
+        # Check DB permanent failure
+        if db.is_permanent_failure(platform, canonical_id):
+            db.increment_daily_run_counts(run_id, skipped=1)
+            continue
+
+        # Transactional atomic claim
+        claimed = db.claim_problem(platform, canonical_id, url=url, worker_id=worker_id)
+        if not claimed:
+            print(f"   🔒 Problem {canonical_id} is claimed or already accepted. Skipping...")
+            db.increment_daily_run_counts(run_id, skipped=1)
             continue
 
         attempt_count += 1
+        db.increment_daily_run_counts(run_id, attempted=1)
         print(f"\n👉 [{platform.upper()}] Attempt {attempt_count}/{max_attempts} | Target Progress: {accepted_count}/{target_accepted} Accepted")
         print(f"   Solving: {url}")
 
-        # Ensure page and CDP connection are alive before attempting
         browser, context, page = await ensure_live_page(page, p_playwright, browser, context)
 
         try:
-            # 180s hard timeout per problem to prevent any infinite freeze
             result = await asyncio.wait_for(process_problem(page, url, mode=mode), timeout=180)
         except asyncio.TimeoutError:
             print(f"   ⏱️  Problem processing timed out after 180s for {url}. Recovering...")
@@ -3317,6 +4075,16 @@ async def solve_platform_quota(
         except Exception as e:
             print(f"   ❌ Unhandled error processing {url}: {e}")
             result = ProcessResult(stage=ProcessStage.SUBMITTED, success=False, url=url, error=str(e))
+
+        # Check stages reached
+        if result.stage.value in [ProcessStage.GENERATED.value, ProcessStage.COMPILED.value, ProcessStage.TESTED.value,
+                                  ProcessStage.SUBMITTED.value, ProcessStage.ACCEPTED.value, ProcessStage.PUBLISHED.value,
+                                  ProcessStage.PUBLISH_FAILED.value]:
+            db.increment_daily_run_counts(run_id, generated=1)
+        if result.stage.value in [ProcessStage.COMPILED.value, ProcessStage.TESTED.value,
+                                  ProcessStage.SUBMITTED.value, ProcessStage.ACCEPTED.value, ProcessStage.PUBLISHED.value,
+                                  ProcessStage.PUBLISH_FAILED.value]:
+            db.increment_daily_run_counts(run_id, compiled=1)
 
         # Check for publish failure on confirmed accepted solution: retry publishing without resubmitting
         if result.stage == ProcessStage.PUBLISH_FAILED and result.verdict and result.verdict.state == VerdictState.ACCEPTED:
@@ -3334,27 +4102,78 @@ async def solve_platform_quota(
         # Quota credit requires confirmed publication in submit/both modes
         is_successful = (result.success and result.published) if mode in ["submit", "both"] else result.success
 
+        err_msg = result.error or (result.verdict.message if result.verdict else None)
+        transient = is_transient_error(err_msg)
+
+        attempt_id = db.record_attempt(
+            platform=platform,
+            canonical_id=canonical_id,
+            run_id=run_id,
+            stage=result.stage,
+            mode=mode,
+            solution_code=result.solution_code,
+            explanation=result.explanation,
+            error=err_msg,
+            is_transient=transient
+        )
+
         if is_successful:
             accepted_count += 1
-            SolvedRegistry.mark_solved(platform, url)
+            db.increment_daily_run_counts(run_id, accepted=1)
+            if result.published:
+                db.increment_daily_run_counts(run_id, published=1)
+                db.record_publish_job(
+                    platform=platform,
+                    canonical_id=canonical_id,
+                    attempt_id=attempt_id,
+                    repo_name=result.repo_name,
+                    branch=result.repo_branch,
+                    commit_hash=result.commit_hash,
+                    status="PUBLISHED"
+                )
+            SolvedRegistry.mark_solved(platform, url, verdict=result.verdict)
             print(f"🎉 [{platform.upper()}] Progress: {accepted_count}/{target_accepted} ACCEPTED & COMMITTED TO GITHUB!\n")
             await asyncio.sleep(6)
         else:
-            if getattr(page, "_anti_bot_blocked", False):
-                page._anti_bot_blocked = False
-                print(f"\n🛑 [{platform.upper()}] Platform is gated by Cloudflare Anti-Bot verification.")
-                print(f"🛑 Stopping {platform.upper()} attempts immediately to avoid continuous looping.")
-                print(f"📁 Generated Java solution has been saved to: {SOLUTIONS_DIR.resolve()}\n")
-                break
+            failed_in_run.add(canonical_id)
+            db.increment_daily_run_counts(run_id, failed=1)
+            status_to_record = "PUBLISH_FAILED" if result.stage == ProcessStage.PUBLISH_FAILED else "FAILED"
+            db.release_problem(
+                platform=platform,
+                canonical_id=canonical_id,
+                status=status_to_record,
+                failure_reason=err_msg,
+                is_transient=transient
+            )
             if result.stage == ProcessStage.PUBLISH_FAILED:
+                db.record_publish_job(
+                    platform=platform,
+                    canonical_id=canonical_id,
+                    attempt_id=attempt_id,
+                    repo_name=result.repo_name,
+                    branch=result.repo_branch,
+                    commit_hash=result.commit_hash,
+                    status="FAILED",
+                    error=result.publish_error
+                )
                 print(f"⚠️ [{platform.upper()}] Problem was accepted by judge, but GitHub publishing failed ({result.publish_error}).")
             else:
                 print(f"⚠️ [{platform.upper()}] Problem was NOT accepted by the judge ({result.error or 'rejected'}).")
-            print(f"🔄 Selecting next unsolved replacement problem to guarantee {target_accepted} accepted solutions...\n")
+
+            if getattr(page, "_anti_bot_blocked", False):
+                page._anti_bot_blocked = False
+                print(f"\n🛑 [{platform.upper()}] Platform is gated by Cloudflare Anti-Bot verification.")
+                print(f"🛑 Stopping {platform.upper()} attempts to avoid continuous looping.")
+                print(f"📁 Generated Java solution has been saved to: {SOLUTIONS_DIR.resolve()}\n")
+                break
+
+            print(f"🔄 Selecting next unsolved replacement candidate (offset={discovery_offset})...\n")
 
         await asyncio.sleep(3)
 
-    print(f"\n📊 [{platform.upper()}] Quota Summary: {accepted_count}/{target_accepted} problems successfully solved & committed.")
+    run_status = "COMPLETED" if accepted_count >= target_accepted else "SHORTFALL"
+    db.complete_daily_run(run_id, status=run_status)
+    print(f"\n📊 [{platform.upper()}] Quota Summary: {accepted_count}/{target_accepted} verified accepted solutions ({run_status}).")
     return accepted_count, browser, context, page
 
 async def execute_batch(
@@ -3497,8 +4316,9 @@ async def execute_batch(
             else:
                 all_platforms = [p.strip().lower() for p in platform.split(",") if p.strip()]
             target_total = count * len(all_platforms)
-            print(f"\n📊 Starting autonomous quota run: {count} ACCEPTED problems on EACH of the {len(all_platforms)} platforms ({target_total} total)...")
+            print(f"\n📊 Starting independent quota run: {count} verified ACCEPTED problems on EACH of the {len(all_platforms)} platforms ({target_total} total)...")
             platform_results = {}
+            platform_targets = {}
             for p_name in all_platforms:
                 acc, browser, context, page = await solve_platform_quota(
                     page, p_name, target_accepted=count, difficulty=difficulty, mode=mode,
@@ -3506,38 +4326,29 @@ async def execute_batch(
                 )
                 total_accepted += acc
                 platform_results[p_name] = acc
+                platform_targets[p_name] = count
 
-            # Fail-safe quota guarantee: If any platform encountered issues (e.g. anti-bot gate, judge maintenance),
-            # reallocate the deficit to operational platforms to GUARANTEE 100% quota fulfillment.
-            deficit = target_total - total_accepted
-            if deficit > 0:
-                print(f"\n" + "=" * 70)
-                print(f"⚠️  Quota deficit detected: {total_accepted}/{target_total} achieved ({deficit} missing).")
-                print(f"🛡️  FAIL-SAFE REALLOCATION: Solving remaining {deficit} problems on healthy platforms...")
-                print("=" * 70)
-
-                successful = [p for p in all_platforms if platform_results.get(p, 0) > 0]
-                fallback_pool = successful if successful else ["hackerrank", "codechef", "hackerearth", "leetcode"]
-
-                for p_name in fallback_pool:
-                    if total_accepted >= target_total:
-                        break
-                    needed = min(deficit, target_total - total_accepted)
-                    print(f"\n🎯 [REALLOCATION] Solving {needed} additional problem(s) on {p_name.upper()}...")
-                    extra, browser, context, page = await solve_platform_quota(
-                        page, p_name, target_accepted=needed, difficulty=difficulty, mode=mode,
-                        p_playwright=p, browser=browser, context=context
-                    )
-                    total_accepted += extra
-
-            print(f"\n🏆 COMPLETED! {total_accepted}/{target_total} total problems verified Accepted & committed to GitHub!")
+            print("\n" + "=" * 70)
+            print("📊 INDEPENDENT PLATFORM QUOTA REPORT")
+            print("=" * 70)
+            all_satisfied = True
+            for p_name in all_platforms:
+                achieved = platform_results.get(p_name, 0)
+                targeted = platform_targets.get(p_name, count)
+                status_mark = "✅ Achieved" if achieved >= targeted else "❌ Deficit"
+                if achieved < targeted:
+                    all_satisfied = False
+                print(f"   {p_name.upper():<14}: {achieved}/{targeted} accepted [{status_mark}]")
+            print("=" * 70)
+            print(f"\n📊 SUMMARY: {total_accepted}/{target_total} total problems verified Accepted across all platforms.")
         else:
             target_total = count
             total_accepted, browser, context, page = await solve_platform_quota(
                 page, platform, target_accepted=count, difficulty=difficulty, mode=mode,
                 p_playwright=p, browser=browser, context=context
             )
-            print(f"\n🏆 {platform.upper()} COMPLETED! {total_accepted}/{count} problems verified Accepted & committed to GitHub!")
+            all_satisfied = (total_accepted >= target_total)
+            print(f"\n📊 {platform.upper()} SUMMARY: {total_accepted}/{count} problems verified Accepted.")
 
         elapsed = (datetime.now() - start_time).total_seconds()
         print("\n" + "=" * 70)
@@ -3576,7 +4387,13 @@ async def execute_batch(
             except Exception:
                 pass
 
-        batch_success = (total_accepted >= target_total) if target_total > 0 else True
+        if platform == "all" or "," in platform:
+            batch_success = all_satisfied
+        elif target_total > 0:
+            batch_success = (total_accepted >= target_total)
+        else:
+            batch_success = True
+
         if not batch_success:
             print(f"\n⚠️  Batch quota shortfall: {total_accepted}/{target_total} completed.")
         return batch_success
@@ -3616,15 +4433,20 @@ async def run_daily_scheduler(scheduled_time_str: str, batch_coro_func):
 # ==============================================================================
 # CLI Helper Utilities & Subcommands
 # ==============================================================================
-def print_status_summary():
-    """Prints a beautiful summary table of solved problems across all platforms."""
+def print_status_summary(db: Optional[DatabaseManager] = None):
+    """Prints a clear, human-readable summary table of verified solved problems and daily quotas."""
+    database = db or SolvedRegistry.get_db()
     all_solved = SolvedRegistry.get_all_solved(force_refresh=True)
-    print("\n" + "=" * 68)
-    print("      📊 AutoCoder AI: Solved Problems Status & Registry")
-    print("=" * 68)
-    print(f"  {'Platform':<16} {'Status':<14} {'Verified Count':>16}")
-    print("  " + "─" * 64)
-    total = 0
+    stats = database.get_all_time_stats()
+    today_str = get_kolkata_today_str()
+    daily_rows = database.get_daily_summary(today_str)
+
+    print("\n" + "=" * 76)
+    print("      📊 AutoCoder AI: Verified Solved Status & Quota Summary")
+    print(f"      Timezone: Asia/Kolkata | Date: {today_str}")
+    print("=" * 76)
+    print(f"  {'Platform':<14} {'Verified Accepted':>18} {'Confirmed Published':>20} {'Legacy Unverified':>18}")
+    print("  " + "─" * 72)
     display_names = {
         "leetcode": "LeetCode",
         "codeforces": "Codeforces",
@@ -3632,19 +4454,39 @@ def print_status_summary():
         "codechef": "CodeChef",
         "hackerearth": "HackerEarth",
     }
+    tot_acc = 0
+    tot_pub = 0
+    tot_unv = 0
     for p, name in display_names.items():
-        cnt = len(all_solved.get(p, set()))
-        total += cnt
-        status_icon = "🟢 Active" if cnt > 0 else "⚪ None yet"
-        print(f"  {name:<16} {status_icon:<14} {cnt:>12} solved")
-    print("  " + "─" * 64)
-    print(f"  {'TOTAL':<16} {'🏆 Accepted':<14} {total:>12} problems")
-    print("=" * 68)
-    print(f"  📁 Solved Registry : {HISTORY_FILE.resolve()}")
+        p_stats = stats.get(p, {})
+        acc = p_stats.get("accepted", len(all_solved.get(p, set())))
+        pub = p_stats.get("published", 0)
+        unv = p_stats.get("unverified", 0)
+        tot_acc += acc
+        tot_pub += pub
+        tot_unv += unv
+        print(f"  {name:<14} {acc:>18} {pub:>20} {unv:>18}")
+    print("  " + "─" * 72)
+    print(f"  {'TOTAL':<14} {tot_acc:>18} {tot_pub:>20} {tot_unv:>18}")
+    print("=" * 76)
+
+    print(f"\n  📅 Today's Quota Runs ({today_str} Asia/Kolkata):")
+    if daily_rows:
+        print(f"  {'Platform':<14} {'Target':>7} {'Attempted':>10} {'Generated':>10} {'Compiled':>9} {'Accepted':>9} {'Published':>10} {'Failed':>7} {'Skipped':>8} {'Status':<10}")
+        print("  " + "─" * 98)
+        for r in daily_rows:
+            p = display_names.get(r.get("platform", ""), r.get("platform", "").upper())
+            print(f"  {p:<14} {r.get('target_quota', 0):>7} {r.get('attempted_count', 0):>10} {r.get('generated_count', 0):>10} {r.get('compiled_count', 0):>9} {r.get('accepted_count', 0):>9} {r.get('published_count', 0):>10} {r.get('failed_count', 0):>7} {r.get('skipped_count', 0):>8} {r.get('status', ''):<10}")
+    else:
+        print("  (No runs recorded yet today)")
+
+    print("\n" + "=" * 76)
+    print(f"  📁 SQLite Database  : {DEFAULT_DB_FILE.resolve()}")
+    print(f"  📁 Solved Registry  : {HISTORY_FILE.resolve()}")
     print(f"  📁 Solution Files   : {SOLUTIONS_DIR.resolve()}")
     if GITHUB_USERNAME:
         print(f"  🐙 GitHub Profile   : https://github.com/{GITHUB_USERNAME}")
-    print("=" * 68 + "\n")
+    print("=" * 76 + "\n")
 
 def interactive_config_wizard():
     """Interactively configures or updates API keys and competitive programming handles."""
@@ -3804,7 +4646,16 @@ async def main():
         action="store_true",
         help="Run browser in headless mode (recommended for scheduled/daemon execution)"
     )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Display verified solved history, daily quotas (Asia/Kolkata), and database summary"
+    )
     args = parser.parse_args()
+
+    if args.status:
+        print_status_summary()
+        return 0
 
     if not GEMINI_API_KEY:
         print("\n" + "=" * 70)

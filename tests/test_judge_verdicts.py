@@ -11,6 +11,13 @@ from bot import (
     ProcessStage,
     ProcessResult,
     PublishResult,
+    DatabaseManager,
+    SolvedRegistry,
+    normalize_problem_identity,
+    get_kolkata_now,
+    get_kolkata_today_str,
+    is_transient_error,
+    print_status_summary,
     get_repo_default_branch,
     PollingConfig,
     poll_with_backoff,
@@ -26,6 +33,16 @@ from bot import (
     SUBMISSIONS_LOG_FILE,
     SOLUTIONS_DIR,
 )
+
+@pytest.fixture(autouse=True)
+def isolated_db(tmp_path):
+    """Provides a pristine, isolated SQLite database for each test to guarantee no state pollution."""
+    test_db_path = tmp_path / "autocoder_test.db"
+    test_db = DatabaseManager(db_path=test_db_path, auto_migrate=False)
+    old_db = SolvedRegistry._db
+    SolvedRegistry.set_db(test_db)
+    yield test_db
+    SolvedRegistry.set_db(old_db)
 
 class MockLocator:
     def __init__(self, visible=True):
@@ -1243,7 +1260,7 @@ async def test_solve_platform_quota_retries_publish_and_credits_quota():
         acc, _, _, _ = await solve_platform_quota(page, "leetcode", target_accepted=1, mode="both")
         assert acc == 1
         assert call_count == 2
-        mock_mark.assert_called_once_with("leetcode", "https://leetcode.com/problems/two-sum")
+        mock_mark.assert_called_once_with("leetcode", "https://leetcode.com/problems/two-sum", verdict=accepted_verdict)
 
 
 @pytest.mark.asyncio
@@ -1299,5 +1316,237 @@ async def test_execute_batch_returns_boolean_reflecting_quota_completion():
              patch("urllib.request.urlopen"):
             success = await execute_batch(platform="leetcode", count=3, difficulty="medium", mode="both", headless=True)
             assert success is False
+
+
+# ==============================================================================
+# Prompt 3 Tests: Duplicate Detection, Solved History, Quotas & Storage
+# ==============================================================================
+
+def test_existing_unverified_local_file_does_not_count_as_accepted(tmp_path):
+    """Verify that mere existence of a .java file or directory does not count as accepted."""
+    # Create fake local solutions
+    fake_solution = SOLUTIONS_DIR / "LeetCode_FakeProblem_Solution.java"
+    try:
+        SOLUTIONS_DIR.mkdir(parents=True, exist_ok=True)
+        fake_solution.write_text("// dummy unverified solution", encoding="utf-8")
+
+        # Check via SolvedRegistry
+        assert SolvedRegistry.is_solved("leetcode", "fake-problem") is False
+        assert SolvedRegistry.is_accepted("leetcode", "fake-problem") is False
+        all_solved = SolvedRegistry.get_all_solved()
+        assert "fake_problem" not in all_solved.get("leetcode", set())
+        assert "fake-problem" not in all_solved.get("leetcode", set())
+    finally:
+        if fake_solution.exists():
+            fake_solution.unlink()
+
+
+def test_duplicate_urls_normalize_to_one_problem():
+    """Verify that multiple query parameter variations, hash fragments, and subpaths normalize to the canonical ID."""
+    url_variations = [
+        ("https://leetcode.com/problems/two-sum", "leetcode", "two-sum"),
+        ("https://leetcode.com/problems/two-sum/", "leetcode", "two-sum"),
+        ("https://leetcode.com/problems/two-sum/description/?envType=study-plan", "leetcode", "two-sum"),
+        ("https://leetcode.com/problems/two-sum#solution", "leetcode", "two-sum"),
+        ("https://codeforces.com/problemset/problem/4/A", "codeforces", "4A"),
+        ("https://codeforces.com/problemset/problem/4/A/", "codeforces", "4A"),
+        ("https://www.hackerrank.com/challenges/simple-array-sum/problem?isFullScreen=true", "hackerrank", "simple-array-sum"),
+        ("https://www.hackerrank.com/challenges/simple-array-sum", "hackerrank", "simple-array-sum"),
+        ("https://www.codechef.com/problems/FLOW001?tab=statement", "codechef", "FLOW001"),
+        ("https://www.codechef.com/problems/FLOW001/", "codechef", "FLOW001"),
+        ("https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/zoos-06063825/", "hackerearth", "zoos-06063825"),
+    ]
+
+    for raw_url, expected_plat, expected_canon in url_variations:
+        plat, canon = normalize_problem_identity(raw_url, expected_plat)
+        assert plat == expected_plat, f"Failed plat for {raw_url}: got {plat}"
+        assert canon == expected_canon, f"Failed canon for {raw_url}: got {canon}"
+
+
+def test_two_workers_cannot_claim_same_problem_simultaneously(tmp_path):
+    """Verify transactional locking prevents two workers from claiming the same problem simultaneously."""
+    db = DatabaseManager(db_path=tmp_path / "claim_test.db", auto_migrate=False)
+
+    # Worker 1 claims the problem
+    c1 = db.claim_problem("leetcode", "trapping-rain-water", "https://leetcode.com/problems/trapping-rain-water", worker_id="worker_alpha")
+    assert c1 is True
+
+    # Worker 2 attempts to claim while lease is active
+    c2 = db.claim_problem("leetcode", "trapping-rain-water", "https://leetcode.com/problems/trapping-rain-water", worker_id="worker_beta")
+    assert c2 is False
+
+    # Worker 1 can re-acquire its own lease
+    c1_again = db.claim_problem("leetcode", "trapping-rain-water", "https://leetcode.com/problems/trapping-rain-water", worker_id="worker_alpha")
+    assert c1_again is True
+
+    # After being marked ACCEPTED, neither worker can claim it
+    db.mark_problem_accepted("leetcode", "trapping-rain-water", "https://leetcode.com/problems/trapping-rain-water")
+    c3 = db.claim_problem("leetcode", "trapping-rain-water", "https://leetcode.com/problems/trapping-rain-water", worker_id="worker_gamma")
+    assert c3 is False
+
+
+def test_failed_candidate_is_not_retried_endlessly(tmp_path):
+    """Verify that failure count accumulates and permanent failures are excluded from candidate pools."""
+    db = DatabaseManager(db_path=tmp_path / "failure_test.db", auto_migrate=False)
+
+    # Transient failures accumulate up to max_failures (3)
+    assert db.is_permanent_failure("codeforces", "100_a") is False
+
+    db.release_problem("codeforces", "100_a", status="FAILED", failure_reason="Temporary rate limit", is_transient=True)
+    assert db.is_permanent_failure("codeforces", "100_a") is False
+
+    db.release_problem("codeforces", "100_a", status="FAILED", failure_reason="Gateway 504 timeout", is_transient=True)
+    assert db.is_permanent_failure("codeforces", "100_a") is False
+
+    # Third failure hits threshold -> permanently excluded
+    db.release_problem("codeforces", "100_a", status="FAILED", failure_reason="Third timeout", is_transient=True)
+    assert db.is_permanent_failure("codeforces", "100_a") is True
+
+    # Direct REJECTED or FAILED status is immediately permanent
+    db.release_problem("codeforces", "200_b", status="REJECTED", failure_reason="Wrong Answer on test 4", is_transient=False)
+    assert db.is_permanent_failure("codeforces", "200_b") is True
+
+
+@pytest.mark.asyncio
+async def test_five_accepted_on_one_platform_cannot_satisfy_another_platform_quota():
+    """Verify that meeting or exceeding quota on one platform does not fulfill other platforms' quotas."""
+    with patch("bot.async_playwright") as mock_playwright:
+        mock_p = MagicMock()
+        mock_browser = MagicMock()
+        mock_browser.pages = []
+        mock_browser.new_page = AsyncMock()
+        mock_browser.close = AsyncMock()
+        mock_browser.add_init_script = AsyncMock()
+        mock_p.chromium.launch_persistent_context = AsyncMock(return_value=mock_browser)
+        mock_p.chromium.connect_over_cdp = AsyncMock(return_value=mock_browser)
+        mock_playwright.return_value.__aenter__.return_value = mock_p
+
+        # Simulate: LeetCode has 5 accepted, but Codeforces, HackerRank, CodeChef, and HackerEarth have 0
+        async def mock_solve_quota(page, plat, target_accepted=5, **kwargs):
+            if plat == "leetcode":
+                return 5, None, None, None
+            return 0, None, None, None
+
+        with patch("bot.solve_platform_quota", side_effect=mock_solve_quota), \
+             patch("urllib.request.urlopen"):
+            # Target is 5 per platform across all 5 platforms (total 25)
+            # 5 on LeetCode cannot satisfy the other 4 platforms!
+            success = await execute_batch(platform="all", count=5, difficulty="medium", mode="both", headless=True)
+            assert success is False
+
+
+def test_restart_preserves_progress(tmp_path):
+    """Verify that restarting the bot preserves verified solved status and daily run history."""
+    db_file = tmp_path / "persistence_test.db"
+
+    # Session 1: Record 2 accepted problems and 1 daily run
+    db1 = DatabaseManager(db_path=db_file, auto_migrate=False)
+    v1 = SubmissionVerdict(VerdictState.ACCEPTED, "Accepted", submission_id="sub_p1")
+    v2 = SubmissionVerdict(VerdictState.ACCEPTED, "Accepted", submission_id="sub_p2")
+    db1.mark_problem_accepted("hackerrank", "sherlock-and-valid-string", "https://hackerrank.com/challenges/sherlock-and-valid-string", verdict=v1)
+    db1.mark_problem_accepted("hackerrank", "almost-sorted", "https://hackerrank.com/challenges/almost-sorted", verdict=v2)
+
+    run_id = db1.get_or_create_daily_run("hackerrank", target_quota=5, run_date="2026-11-12")
+    db1.increment_daily_run_counts(run_id, attempted=2, generated=2, compiled=2, accepted=2, published=2)
+
+    # Session 2: Fresh instance pointing to the same SQLite file
+    db2 = DatabaseManager(db_path=db_file, auto_migrate=False)
+    assert db2.is_accepted("hackerrank", "sherlock-and-valid-string") is True
+    assert db2.is_accepted("hackerrank", "almost-sorted") is True
+    assert db2.is_accepted("hackerrank", "unknown-challenge") is False
+
+    summary = db2.get_daily_summary("2026-11-12")
+    assert len(summary) == 1
+    row = summary[0]
+    assert row["platform"] == "hackerrank"
+    assert row["target_quota"] == 5
+    assert row["accepted_count"] == 2
+    assert row["published_count"] == 2
+
+
+def test_migration_preserves_existing_history_without_inventing_acceptance(tmp_path):
+    """Verify that migration imports solved_history.json but marks entries without verified evidence as UNVERIFIED."""
+    db_file = tmp_path / "migration_test.db"
+    hist_file = tmp_path / "solved_history.json"
+    subs_file = tmp_path / "submissions.jsonl"
+
+    # Legacy history contains 4 problems
+    history_content = {
+        "leetcode": ["two_sum", "reverse_integer"],
+        "codeforces": ["4_a", "71_a"]
+    }
+    hist_file.write_text(json.dumps(history_content), encoding="utf-8")
+
+    # Only "two-sum" and "4_a" have confirmed judge ACCEPTED evidence in submissions.jsonl
+    subs_lines = [
+        json.dumps({
+            "timestamp": "2026-11-12T10:00:00",
+            "platform": "leetcode",
+            "url": "https://leetcode.com/problems/two-sum/",
+            "submission_id": "sub_ev_1",
+            "verdict": "ACCEPTED",
+            "message": "Accepted"
+        }),
+        json.dumps({
+            "timestamp": "2026-11-12T10:05:00",
+            "platform": "codeforces",
+            "url": "https://codeforces.com/problemset/problem/4/A",
+            "submission_id": "sub_ev_2",
+            "verdict": "ACCEPTED",
+            "message": "OK"
+        })
+    ]
+    subs_file.write_text("\n".join(subs_lines) + "\n", encoding="utf-8")
+
+    db = DatabaseManager(db_path=db_file, auto_migrate=False)
+    db.migrate_from_solved_history_if_needed(history_file=hist_file, submissions_file=subs_file)
+
+    # Verified entries with judge evidence qualify as ACCEPTED
+    assert db.is_accepted("leetcode", "two_sum") is True
+    assert db.is_accepted("codeforces", "4_a") is True
+
+    # Legacy entries WITHOUT judge evidence are preserved as UNVERIFIED and do NOT count as ACCEPTED
+    assert db.is_accepted("leetcode", "reverse_integer") is False
+    assert db.is_accepted("codeforces", "71_a") is False
+
+    stats = db.get_all_time_stats()
+    assert stats["leetcode"]["accepted"] == 1
+    assert stats["leetcode"]["unverified"] == 1
+    assert stats["codeforces"]["accepted"] == 1
+    assert stats["codeforces"]["unverified"] == 1
+
+
+def test_daily_quota_boundaries_use_kolkata_timezone():
+    """Verify that daily quota date boundaries are strictly calculated in Asia/Kolkata timezone."""
+    now_kolkata = get_kolkata_now()
+    today_str = get_kolkata_today_str()
+
+    assert now_kolkata.tzinfo is not None
+    assert "Kolkata" in str(now_kolkata.tzinfo)
+    assert len(today_str) == 10
+    assert today_str == now_kolkata.strftime("%Y-%m-%d")
+
+
+def test_print_status_summary_command(capsys, tmp_path):
+    """Verify the status command generates a human-readable report with verified metrics."""
+    db_file = tmp_path / "status_test.db"
+    db = DatabaseManager(db_path=db_file, auto_migrate=False)
+
+    # Insert test data
+    v = SubmissionVerdict(VerdictState.ACCEPTED, "Accepted", submission_id="sub_stat")
+    db.mark_problem_accepted("leetcode", "merge-two-sorted-lists", "https://leetcode.com/problems/merge-two-sorted-lists", verdict=v)
+    run_id = db.get_or_create_daily_run("leetcode", target_quota=5)
+    db.increment_daily_run_counts(run_id, attempted=1, generated=1, compiled=1, accepted=1, published=1)
+
+    print_status_summary(db)
+    captured = capsys.readouterr().out
+
+    assert "AutoCoder AI: Verified Solved Status & Quota Summary" in captured
+    assert "Asia/Kolkata" in captured
+    assert "LeetCode" in captured
+    assert "Verified Accepted" in captured
+    assert "Confirmed Published" in captured
+    assert "Legacy Unverified" in captured
+
 
 

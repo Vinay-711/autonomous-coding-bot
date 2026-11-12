@@ -16,6 +16,9 @@ logs/
 solutions/
 repos/
 solved_history.json
+*.db
+*.db-shm
+*.db-wal
 
 # Python cache and compiled files
 __pycache__/
