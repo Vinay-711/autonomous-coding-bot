@@ -2422,9 +2422,10 @@ class DatabaseManager:
             locked_at = row[5]
 
             # If quota is already met, avoid duplicate runs
-            if status == "COMPLETED" and accepted_count >= existing_target:
+            effective_target = max(existing_target, target_quota)
+            if status == "COMPLETED" and accepted_count >= effective_target:
                 self._execute(conn, "COMMIT")
-                log_event("INFO", f"Daily quota for {platform} on {r_date} is already completed ({accepted_count}/{existing_target}). Skipping duplicate run.")
+                log_event("INFO", f"Daily quota for {platform} on {r_date} is already completed ({accepted_count}/{effective_target}). Skipping duplicate run.")
                 return None
 
             # If locked by another worker and lock is still active
@@ -2441,14 +2442,20 @@ class DatabaseManager:
                 conn,
                 """
                 UPDATE daily_runs
-                SET locked_by = ?, locked_at = ?, status = 'IN_PROGRESS'
+                SET locked_by = ?, locked_at = ?, target_quota = ?, status = 'IN_PROGRESS'
                 WHERE id = ?
                 """,
-                (worker_id, now, run_id)
+                (worker_id, now, effective_target, run_id)
             )
             self._execute(conn, "COMMIT")
             log_event("INFO", f"Acquired lock on daily run {run_id} for {platform} (worker={worker_id})")
             return run_id
+
+    def get_daily_run_accepted_count(self, run_id: int) -> int:
+        with self.get_connection() as conn:
+            cur = self._execute(conn, "SELECT accepted_count FROM daily_runs WHERE id = ?", (run_id,))
+            row = cur.fetchone()
+            return (row[0] or 0) if row else 0
 
     def release_daily_run_lock(self, run_id: int):
         with self.get_connection() as conn:
@@ -7115,7 +7122,7 @@ async def solve_platform_quota(
 
     if page:
         page._anti_bot_blocked = False
-    accepted_count = 0
+    accepted_count = db.get_daily_run_accepted_count(run_id)
     attempt_count = 0
     max_attempts = target_accepted * 4  # Bounded search limit per run
     failed_in_run: Set[str] = set()    # Prevent repeating failed candidates in the same run
