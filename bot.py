@@ -554,28 +554,46 @@ async def detect_security_challenge_or_captcha(page: Page) -> SecurityChallengeD
 
     # 2. DOM-based challenge and CAPTCHA indicators
     check_js = """() => {
-        // Cloudflare Turnstile / IUAM
-        const cf = document.querySelector('iframe[src*="cloudflare"], iframe[src*="turnstile"], .cf-turnstile, input[name="turnstileToken"], input[name="cf-turnstile-response"], #cf-wrapper, .cf-browser-verification');
-        if (cf) return { detected: true, type: 'cloudflare_turnstile', details: 'Cloudflare Turnstile or IUAM challenge detected in DOM' };
-
-        // Title checks
+        // Cloudflare IUAM / Turnstile full-page challenge or interstitial
         const title = (document.title || '').toLowerCase();
         if (title.includes('just a moment') || title.includes('attention required') || title.includes('security check')) {
             return { detected: true, type: 'cloudflare_iuam', details: `Challenge page title: ${document.title}` };
         }
 
-        // Google reCAPTCHA
-        const recaptcha = document.querySelector('iframe[src*="recaptcha"], .g-recaptcha, #g-recaptcha, div[class*="recaptcha"]');
-        if (recaptcha) return { detected: true, type: 'recaptcha', details: 'Google reCAPTCHA iframe or container detected' };
+        const cfChallenge = document.querySelector('#challenge-running, #cf-challenge-running, #challenge-form, .cf-browser-verification, #cf-wrapper #challenge-stage, #challenge-stage');
+        if (cfChallenge) {
+            return { detected: true, type: 'cloudflare_turnstile', details: 'Cloudflare Turnstile or IUAM challenge container detected' };
+        }
+
+        // Active Turnstile interactive challenge or turnstileToken gate (only if main content is absent)
+        const turnstileIframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+        if (turnstileIframe) {
+            const hasContent = !!document.querySelector('.problem-statement, #pageContent, div[class*="description"], .challenge-body-html, div[class*="overflow-y-auto"]');
+            if (!hasContent) {
+                return { detected: true, type: 'cloudflare_turnstile', details: 'Blocking Cloudflare Turnstile challenge iframe detected' };
+            }
+        }
+
+        // Google reCAPTCHA (interactive challenge puzzle only, ignore invisible footer badge)
+        const recaptchaFrame = document.querySelector('iframe[src*="recaptcha/api2/bframe"], iframe[src*="recaptcha"][title*="challenge"]');
+        const normalRecaptcha = document.querySelector('.g-recaptcha:not([data-size="invisible"]), #g-recaptcha:not([data-size="invisible"])');
+        if (recaptchaFrame || normalRecaptcha) {
+            return { detected: true, type: 'recaptcha', details: 'Google reCAPTCHA interactive challenge detected' };
+        }
 
         // hCaptcha
-        const hcaptcha = document.querySelector('iframe[src*="hcaptcha"], .h-captcha, div[class*="hcaptcha"]');
-        if (hcaptcha) return { detected: true, type: 'hcaptcha', details: 'hCaptcha iframe or container detected' };
+        const hcaptcha = document.querySelector('iframe[src*="assets.hcaptcha.com/check"], iframe[data-hcaptcha-widget-id]');
+        if (hcaptcha) {
+            return { detected: true, type: 'hcaptcha', details: 'hCaptcha iframe or container detected' };
+        }
 
-        // Generic anti-bot / captcha text
+        // Generic anti-bot / captcha text (only if main content is absent)
         const bodyText = (document.body ? document.body.innerText || '' : '').toLowerCase();
         if (bodyText.includes('please verify you are a human') || bodyText.includes('confirm you are human') || bodyText.includes('complete the security check')) {
-            return { detected: true, type: 'generic_captcha', details: 'Human verification prompt detected in page text' };
+            const hasContent = !!document.querySelector('.problem-statement, #pageContent, div[class*="description"], .challenge-body-html, div[class*="overflow-y-auto"]');
+            if (!hasContent) {
+                return { detected: true, type: 'generic_captcha', details: 'Human verification prompt detected in page text' };
+            }
         }
 
         return { detected: false };
@@ -603,8 +621,12 @@ async def check_live_or_rated_contest(page: Page, url: str, platform_type: str) 
             if (timer && (timer.innerText || '').trim().length > 0) {
                 return { is_live: true, reason: `Active countdown timer detected: ${timer.innerText.trim()}` };
             }
-            const liveBadge = document.querySelector('.live-contest-banner, .contest-status-live, div:has-text("Contest is running")');
+            const liveBadge = document.querySelector('.live-contest-banner, .contest-status-live');
             if (liveBadge) {
+                return { is_live: true, reason: 'Live contest banner detected' };
+            }
+            const hasLiveText = Array.from(document.querySelectorAll('div, span')).some(d => (d.innerText || '').includes('Contest is running'));
+            if (hasLiveText) {
                 return { is_live: true, reason: 'Live contest banner detected' };
             }
             return { is_live: false };
@@ -6278,7 +6300,8 @@ class LeetCodeAdapter(BasePlatformAdapter):
 
     async def check_auth_state(self, page: Page) -> AuthStateResult:
         js = """() => {
-            const hasLogin = !!document.querySelector('a[href*="/accounts/login"], a:has-text("Sign in")');
+            const hasLogin = !!document.querySelector('a[href*="/accounts/login"]') ||
+                             Array.from(document.querySelectorAll('a, button')).some(el => (el.innerText || '').trim().toLowerCase() === 'sign in');
             const hasAuth = !!document.querySelector('[data-cypress="UserAvatar"], #navbar_user_avatar, .avatar, a[href*="/profile/"]');
             if (hasAuth) return 'LOGGED_IN';
             if (hasLogin) return 'LOGGED_OUT';
@@ -6384,8 +6407,9 @@ class HackerRankAdapter(BasePlatformAdapter):
 
     async def check_auth_state(self, page: Page) -> AuthStateResult:
         js = """() => {
-            const hasAuth = !!document.querySelector('.avatar, [data-analytics="NavBarProfileAvatar"], a[href*="/profile/"]');
-            const hasLogin = !!document.querySelector('a[href*="/auth/login"], a:has-text("Log In")');
+            const hasAuth = !!document.querySelector('.avatar, [data-analytics="NavBarProfileAvatar"], a[href*="/profile/"], [data-analytics="NavBarProfile"], .profile-icon') ||
+                            (document.body && document.body.innerText.includes('Rank:'));
+            const hasLogin = !!document.querySelector('a[href*="/auth/login"], a[href*="/login"]') && !hasAuth;
             if (hasAuth) return 'LOGGED_IN';
             if (hasLogin) return 'LOGGED_OUT';
             return 'UNKNOWN';
@@ -6432,8 +6456,9 @@ class CodeChefAdapter(BasePlatformAdapter):
 
     async def check_auth_state(self, page: Page) -> AuthStateResult:
         js = """() => {
-            const hasAuth = !!document.querySelector('a[href*="/logout"], .user-details, .profile-image');
-            const hasLogin = !!document.querySelector('a[href*="/login"], a:has-text("Log In")');
+            const hasAuth = !!document.querySelector('a[href*="/logout"], .user-details, .profile-image, a[href*="/users/"], [class*="user-menu"], [class*="profile-menu"]') ||
+                            Array.from(document.querySelectorAll('a')).some(a => (a.innerText || '').trim() === 'My Profile');
+            const hasLogin = !!document.querySelector('a[href*="/login"]') && !hasAuth;
             if (hasAuth) return 'LOGGED_IN';
             if (hasLogin) return 'LOGGED_OUT';
             return 'UNKNOWN';
@@ -6460,6 +6485,9 @@ class HackerEarthAdapter(BasePlatformAdapter):
         "div[class*='problem-description']",
         "div[class*='problem-statement']",
         "[data-slot='card']",
+        "div.flex-1.overflow-y-auto",
+        "[role='tabpanel']",
+        "div[class*='overflow-y-auto']",
     ]
     run_selectors = [
         "button:has-text('Compile & Test')",
@@ -6477,8 +6505,9 @@ class HackerEarthAdapter(BasePlatformAdapter):
 
     async def check_auth_state(self, page: Page) -> AuthStateResult:
         js = """() => {
-            const hasAuth = !!document.querySelector('a[href*="/logout"], .user-avatar, img[alt*="profile"]');
-            const hasLogin = !!document.querySelector('a[href*="/login"], a:has-text("Log In")');
+            const hasAuth = !!document.querySelector('a[href*="/logout"], .user-avatar, img[alt*="profile"], a[href*="/@"], .user-profile, .profile-avatar, a[href*="/users/"]') ||
+                            Array.from(document.querySelectorAll('a')).some(a => (a.innerText || '').trim() === 'Profile' && (a.href || '').includes('@'));
+            const hasLogin = !!document.querySelector('a[href*="/login"]') && !hasAuth;
             if (hasAuth) return 'LOGGED_IN';
             if (hasLogin) return 'LOGGED_OUT';
             return 'UNKNOWN';
