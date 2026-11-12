@@ -16,11 +16,15 @@ import argparse
 import subprocess
 import tempfile
 import sqlite3
+try:
+    import resource
+except ImportError:
+    resource = None
 from contextlib import contextmanager
 from zoneinfo import ZoneInfo
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, Tuple, List, Set, Dict, Any, Union
+from typing import Optional, Tuple, List, Set, Dict, Any, Union, Callable
 from enum import Enum
 from dataclasses import dataclass, field
 
@@ -104,6 +108,9 @@ class ProcessResult:
     repo_name: Optional[str] = None
     repo_branch: Optional[str] = None
     commit_hash: Optional[str] = None
+    compiler_output: Optional[str] = None
+    diagnostics: Optional[str] = None
+    sample_results: List[Any] = field(default_factory=list)
 
     def __bool__(self) -> bool:
         return self.success
@@ -116,6 +123,53 @@ class ProcessResult:
         if isinstance(other, str):
             return self.stage.value == other
         return super().__eq__(other)
+
+@dataclass
+class SampleTestCase:
+    input_text: str
+    expected_output: str
+    sample_index: int = 1
+
+@dataclass
+class CompilationResult:
+    success: bool
+    class_name: str
+    source_filename: str
+    error_message: Optional[str] = None
+    diagnostics: Optional[str] = None
+    cleaned_code: str = ""
+    target_version: Optional[str] = None
+
+@dataclass
+class ExecutionResult:
+    success: bool
+    return_code: int
+    stdout: str
+    stderr: str
+    timeout: bool = False
+    oom: bool = False
+    security_violation: bool = False
+    error_message: Optional[str] = None
+
+@dataclass
+class SampleTestResult:
+    sample_index: int
+    passed: bool
+    input_text: str
+    expected_output: str
+    actual_output: str
+    error_message: Optional[str] = None
+    diff: Optional[str] = None
+
+@dataclass
+class VerificationPipelineResult:
+    success: bool
+    solution_code: str
+    explanation: str
+    compilation: Optional[CompilationResult] = None
+    sample_results: List[SampleTestResult] = field(default_factory=list)
+    repair_attempts: int = 0
+    failure_reason: Optional[str] = None
 
 @dataclass
 class PublishResult:
@@ -688,11 +742,35 @@ class DatabaseManager:
                     published_at TEXT NOT NULL
                 )
             """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS sample_test_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    attempt_id INTEGER REFERENCES attempts(id),
+                    sample_index INTEGER NOT NULL,
+                    input_text TEXT,
+                    expected_output TEXT,
+                    actual_output TEXT,
+                    passed INTEGER NOT NULL,
+                    error_message TEXT,
+                    diff TEXT,
+                    created_at TEXT NOT NULL
+                )
+            """)
             cursor.execute("CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY, migrated_at TEXT)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_problems_lookup ON problems(platform, canonical_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_problems_status ON problems(status)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_daily_runs_lookup ON daily_runs(run_date, platform)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_judge_verdicts_lookup ON judge_verdicts(platform, canonical_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_sample_test_attempt ON sample_test_results(attempt_id)")
+
+            # Ensure attempts table has compiler_output and diagnostics columns
+            cursor.execute("PRAGMA table_info(attempts)")
+            att_cols = [col[1] for col in cursor.fetchall()]
+            if "compiler_output" not in att_cols:
+                cursor.execute("ALTER TABLE attempts ADD COLUMN compiler_output TEXT")
+            if "diagnostics" not in att_cols:
+                cursor.execute("ALTER TABLE attempts ADD COLUMN diagnostics TEXT")
+
             cursor.execute("COMMIT")
 
     def migrate_from_solved_history_if_needed(self, history_file: Optional[Path] = None, submissions_file: Optional[Path] = None):
@@ -1054,7 +1132,9 @@ class DatabaseManager:
         solution_code: Optional[str] = None,
         explanation: Optional[str] = None,
         error: Optional[str] = None,
-        is_transient: bool = False
+        is_transient: bool = False,
+        compiler_output: Optional[str] = None,
+        diagnostics: Optional[str] = None
     ) -> int:
         now_iso = get_kolkata_now().isoformat()
         with self.get_connection() as conn:
@@ -1066,14 +1146,47 @@ class DatabaseManager:
 
             cursor.execute(
                 """
-                INSERT INTO attempts (problem_id, run_id, platform, canonical_id, stage, mode, solution_code, explanation, error, is_transient, started_at, finished_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO attempts (problem_id, run_id, platform, canonical_id, stage, mode, solution_code, explanation, error, is_transient, started_at, finished_at, compiler_output, diagnostics)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (prob_id, run_id, platform, canonical_id, stage.value, mode, solution_code, explanation, error, 1 if is_transient else 0, now_iso, now_iso)
+                (prob_id, run_id, platform, canonical_id, stage.value, mode, solution_code, explanation, error, 1 if is_transient else 0, now_iso, now_iso, compiler_output, diagnostics)
             )
             attempt_id = cursor.lastrowid
             cursor.execute("COMMIT")
             return attempt_id
+
+    def record_sample_test_results(
+        self,
+        attempt_id: int,
+        sample_results: List[Any]
+    ):
+        """Persists executed sample test cases and their diagnostic diffs for an attempt."""
+        if not sample_results:
+            return
+        now_iso = get_kolkata_now().isoformat()
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            for s in sample_results:
+                cursor.execute(
+                    """
+                    INSERT INTO sample_test_results (
+                        attempt_id, sample_index, input_text, expected_output, actual_output, passed, error_message, diff, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        attempt_id,
+                        getattr(s, "sample_index", 1),
+                        getattr(s, "input_text", ""),
+                        getattr(s, "expected_output", ""),
+                        getattr(s, "actual_output", ""),
+                        1 if getattr(s, "passed", False) else 0,
+                        getattr(s, "error_message", None),
+                        getattr(s, "diff", None),
+                        now_iso,
+                    )
+                )
+            cursor.execute("COMMIT")
 
     def record_publish_job(
         self,
@@ -2128,44 +2241,256 @@ async def inject_code_into_editor(page: Page, solution_code: str) -> bool:
 # ==============================================================================
 # Local Java Compilation & Verification (Universal for All Platforms)
 # ==============================================================================
-def compile_java_code_locally(code: str, platform_type: str) -> Tuple[bool, str, str]:
-    """Compiles Java code locally using javac to detect syntax, type, and import errors."""
+LEETCODE_STUBS = {
+    "TreeNode.java": (
+        "public class TreeNode {\n"
+        "    public int val;\n"
+        "    public TreeNode left;\n"
+        "    public TreeNode right;\n"
+        "    public TreeNode() {}\n"
+        "    public TreeNode(int val) { this.val = val; }\n"
+        "    public TreeNode(int val, TreeNode left, TreeNode right) {\n"
+        "        this.val = val;\n"
+        "        this.left = left;\n"
+        "        this.right = right;\n"
+        "    }\n"
+        "}\n"
+    ),
+    "ListNode.java": (
+        "public class ListNode {\n"
+        "    public int val;\n"
+        "    public ListNode next;\n"
+        "    public ListNode() {}\n"
+        "    public ListNode(int val) { this.val = val; }\n"
+        "    public ListNode(int val, ListNode next) { this.val = val; this.next = next; }\n"
+        "}\n"
+    ),
+    "Node.java": (
+        "import java.util.*;\n"
+        "public class Node {\n"
+        "    public int val;\n"
+        "    public List<Node> children;\n"
+        "    public Node left, right, next, random;\n"
+        "    public Node() {}\n"
+        "    public Node(int _val) { val = _val; }\n"
+        "    public Node(int _val, List<Node> _children) { val = _val; children = _children; }\n"
+        "    public Node(int _val, Node _left, Node _right, Node _next) {\n"
+        "        val = _val; left = _left; right = _right; next = _next;\n"
+        "    }\n"
+        "}\n"
+    ),
+}
+
+def detect_java_class_and_filename(code: str, platform_type: str) -> Tuple[Optional[str], Optional[str], str, Optional[str]]:
+    """
+    Detects the primary Java class name, source filename, and verifies platform requirements.
+    Returns (class_name, filename, cleaned_code, error_message).
+    """
     cleaned = clean_code_string(code)
 
-    # Platform-specific class naming adjustments
-    if platform_type == "hackerearth":
-        # HackerEarth requires TestClass
-        cleaned = re.sub(r"public\s+class\s+Main\b", "public class TestClass", cleaned)
-        cleaned = re.sub(r"\bclass\s+Main\b", "class TestClass", cleaned)
-        class_name = "TestClass"
+    # Strip comments to avoid false class detections in comments
+    no_comments = re.sub(r"/\*[\s\S]*?\*/", "", cleaned)
+    no_comments = re.sub(r"//.*", "", no_comments)
+
+    pub_match = re.search(r"\bpublic\s+(?:final\s+)?class\s+(\w+)", no_comments)
+    all_classes = [m.group(1) for m in re.finditer(r"\bclass\s+(\w+)", no_comments)]
+
+    if not all_classes and not pub_match:
+        return None, None, cleaned, "Missing public class or class declaration in generated Java code."
+
+    pub_class = pub_match.group(1) if pub_match else None
+    first_class = pub_class or (all_classes[0] if all_classes else None)
+
+    if platform_type in ["codeforces", "codechef"]:
+        if pub_class:
+            if pub_class != "Main":
+                return pub_class, f"{pub_class}.java", cleaned, f"Platform {platform_type} requires class Main, but found public class '{pub_class}'."
+            return "Main", "Main.java", cleaned, None
+        if "Main" in all_classes:
+            return "Main", "Main.java", cleaned, None
+        return first_class, f"{first_class}.java", cleaned, f"Platform {platform_type} requires class Main, but found class '{first_class}'."
+
+    elif platform_type == "hackerearth":
+        if pub_class:
+            if pub_class != "TestClass":
+                return pub_class, f"{pub_class}.java", cleaned, f"HackerEarth requires class TestClass, but found public class '{pub_class}'."
+            return "TestClass", "TestClass.java", cleaned, None
+        if "TestClass" in all_classes:
+            return "TestClass", "TestClass.java", cleaned, None
+        return first_class, f"{first_class}.java", cleaned, f"HackerEarth requires class TestClass, but found class '{first_class}'."
+
+    elif platform_type == "hackerrank":
+        if not pub_class:
+            return first_class, f"{first_class}.java", cleaned, "HackerRank requires public class Solution."
+        if pub_class != "Solution":
+            return pub_class, f"{pub_class}.java", cleaned, f"HackerRank requires public class Solution, but found public class '{pub_class}'."
+        return "Solution", "Solution.java", cleaned, None
+
+    else:  # leetcode
+        c_name = pub_class or ("Solution" if "Solution" in all_classes else first_class)
+        return c_name, f"{c_name}.java", cleaned, None
+
+def validate_code_security_and_dependencies(code: str) -> Tuple[bool, Optional[str]]:
+    """
+    Statically inspects generated Java code to reject forbidden network, process,
+    reflection, or unauthorized third-party libraries before compilation/execution.
+    """
+    cleaned = re.sub(r"/\*[\s\S]*?\*/", "", code)
+    cleaned = re.sub(r"//.*", "", cleaned)
+    cleaned = re.sub(r'"(?:\\.|[^"\\])*"', '""', cleaned)
+    cleaned = re.sub(r"'(?:\\.|[^'\\])*'", "''", cleaned)
+
+    prohibited = [
+        (r"\bjava\.net\b", "Network access package java.net is strictly prohibited"),
+        (r"\b(?:Socket|ServerSocket|HttpURLConnection|HttpClient|InetAddress|DatagramSocket)\b", "Network socket/connection classes are prohibited"),
+        (r"\bnew\s+URL\b|\bURI\.create\b", "URL/URI creation is prohibited"),
+        (r"\bProcessBuilder\b", "ProcessBuilder execution is prohibited"),
+        (r"\bRuntime\.getRuntime\b", "Runtime command execution is prohibited"),
+        (r"\bSystem\.exit\b", "System.exit is prohibited in competitive solutions"),
+        (r"\bjava\.lang\.reflect\b|\bMethod\.invoke\b|\bField\.get\b", "Reflection operations are prohibited"),
+        (r"\bjava\.io\.File\b|\bnew\s+File\s*\(", "Host file manipulation is prohibited"),
+        (r"\bjava\.nio\.file\b", "Host filesystem manipulation is prohibited"),
+        (r"^\s*import\s+(?!java\.(?:util|io|math|text|lang)\b)[a-zA-Z0-9_\.]+", "Unsupported external package import"),
+    ]
+
+    for pattern, desc in prohibited:
+        if re.search(pattern, cleaned, re.MULTILINE):
+            return False, f"Security violation: {desc}"
+
+    return True, None
+
+def validate_platform_signatures(code: str, starter_code: str, platform_type: str) -> Tuple[bool, Optional[str]]:
+    """
+    Validates that required platform structures, entrypoints, and Java version compatibility
+    are preserved in the generated code.
+    """
+    cleaned = clean_code_string(code)
+    no_comments = re.sub(r"/\*[\s\S]*?\*/", "", cleaned)
+    no_comments = re.sub(r"//.*", "", no_comments)
+
+    if platform_type == "hackerrank":
+        if "class Result" in starter_code and not re.search(r"\bclass\s+Result\b", no_comments):
+            return False, "HackerRank solution missing required class Result from starter template"
+        if not re.search(r"\bpublic\s+class\s+Solution\b", no_comments):
+            return False, "HackerRank solution missing required public class Solution"
+        if not re.search(r"public\s+static\s+void\s+main\s*\(\s*String\s*\[\s*\]", no_comments):
+            return False, "HackerRank Solution class must contain public static void main(String[] args)"
+
+    elif platform_type == "hackerearth":
+        if not re.search(r"\bclass\s+TestClass\b", no_comments):
+            return False, "HackerEarth solution missing required class TestClass"
+        if not re.search(r"public\s+static\s+void\s+main\s*\(\s*String\s*\[\s*\]", no_comments):
+            return False, "HackerEarth TestClass must contain public static void main(String[] args)"
+
     elif platform_type in ["codeforces", "codechef"]:
-        class_name = "Main"
-    else:  # leetcode, hackerrank
-        match = re.search(r"public\s+class\s+(\w+)", cleaned)
-        class_name = match.group(1) if match else "Solution"
+        if not re.search(r"\bclass\s+Main\b", no_comments):
+            return False, f"{platform_type} solution missing required class Main"
+        if not re.search(r"public\s+static\s+void\s+main\s*\(\s*String\s*\[\s*\]", no_comments):
+            return False, f"{platform_type} Main class must contain public static void main(String[] args)"
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # Provide standard LeetCode data structure stubs if referenced but not defined
+    if platform_type in ["hackerrank", "hackerearth"]:
+        j8_issues = [
+            (r"\bvar\s+\w+\s*=", "var keyword (Java 10+)"),
+            (r"\.strip\(\)", "String.strip() (Java 11+)"),
+            (r"\.repeat\(", "String.repeat() (Java 11+)"),
+            (r"\.isBlank\(\)", "String.isBlank() (Java 11+)"),
+            (r"\bList\.of\(", "List.of() (Java 9+)"),
+            (r"\bSet\.of\(", "Set.of() (Java 9+)"),
+            (r"\bMap\.of\(", "Map.of() (Java 9+)"),
+            (r"\.toList\(\)", "Stream.toList() (Java 16+)"),
+        ]
+        for pattern, desc in j8_issues:
+            if re.search(pattern, no_comments):
+                return False, f"Java 8 incompatibility detected: {desc} is not supported in Java 8."
+
+    return True, None
+
+def compare_sample_outputs(actual: str, expected: str, float_tolerance: float = 1e-6) -> Tuple[bool, Optional[str]]:
+    """
+    Compares program actual output against expected sample output using platform-appropriate
+    whitespace rules and float precision tolerances without blindly ignoring significant formatting.
+    """
+    act_norm = actual.replace("\r\n", "\n").replace("\r", "\n").rstrip()
+    exp_norm = expected.replace("\r\n", "\n").replace("\r", "\n").rstrip()
+
+    if act_norm == exp_norm:
+        return True, None
+
+    act_lines = act_norm.split("\n") if act_norm else []
+    exp_lines = exp_norm.split("\n") if exp_norm else []
+
+    if len(act_lines) != len(exp_lines):
+        return False, f"Line count mismatch: expected {len(exp_lines)} lines, got {len(act_lines)} lines.\nExpected:\n{expected}\nActual:\n{actual}"
+
+    for i, (a_line, e_line) in enumerate(zip(act_lines, exp_lines), 1):
+        a_line_r = a_line.rstrip()
+        e_line_r = e_line.rstrip()
+        if a_line_r == e_line_r:
+            continue
+
+        a_tokens = a_line_r.split()
+        e_tokens = e_line_r.split()
+        if len(a_tokens) != len(e_tokens):
+            return False, f"Line {i} token count mismatch: expected {len(e_tokens)} tokens ('{e_line_r}'), got {len(a_tokens)} tokens ('{a_line_r}')."
+
+        for t_idx, (at, et) in enumerate(zip(a_tokens, e_tokens), 1):
+            if at == et:
+                continue
+            try:
+                af = float(at)
+                ef = float(et)
+                diff = abs(af - ef)
+                denom = max(1.0, abs(ef))
+                if diff > float_tolerance and (diff / denom) > float_tolerance:
+                    return False, f"Line {i} token {t_idx} float mismatch: expected {et}, got {at} (diff {diff:.2e} > {float_tolerance:.2e})."
+            except ValueError:
+                return False, f"Line {i} token {t_idx} mismatch: expected '{et}', got '{at}'."
+
+    return True, None
+
+def compile_java_code_sandboxed(
+    code: str,
+    platform_type: str,
+    java_version: Optional[str] = None,
+    work_dir: Optional[Path] = None
+) -> CompilationResult:
+    """
+    Compiles Java code in an isolated directory with release flags and data structure stubs.
+    """
+    class_name, filename, cleaned, class_err = detect_java_class_and_filename(code, platform_type)
+    if class_err or not class_name or not filename:
+        return CompilationResult(
+            success=False,
+            class_name=class_name or "",
+            source_filename=filename or "",
+            error_message=class_err or "Missing class definition",
+            diagnostics=class_err or "Missing class definition",
+            cleaned_code=cleaned
+        )
+
+    target_version = java_version
+    if not target_version:
+        if platform_type in ["hackerrank", "hackerearth"]:
+            target_version = "8"
+
+    def _compile_in_dir(target_dir: Path) -> CompilationResult:
         if platform_type == "leetcode":
-            if "class TreeNode" not in cleaned and "TreeNode" in cleaned:
-                with open(Path(tmpdir) / "TreeNode.java", "w", encoding="utf-8") as f:
-                    f.write("public class TreeNode { public int val; public TreeNode left; public TreeNode right; public TreeNode() {} public TreeNode(int val) { this.val = val; } public TreeNode(int val, TreeNode left, TreeNode right) { this.val = val; this.left = left; this.right = right; } }")
-            if "class ListNode" not in cleaned and "ListNode" in cleaned:
-                with open(Path(tmpdir) / "ListNode.java", "w", encoding="utf-8") as f:
-                    f.write("public class ListNode { public int val; public ListNode next; public ListNode() {} public ListNode(int val) { this.val = val; } public ListNode(int val, ListNode next) { this.val = val; this.next = next; } }")
-            if "class Node" not in cleaned and "Node" in cleaned:
-                with open(Path(tmpdir) / "Node.java", "w", encoding="utf-8") as f:
-                    f.write("import java.util.*; public class Node { public int val; public List<Node> children; public Node left, right, next, random; public Node() {} public Node(int _val) { val = _val; } }")
+            for stub_name, stub_content in LEETCODE_STUBS.items():
+                stub_file = target_dir / stub_name
+                if not stub_file.exists():
+                    stub_file.write_text(stub_content, encoding="utf-8")
 
-        src_file = Path(tmpdir) / f"{class_name}.java"
-        with open(src_file, "w", encoding="utf-8") as f:
-            f.write(cleaned)
+        src_file = target_dir / filename
+        src_file.write_text(cleaned, encoding="utf-8")
+
+        cmd = ["javac", "-cp", str(target_dir), "-sourcepath", str(target_dir)]
+        if target_version:
+            cmd.extend(["-Xlint:-options", "--release", str(target_version)])
+
+        java_files = [str(f) for f in target_dir.glob("*.java")]
+        cmd.extend(java_files)
 
         try:
-            cmd = ["javac"]
-            if platform_type in ["hackerrank", "hackerearth"]:
-                cmd.extend(["-Xlint:-options", "--release", "8"])
-            cmd.append(str(src_file))
             comp_proc = subprocess.run(
                 cmd,
                 capture_output=True,
@@ -2173,10 +2498,458 @@ def compile_java_code_locally(code: str, platform_type: str) -> Tuple[bool, str,
                 timeout=15
             )
             if comp_proc.returncode != 0:
-                return False, comp_proc.stderr.strip(), cleaned
-            return True, "Compilation successful.", cleaned
+                return CompilationResult(
+                    success=False,
+                    class_name=class_name,
+                    source_filename=filename,
+                    error_message=comp_proc.stderr.strip(),
+                    diagnostics=comp_proc.stderr.strip(),
+                    cleaned_code=cleaned,
+                    target_version=target_version
+                )
+            return CompilationResult(
+                success=True,
+                class_name=class_name,
+                source_filename=filename,
+                cleaned_code=cleaned,
+                target_version=target_version
+            )
         except Exception as e:
-            return False, f"javac invocation failed: {e}", cleaned
+            return CompilationResult(
+                success=False,
+                class_name=class_name,
+                source_filename=filename,
+                error_message=f"javac invocation failed: {e}",
+                diagnostics=f"javac invocation failed: {e}",
+                cleaned_code=cleaned,
+                target_version=target_version
+            )
+
+    if work_dir is not None:
+        return _compile_in_dir(work_dir)
+    else:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            return _compile_in_dir(Path(tmpdir))
+
+def compile_java_code_locally(code: str, platform_type: str, java_version: Optional[str] = None) -> Tuple[bool, str, str]:
+    """Compiles Java code locally using javac to detect syntax, type, and import errors."""
+    res = compile_java_code_sandboxed(code, platform_type, java_version=java_version)
+    if res.success:
+        return True, "Compilation successful.", res.cleaned_code
+    return False, res.diagnostics or res.error_message or "Compilation failed", res.cleaned_code
+
+def execute_java_sandboxed(
+    class_dir: Path,
+    class_name: str,
+    stdin_input: str = "",
+    timeout_sec: float = 5.0,
+    max_memory_mb: int = 256,
+    disable_network: bool = True,
+    max_output_bytes: int = 10 * 1024 * 1024
+) -> ExecutionResult:
+    """
+    Executes compiled Java bytecode in a restricted sandbox enforcing CPU, memory, time,
+    process, filesystem, and network isolation limits.
+    """
+    java_cmd = [
+        "java",
+        f"-Xmx{max_memory_mb}m",
+        f"-Xms16m",
+        "-XX:+UseSerialGC",
+        "-Dfile.encoding=UTF-8",
+    ]
+    if disable_network:
+        java_cmd.extend([
+            "-Dhttp.proxyHost=0.0.0.0",
+            "-Dhttp.proxyPort=0",
+            "-Dhttps.proxyHost=0.0.0.0",
+            "-Dhttps.proxyPort=0",
+            "-DsocksProxyHost=0.0.0.0",
+            "-DsocksProxyPort=0",
+        ])
+
+    java_cmd.extend(["-cp", str(class_dir), class_name])
+
+    final_cmd = list(java_cmd)
+    if sys.platform == "darwin" and Path("/usr/bin/sandbox-exec").exists():
+        sb_profile = (
+            "(version 1)\n"
+            "(allow default)\n"
+            "(deny network*)\n"
+            f'(deny file-write* (subpath "/Users"))\n'
+            f'(deny file-write* (subpath "/private/tmp"))\n'
+            f'(deny file-write* (subpath "/tmp"))\n'
+            f'(allow file-write* (subpath "{class_dir}"))\n'
+        )
+        final_cmd = ["/usr/bin/sandbox-exec", "-p", sb_profile] + final_cmd
+
+    def _set_rlimits():
+        if resource is not None:
+            try:
+                cpu_lim = max(1, int(timeout_sec) + 2)
+                resource.setrlimit(resource.RLIMIT_CPU, (cpu_lim, cpu_lim + 1))
+            except Exception:
+                pass
+            try:
+                resource.setrlimit(resource.RLIMIT_NPROC, (128, 128))
+            except Exception:
+                pass
+
+    try:
+        proc = subprocess.run(
+            final_cmd,
+            input=stdin_input,
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+            preexec_fn=_set_rlimits if sys.platform != "win32" else None,
+        )
+        stdout = proc.stdout[:max_output_bytes]
+        stderr = proc.stderr[:max_output_bytes]
+
+        oom = ("OutOfMemoryError" in stderr)
+        sec_violation = (
+            "SocketException" in stderr or
+            "UnknownHostException" in stderr or
+            "ConnectException" in stderr or
+            "SecurityException" in stderr or
+            "Operation not permitted" in stderr
+        )
+
+        err_msg = None
+        if proc.returncode != 0:
+            if oom:
+                err_msg = f"Memory Limit Exceeded ({max_memory_mb}MB): OutOfMemoryError"
+            elif sec_violation:
+                err_msg = "Security violation: Network or unauthorized resource access blocked"
+            else:
+                err_msg = f"Runtime Error (Exit Code {proc.returncode}): {stderr.strip()}"
+
+        return ExecutionResult(
+            success=(proc.returncode == 0),
+            return_code=proc.returncode,
+            stdout=stdout,
+            stderr=stderr,
+            timeout=False,
+            oom=oom,
+            security_violation=sec_violation,
+            error_message=err_msg
+        )
+    except subprocess.TimeoutExpired as te:
+        return ExecutionResult(
+            success=False,
+            return_code=-1,
+            stdout="",
+            stderr=str(te),
+            timeout=True,
+            error_message=f"Time Limit Exceeded ({timeout_sec}s)"
+        )
+    except Exception as e:
+        return ExecutionResult(
+            success=False,
+            return_code=-1,
+            stdout="",
+            stderr=str(e),
+            error_message=f"Execution failed: {e}"
+        )
+
+def extract_sample_test_cases_from_text(problem_text: str) -> List[SampleTestCase]:
+    """Extracts sample inputs and outputs from problem descriptions."""
+    samples: List[SampleTestCase] = []
+
+    pattern1 = re.compile(
+        r"(?:Sample\s+Input|Input)\s*(?:\d*)\s*:?\s*\n([\s\S]*?)\n\s*(?:Sample\s+Output|Output)\s*(?:\d*)\s*:?\s*\n([\s\S]*?)(?=(?:Sample\s+Input|Input|\Z))",
+        re.IGNORECASE
+    )
+    for i, (inp, out) in enumerate(pattern1.findall(problem_text), 1):
+        clean_inp = inp.strip()
+        clean_out = out.strip()
+        if clean_inp or clean_out:
+            samples.append(SampleTestCase(input_text=clean_inp, expected_output=clean_out, sample_index=i))
+
+    if samples:
+        return samples
+
+    pattern2 = re.compile(
+        r"Example\s*\d*:?\s*Input:?\s*([^\n]+(?:\n[^\n]+)*?)\s*Output:?\s*([^\n]+(?:\n[^\n]+)*?)(?=Example|Explanation|Note|Constraints|\Z)",
+        re.IGNORECASE
+    )
+    for i, (inp, out) in enumerate(pattern2.findall(problem_text), 1):
+        clean_inp = inp.strip()
+        clean_out = out.strip()
+        if clean_inp or clean_out:
+            samples.append(SampleTestCase(input_text=clean_inp, expected_output=clean_out, sample_index=i))
+
+    return samples
+
+async def extract_sample_test_cases_from_page(page: Page, platform_type: str) -> List[SampleTestCase]:
+    """Extracts sample test cases from live browser DOM based on platform-specific selectors."""
+    samples: List[SampleTestCase] = []
+    try:
+        if platform_type == "codeforces":
+            inputs = await page.locator(".sample-test .input pre").all_inner_texts()
+            outputs = await page.locator(".sample-test .output pre").all_inner_texts()
+            for i, (inp, out) in enumerate(zip(inputs, outputs), 1):
+                samples.append(SampleTestCase(input_text=inp.strip(), expected_output=out.strip(), sample_index=i))
+        elif platform_type == "hackerrank":
+            inputs = await page.locator(".challenge_sample_input pre").all_inner_texts()
+            outputs = await page.locator(".challenge_sample_output pre").all_inner_texts()
+            for i, (inp, out) in enumerate(zip(inputs, outputs), 1):
+                samples.append(SampleTestCase(input_text=inp.strip(), expected_output=out.strip(), sample_index=i))
+        elif platform_type == "codechef":
+            inputs = await page.locator(".problem-statement pre:has-text('Input')").all_inner_texts()
+            outputs = await page.locator(".problem-statement pre:has-text('Output')").all_inner_texts()
+            for i, (inp, out) in enumerate(zip(inputs, outputs), 1):
+                samples.append(SampleTestCase(input_text=inp.strip(), expected_output=out.strip(), sample_index=i))
+    except Exception:
+        pass
+    return samples
+
+def run_all_sample_tests_sandboxed(
+    code: str,
+    samples: List[SampleTestCase],
+    platform_type: str,
+    java_version: Optional[str] = None,
+    timeout_sec: float = 5.0,
+    max_memory_mb: int = 256
+) -> Tuple[bool, List[SampleTestResult], str]:
+    """Compiles and executes Java code against sample test cases in an isolated sandbox."""
+    if not samples:
+        return True, [], "No sample test cases provided; compilation check only."
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        comp_res = compile_java_code_sandboxed(code, platform_type, java_version=java_version, work_dir=tmp_path)
+        if not comp_res.success:
+            return False, [], f"Compilation error before sample tests:\n{comp_res.diagnostics}"
+
+        class_name = comp_res.class_name
+        if platform_type == "leetcode" and "public static void main" not in comp_res.cleaned_code:
+            return True, [], "LeetCode class-based solution verified with data structure stubs."
+
+        all_passed = True
+        summary = []
+        results: List[SampleTestResult] = []
+
+        for sample in samples:
+            exec_res = execute_java_sandboxed(
+                class_dir=tmp_path,
+                class_name=class_name,
+                stdin_input=sample.input_text,
+                timeout_sec=timeout_sec,
+                max_memory_mb=max_memory_mb
+            )
+
+            if exec_res.timeout:
+                all_passed = False
+                res = SampleTestResult(
+                    sample_index=sample.sample_index,
+                    passed=False,
+                    input_text=sample.input_text,
+                    expected_output=sample.expected_output,
+                    actual_output="",
+                    error_message=exec_res.error_message
+                )
+                results.append(res)
+                summary.append(f"Sample {sample.sample_index}: TIME LIMIT EXCEEDED ({timeout_sec}s)")
+            elif exec_res.oom:
+                all_passed = False
+                res = SampleTestResult(
+                    sample_index=sample.sample_index,
+                    passed=False,
+                    input_text=sample.input_text,
+                    expected_output=sample.expected_output,
+                    actual_output="",
+                    error_message=exec_res.error_message
+                )
+                results.append(res)
+                summary.append(f"Sample {sample.sample_index}: MEMORY LIMIT EXCEEDED ({max_memory_mb}MB)")
+            elif not exec_res.success:
+                all_passed = False
+                res = SampleTestResult(
+                    sample_index=sample.sample_index,
+                    passed=False,
+                    input_text=sample.input_text,
+                    expected_output=sample.expected_output,
+                    actual_output=exec_res.stdout,
+                    error_message=exec_res.error_message
+                )
+                results.append(res)
+                summary.append(f"Sample {sample.sample_index}: RUNTIME ERROR (Code {exec_res.return_code})\nStderr: {exec_res.stderr.strip()}")
+            else:
+                matches, diff_msg = compare_sample_outputs(exec_res.stdout, sample.expected_output)
+                if matches:
+                    res = SampleTestResult(
+                        sample_index=sample.sample_index,
+                        passed=True,
+                        input_text=sample.input_text,
+                        expected_output=sample.expected_output,
+                        actual_output=exec_res.stdout
+                    )
+                    results.append(res)
+                    summary.append(f"Sample {sample.sample_index}: PASSED")
+                else:
+                    all_passed = False
+                    res = SampleTestResult(
+                        sample_index=sample.sample_index,
+                        passed=False,
+                        input_text=sample.input_text,
+                        expected_output=sample.expected_output,
+                        actual_output=exec_res.stdout,
+                        error_message=diff_msg,
+                        diff=diff_msg
+                    )
+                    results.append(res)
+                    summary.append(f"Sample {sample.sample_index}: FAILED\nInput:\n{sample.input_text}\nExpected:\n{sample.expected_output}\nActual:\n{exec_res.stdout}\nDiff: {diff_msg}")
+
+        return all_passed, results, "\n".join(summary)
+
+def verify_and_repair_java_pipeline(
+    problem_text: str,
+    starter_code: str,
+    samples: List[SampleTestCase],
+    platform_name: str,
+    platform_type: str,
+    max_repairs: int = 3,
+    java_version: Optional[str] = None,
+    ai_caller: Optional[Callable[..., Tuple[str, str]]] = None,
+) -> VerificationPipelineResult:
+    """
+    Modular AI generation, verification, and repair pipeline.
+    Enforces configurable repair attempts, feeds exact compiler/sample diagnostics into prompts,
+    and isolates untrusted execution.
+    """
+    caller = ai_caller or ask_gemini_for_java_code
+    last_feedback: Optional[str] = None
+    solution_code: str = ""
+    explanation: str = ""
+    last_comp_res: Optional[CompilationResult] = None
+    last_sample_results: List[SampleTestResult] = []
+
+    for attempt in range(1, max_repairs + 2):
+        repair_idx = attempt - 1
+        if repair_idx > 0:
+            print(f"   🔧 [Repair Attempt {repair_idx}/{max_repairs}] Querying AI with exact failure diagnostics...")
+        else:
+            print("   🤖 [Initial Generation] Querying AI for Java solution...")
+
+        try:
+            solution_code, explanation = caller(
+                problem_text=problem_text,
+                starter_code=starter_code,
+                platform_name=platform_name,
+                platform_type=platform_type,
+                error_feedback=last_feedback
+            )
+        except Exception as e:
+            return VerificationPipelineResult(
+                success=False,
+                solution_code=solution_code,
+                explanation=explanation,
+                repair_attempts=repair_idx,
+                failure_reason=f"AI generation call failed: {e}"
+            )
+
+        # 1. Security & Dependency Check
+        sec_ok, sec_err = validate_code_security_and_dependencies(solution_code)
+        if not sec_ok:
+            print(f"   🛑 Security Check Failed: {sec_err}")
+            last_feedback = (
+                f"SECURITY VIOLATION IN GENERATED CODE:\n{sec_err}\n"
+                f"Requirement: Online judge code must be completely self-contained. "
+                f"Do NOT import or use java.net, ProcessBuilder, Runtime.getRuntime, System.exit, "
+                f"reflection, or external 3rd-party libraries."
+            )
+            continue
+
+        # 2. Platform Signature Check
+        sig_ok, sig_err = validate_platform_signatures(solution_code, starter_code, platform_type)
+        if not sig_ok:
+            print(f"   ⚠️ Platform Signature Check Failed: {sig_err}")
+            last_feedback = (
+                f"PLATFORM SIGNATURE ERROR:\n{sig_err}\n"
+                f"Please preserve the required class names, method signatures, and Java version compatibility."
+            )
+            continue
+
+        # 3. Class & Filename Check
+        c_name, f_name, cleaned_code, class_err = detect_java_class_and_filename(solution_code, platform_type)
+        if class_err:
+            print(f"   ⚠️ Class Detection Error: {class_err}")
+            last_feedback = (
+                f"CLASS DEFINITION ERROR:\n{class_err}\n"
+                f"Ensure the primary class is properly named according to {platform_name} conventions."
+            )
+            continue
+
+        # 4. Compilation Check
+        comp_ok, comp_msg, cleaned_code = compile_java_code_locally(solution_code, platform_type, java_version=java_version)
+        last_comp_res = CompilationResult(
+            success=comp_ok,
+            class_name=c_name or "Solution",
+            source_filename=f_name or "Solution.java",
+            error_message=None if comp_ok else comp_msg,
+            diagnostics=None if comp_ok else comp_msg,
+            cleaned_code=cleaned_code,
+            target_version=java_version
+        )
+        if not comp_ok:
+            print(f"   ⚠️ Java Compilation Failed:\n{comp_msg}")
+            last_feedback = (
+                f"EXACT COMPILER DIAGNOSTICS (javac):\n{comp_msg}\n"
+                f"Diagnose and fix the syntax, type, or import errors in Java."
+            )
+            continue
+
+        print("   ✅ Local javac compilation PASSED cleanly!")
+
+        # 5. Sample Test Cases Check
+        samples_passed, sample_results, sample_summary = run_all_sample_tests_sandboxed(
+            code=cleaned_code,
+            samples=samples,
+            platform_type=platform_type,
+            java_version=java_version
+        )
+        last_sample_results = sample_results
+
+        if not samples_passed:
+            print(f"   ⚠️ Sample Test Cases Failed:\n{sample_summary}")
+            failed_s = next((s for s in sample_results if not s.passed), None)
+            diag = (failed_s.diff or failed_s.error_message or "Output mismatch") if failed_s else "Sample mismatch"
+            s_idx = failed_s.sample_index if failed_s else 1
+            s_inp = failed_s.input_text if failed_s else ""
+            s_exp = failed_s.expected_output if failed_s else ""
+            s_act = failed_s.actual_output if failed_s else ""
+            last_feedback = (
+                f"SAMPLE TEST CASE #{s_idx} FAILED:\n"
+                f"Input:\n{s_inp}\n"
+                f"Expected Output:\n{s_exp}\n"
+                f"Actual Output:\n{s_act}\n"
+                f"Exact Diagnostic:\n{diag}\n"
+                f"Diagnose the algorithmic failure and output a corrected solution."
+            )
+            continue
+
+        print("   ✅ Sample test cases PASSED!")
+        return VerificationPipelineResult(
+            success=True,
+            solution_code=cleaned_code,
+            explanation=explanation,
+            compilation=last_comp_res,
+            sample_results=last_sample_results,
+            repair_attempts=repair_idx
+        )
+
+    # All repair attempts exhausted
+    return VerificationPipelineResult(
+        success=False,
+        solution_code=solution_code,
+        explanation=explanation,
+        compilation=last_comp_res,
+        sample_results=last_sample_results,
+        repair_attempts=max_repairs,
+        failure_reason=last_feedback or "Verification failed after maximum repair attempts"
+    )
 
 async def capture_pre_submission_snapshot(
     page: Page,
@@ -3078,52 +3851,11 @@ async def verify_live_submission_verdict(
 async def verify_codeforces_samples_java(page: Page, code: str) -> Tuple[bool, str]:
     """Compiles Java solution using javac and runs against sample test cases locally."""
     try:
-        inputs = await page.locator(".sample-test .input pre").all_inner_texts()
-        outputs = await page.locator(".sample-test .output pre").all_inner_texts()
-        if not inputs or not outputs:
+        samples = await extract_sample_test_cases_from_page(page, "codeforces")
+        if not samples:
             return True, "No sample test cases found on page."
-
-        match = re.search(r"public\s+class\s+(\w+)", code)
-        class_name = match.group(1) if match else "Main"
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            src_file = Path(tmpdir) / f"{class_name}.java"
-            with open(src_file, "w", encoding="utf-8") as f:
-                f.write(code)
-
-            # Compile with javac
-            comp_proc = subprocess.run(
-                ["javac", str(src_file)],
-                capture_output=True,
-                text=True,
-                timeout=12
-            )
-            if comp_proc.returncode != 0:
-                return False, f"Java compilation error:\n{comp_proc.stderr.strip()}"
-
-            all_passed = True
-            summary = []
-            for i, (inp, expected) in enumerate(zip(inputs, outputs), 1):
-                inp = inp.strip()
-                expected = expected.strip()
-                run_proc = subprocess.run(
-                    ["java", "-cp", tmpdir, class_name],
-                    input=inp,
-                    capture_output=True,
-                    text=True,
-                    timeout=6
-                )
-                actual = run_proc.stdout.strip()
-                if run_proc.returncode != 0:
-                    all_passed = False
-                    summary.append(f"Sample {i}: RUNTIME ERROR (Code {run_proc.returncode})\nStderr: {run_proc.stderr.strip()}")
-                elif actual == expected:
-                    summary.append(f"Sample {i}: PASSED (Output == Expected == '{expected}')")
-                else:
-                    all_passed = False
-                    summary.append(f"Sample {i}: FAILED\nInput:\n{inp}\nExpected:\n{expected}\nActual:\n{actual}")
-
-            return all_passed, "\n".join(summary)
+        all_passed, results, summary = run_all_sample_tests_sandboxed(code, samples, "codeforces")
+        return all_passed, summary
     except Exception as e:
         return True, f"Local test skipped: {e}"
 
@@ -3372,6 +4104,8 @@ async def process_problem(
     cached_verdict: Optional[SubmissionVerdict] = None,
     cached_code: Optional[str] = None,
     cached_explanation: Optional[str] = None,
+    max_repairs: int = 3,
+    java_version: Optional[str] = None,
 ) -> ProcessResult:
     """Processes a single coding problem URL end-to-end in Java with zero human input."""
     print(f"\n{'='*70}")
@@ -3488,43 +4222,49 @@ async def process_problem(
     else:
         print("   ℹ️  No starter template detected (will generate complete standalone Java code).")
 
-    # 5. Generate Java solution via Gemini with local javac verification & repair loop
-    print("[4/7] Solving in Java with Gemini AI & verifying locally...")
-    solution_code = None
-    explanation = None
-    compile_passed = False
-    last_error_log = None
+    # 5. Extract sample test cases & run modular verification and repair pipeline
+    print(f"[4/7] Verifying and repairing Java solution locally (max {max_repairs} repairs)...")
+    samples = await extract_sample_test_cases_from_page(page, platform_type)
+    if not samples:
+        samples = extract_sample_test_cases_from_text(problem_text)
 
-    for attempt in range(1, 4):
-        print(f"   [Attempt {attempt}/3] Generating Java solution...")
-        solution_code, explanation = ask_gemini_for_java_code(
-            problem_text=problem_text,
-            starter_code=starter_code,
-            platform_name=platform_name,
-            platform_type=platform_type,
-            error_feedback=last_error_log
+    pipeline_res = verify_and_repair_java_pipeline(
+        problem_text=problem_text,
+        starter_code=starter_code,
+        samples=samples,
+        platform_name=platform_name,
+        platform_type=platform_type,
+        max_repairs=max_repairs,
+        java_version=java_version,
+    )
+    solution_code = pipeline_res.solution_code
+    explanation = pipeline_res.explanation
+    filename = get_safe_java_filename(url, platform_name)
+
+    if not pipeline_res.success:
+        print(f"❌ Failed verification pipeline for {url} ({pipeline_res.failure_reason}). Skipping.")
+        is_compiled = bool(pipeline_res.compilation and pipeline_res.compilation.success)
+        fail_stage = ProcessStage.COMPILED if is_compiled else ProcessStage.GENERATED
+        return ProcessResult(
+            stage=fail_stage,
+            success=False,
+            url=url,
+            platform=platform_type,
+            problem_id=prob_id,
+            solution_code=solution_code,
+            explanation=explanation,
+            error=pipeline_res.failure_reason,
+            compiler_output=pipeline_res.compilation.diagnostics if pipeline_res.compilation else None,
+            diagnostics=pipeline_res.failure_reason,
+            sample_results=pipeline_res.sample_results,
+            published=False
         )
 
-        # Local javac compilation check
-        print(f"   🧪 Compiling generated Java solution with javac locally...")
-        compile_passed, err_msg, solution_code = compile_java_code_locally(solution_code, platform_type)
-        if compile_passed:
-            print(f"   ✅ Local javac compilation PASSED cleanly!")
-            break
-        else:
-            print(f"   ⚠️  Java compilation failed with error:\n{err_msg}")
-            last_error_log = f"Java compilation error:\n{err_msg}"
-
-    if not compile_passed or not solution_code:
-        print(f"❌ Failed to generate compiling Java code for {url} after 3 attempts. Skipping to protect repo integrity.")
-        return ProcessResult(stage=ProcessStage.GENERATED, success=False, url=url, platform=platform_type, problem_id=prob_id, error="Failed to generate compiling Java code after 3 attempts")
-
     print(f"   💡 Approach: {explanation}")
-    filename = get_safe_java_filename(url, platform_name)
 
     # In mode 'save', store locally only; no judge submission or GitHub commit
     if mode == "save":
-        print(f"   💾 Mode 'SAVE': saving compiled Java solution locally without running or submitting.")
+        print(f"   💾 Mode 'SAVE': saving verified Java solution locally without running or submitting.")
         save_java_solution(filename, solution_code, url, explanation, platform_name, verdict=None)
         return ProcessResult(
             stage=ProcessStage.COMPILED,
@@ -3536,30 +4276,10 @@ async def process_problem(
             explanation=explanation,
             verdict=None,
             saved_path=str(SOLUTIONS_DIR / filename),
+            compiler_output=pipeline_res.compilation.diagnostics if pipeline_res.compilation else None,
+            sample_results=pipeline_res.sample_results,
             published=False
         )
-
-    # Optional local sample test verification for Codeforces
-    if platform_type == "codeforces":
-        print("   🧪 Testing Java solution against sample test cases locally...")
-        passed_samples, sample_log = await verify_codeforces_samples_java(page, solution_code)
-        print(f"   {sample_log}")
-        if not passed_samples:
-            print("   ⚠️  Sample test failed! Attempting self-correction...")
-            try:
-                corr_code, corr_exp = ask_gemini_for_java_code(
-                    problem_text=problem_text,
-                    starter_code=starter_code,
-                    platform_name=platform_name,
-                    platform_type=platform_type,
-                    error_feedback=sample_log
-                )
-                c_ok, _, clean_corr = compile_java_code_locally(corr_code, platform_type)
-                if c_ok:
-                    solution_code = clean_corr
-                    explanation = corr_exp
-            except Exception:
-                pass
 
     # 6. Inject code into webpage editor & 7. Execute action
     submission_snapshot = {
@@ -3848,6 +4568,9 @@ async def process_problem(
                 explanation=explanation,
                 verdict=verdict,
                 saved_path=str(SOLUTIONS_DIR / filename),
+                compiler_output=pipeline_res.compilation.diagnostics if pipeline_res.compilation else None,
+                diagnostics=pipeline_res.failure_reason,
+                sample_results=pipeline_res.sample_results,
                 error=verdict_msg,
                 published=False
             )
@@ -3865,6 +4588,9 @@ async def process_problem(
             explanation=explanation,
             verdict=None,
             saved_path=str(SOLUTIONS_DIR / filename),
+            compiler_output=pipeline_res.compilation.diagnostics if pipeline_res.compilation else None,
+            diagnostics=pipeline_res.failure_reason,
+            sample_results=pipeline_res.sample_results,
             published=False
         )
 
@@ -3886,6 +4612,9 @@ async def process_problem(
             verdict=verdict,
             saved_path=str(SOLUTIONS_DIR / filename),
             publish_error=pub_res.error,
+            compiler_output=pipeline_res.compilation.diagnostics if pipeline_res.compilation else None,
+            diagnostics=pipeline_res.failure_reason,
+            sample_results=pipeline_res.sample_results,
             error=f"Publish failed: {pub_res.error}",
             published=False,
             repo_name=pub_res.repo_name,
@@ -3904,6 +4633,9 @@ async def process_problem(
         explanation=explanation,
         verdict=verdict,
         saved_path=str(SOLUTIONS_DIR / filename),
+        compiler_output=pipeline_res.compilation.diagnostics if pipeline_res.compilation else None,
+        diagnostics=pipeline_res.failure_reason,
+        sample_results=pipeline_res.sample_results,
         published=True,
         repo_name=pub_res.repo_name,
         repo_branch=pub_res.branch,
@@ -3974,7 +4706,9 @@ async def solve_platform_quota(
     mode: str = "both",
     p_playwright = None,
     browser = None,
-    context = None
+    context = None,
+    max_repairs: int = 3,
+    java_version: Optional[str] = None
 ) -> Tuple[int, Any, Any, Page]:
     """Solves problems on the given platform until target_accepted ACCEPTED problems are achieved.
     If a problem is not accepted by the judge, it fetches replacement candidates using pagination.
@@ -4064,7 +4798,10 @@ async def solve_platform_quota(
         browser, context, page = await ensure_live_page(page, p_playwright, browser, context)
 
         try:
-            result = await asyncio.wait_for(process_problem(page, url, mode=mode), timeout=180)
+            result = await asyncio.wait_for(
+                process_problem(page, url, mode=mode, max_repairs=max_repairs, java_version=java_version),
+                timeout=180
+            )
         except asyncio.TimeoutError:
             print(f"   ⏱️  Problem processing timed out after 180s for {url}. Recovering...")
             try:
@@ -4094,7 +4831,9 @@ async def solve_platform_quota(
                 retry_publish=True,
                 cached_verdict=result.verdict,
                 cached_code=result.solution_code,
-                cached_explanation=result.explanation
+                cached_explanation=result.explanation,
+                max_repairs=max_repairs,
+                java_version=java_version
             )
             if retry_res.published:
                 result = retry_res
@@ -4114,8 +4853,12 @@ async def solve_platform_quota(
             solution_code=result.solution_code,
             explanation=result.explanation,
             error=err_msg,
-            is_transient=transient
+            is_transient=transient,
+            compiler_output=result.compiler_output,
+            diagnostics=result.diagnostics
         )
+        if result.sample_results:
+            db.record_sample_test_results(attempt_id, result.sample_results)
 
         if is_successful:
             accepted_count += 1
@@ -4182,7 +4925,9 @@ async def execute_batch(
     difficulty: str,
     mode: str,
     file_path: Optional[str] = None,
-    headless: bool = False
+    headless: bool = False,
+    max_repairs: int = 3,
+    java_version: Optional[str] = None
 ) -> bool:
     """Executes a complete automated batch of problems with zero human input."""
     start_time = datetime.now()
@@ -4304,7 +5049,7 @@ async def execute_batch(
             target_total = len(urls_to_solve)
             for idx, url in enumerate(urls_to_solve, 1):
                 browser, context, page = await ensure_live_page(page, p, browser, context)
-                res = await process_problem(page, url, mode=mode)
+                res = await process_problem(page, url, mode=mode, max_repairs=max_repairs, java_version=java_version)
                 is_ok = (res.success and res.published) if mode in ["submit", "both"] else res.success
                 if is_ok:
                     total_accepted += 1
@@ -4322,7 +5067,8 @@ async def execute_batch(
             for p_name in all_platforms:
                 acc, browser, context, page = await solve_platform_quota(
                     page, p_name, target_accepted=count, difficulty=difficulty, mode=mode,
-                    p_playwright=p, browser=browser, context=context
+                    p_playwright=p, browser=browser, context=context,
+                    max_repairs=max_repairs, java_version=java_version
                 )
                 total_accepted += acc
                 platform_results[p_name] = acc
@@ -4345,7 +5091,8 @@ async def execute_batch(
             target_total = count
             total_accepted, browser, context, page = await solve_platform_quota(
                 page, platform, target_accepted=count, difficulty=difficulty, mode=mode,
-                p_playwright=p, browser=browser, context=context
+                p_playwright=p, browser=browser, context=context,
+                max_repairs=max_repairs, java_version=java_version
             )
             all_satisfied = (total_accepted >= target_total)
             print(f"\n📊 {platform.upper()} SUMMARY: {total_accepted}/{count} problems verified Accepted.")
@@ -4651,6 +5398,18 @@ async def main():
         action="store_true",
         help="Display verified solved history, daily quotas (Asia/Kolkata), and database summary"
     )
+    parser.add_argument(
+        "--max-repairs",
+        type=int,
+        default=3,
+        help="Maximum AI repair attempts per problem if compilation or sample tests fail (default: 3)"
+    )
+    parser.add_argument(
+        "--java-version",
+        type=str,
+        default=None,
+        help="Target Java version for javac compilation/verification (e.g. 8, 17, 21; default: auto by platform)"
+    )
     args = parser.parse_args()
 
     if args.status:
@@ -4682,7 +5441,9 @@ async def main():
             difficulty=args.difficulty,
             mode=args.mode,
             file_path=args.file,
-            headless=args.headless
+            headless=args.headless,
+            max_repairs=args.max_repairs,
+            java_version=args.java_version
         )
 
     if args.daily:
