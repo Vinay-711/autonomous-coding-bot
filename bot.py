@@ -61,6 +61,116 @@ class SubmissionVerdict:
         """Allows unpacking as (verdict_state, verdict_message) for backward compatibility."""
         return iter((self.state, self.message))
 
+class ProcessStage(str, Enum):
+    GENERATED = "GENERATED"
+    COMPILED = "COMPILED"
+    TESTED = "TESTED"
+    SUBMITTED = "SUBMITTED"
+    ACCEPTED = "ACCEPTED"
+    REJECTED = "REJECTED"
+    PUBLISH_FAILED = "PUBLISH_FAILED"
+    PUBLISHED = "PUBLISHED"
+
+    def __bool__(self) -> bool:
+        return self in (ProcessStage.ACCEPTED, ProcessStage.PUBLISHED)
+
+@dataclass
+class ProcessResult:
+    stage: ProcessStage
+    success: bool
+    url: str = ""
+    platform: str = ""
+    problem_id: Optional[str] = None
+    solution_code: Optional[str] = None
+    explanation: Optional[str] = None
+    verdict: Optional[SubmissionVerdict] = None
+    error: Optional[str] = None
+    publish_error: Optional[str] = None
+    saved_path: Optional[str] = None
+    published: bool = False
+
+    def __bool__(self) -> bool:
+        return self.success
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, bool):
+            return self.success is other
+        if isinstance(other, ProcessStage):
+            return self.stage == other
+        if isinstance(other, str):
+            return self.stage.value == other
+        return super().__eq__(other)
+
+@dataclass
+class PublishResult:
+    success: bool
+    error: Optional[str] = None
+    repo_name: Optional[str] = None
+    branch: Optional[str] = None
+    commit_hash: Optional[str] = None
+
+    def __bool__(self) -> bool:
+        return self.success
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, bool):
+            return self.success is other
+        return super().__eq__(other)
+
+    def __iter__(self):
+        yield self.success
+        yield self.error
+
+def get_repo_default_branch(repo_dir: Union[Path, str]) -> str:
+    """Detects the default branch for a git repository (e.g. main, master)."""
+    r_dir = Path(repo_dir)
+    # 1. Try git symbolic-ref
+    try:
+        res = subprocess.run(
+            ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+            cwd=r_dir,
+            capture_output=True,
+            text=True
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            ref = res.stdout.strip()
+            return ref.split("/")[-1]
+    except Exception:
+        pass
+
+    # 2. Try git remote show origin
+    try:
+        res = subprocess.run(
+            ["git", "remote", "show", "origin"],
+            cwd=r_dir,
+            capture_output=True,
+            text=True
+        )
+        if res.returncode == 0 and res.stdout:
+            for line in res.stdout.splitlines():
+                if "HEAD branch:" in line:
+                    b = line.split(":")[-1].strip()
+                    if b:
+                        return b
+    except Exception:
+        pass
+
+    # 3. Try current local branch
+    try:
+        res = subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=r_dir,
+            capture_output=True,
+            text=True
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            return res.stdout.strip()
+    except Exception:
+        pass
+
+    # 4. Fallback to main
+    return "main"
+
 @dataclass
 class PollingConfig:
     max_timeout: float = 45.0
@@ -2354,8 +2464,8 @@ def save_java_solution(
 ):
     """Saves Java solution to solutions/ directory with metadata header including verified verdict and submission ID."""
     file_path = SOLUTIONS_DIR / filename
-    sub_id_line = f" * Submission ID: {verdict.submission_id or verdict.correlation_mechanism}\n" if verdict else ""
-    verdict_line = f" * Verdict: {verdict.state.value}\n" if verdict else ""
+    sub_id_line = f" * Submission ID: {verdict.submission_id or verdict.correlation_mechanism}\n" if verdict is not None else ""
+    verdict_line = f" * Verdict: {verdict.state.value}\n" if verdict is not None else ""
     header = f"""/* ==============================================================================
  * Platform: {platform_name}
  * Language: Java
@@ -2379,13 +2489,21 @@ def commit_solution_to_github(
     explanation: str,
     platform_name: str,
     verdict: Optional[SubmissionVerdict] = None
-) -> bool:
+) -> PublishResult:
     """Commits and pushes the solution to the user's dedicated GitHub repository for that platform."""
     if not GITHUB_USERNAME:
-        return False
+        print("   ⚠️  GITHUB_USERNAME is not configured. Skipping GitHub commit.")
+        return PublishResult(success=False, error="GITHUB_USERNAME is not configured")
 
     if platform_type not in PLATFORM_REPO_CONFIG:
-        return False
+        print(f"   ⚠️  Unknown platform_type '{platform_type}'. Skipping GitHub commit.")
+        return PublishResult(success=False, error=f"Unknown platform_type: {platform_type}")
+
+    # Enforce acceptance requirement: never commit as accepted if not confirmed ACCEPTED
+    if verdict is not None and verdict.state != VerdictState.ACCEPTED:
+        err = f"Cannot commit solution with non-accepted verdict: {verdict.state.value}"
+        print(f"   🛑 {err}")
+        return PublishResult(success=False, error=err)
 
     repo_info = PLATFORM_REPO_CONFIG[platform_type]
     repo_name = repo_info["repo_name"]
@@ -2396,10 +2514,36 @@ def commit_solution_to_github(
         REPOS_DIR.mkdir(parents=True, exist_ok=True)
         try:
             print(f"   📦 Cloning https://github.com/{GITHUB_USERNAME}/{repo_name}...")
-            subprocess.run(["gh", "repo", "clone", f"{GITHUB_USERNAME}/{repo_name}", str(repo_dir)], check=True, capture_output=True)
+            clone_res = subprocess.run(
+                ["gh", "repo", "clone", f"{GITHUB_USERNAME}/{repo_name}", str(repo_dir)],
+                capture_output=True,
+                text=True
+            )
+            if clone_res.returncode != 0:
+                err = clone_res.stderr.strip() or clone_res.stdout.strip() or "gh repo clone failed"
+                print(f"   ⚠️  Could not clone repo {repo_name}: {err}")
+                return PublishResult(success=False, error=f"Clone failed: {err}", repo_name=repo_name)
         except Exception as e:
             print(f"   ⚠️  Could not clone repo {repo_name}: {e}")
-            return False
+            return PublishResult(success=False, error=f"Clone failed: {e}", repo_name=repo_name)
+
+    branch = get_repo_default_branch(repo_dir)
+
+    # Pull latest changes before modifying working tree; stop immediately on failure (Failed pull -> no commit)
+    try:
+        pull_res = subprocess.run(
+            ["git", "pull", "--rebase", "origin", branch],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True
+        )
+        if pull_res.returncode != 0:
+            err = pull_res.stderr.strip() or pull_res.stdout.strip() or "git pull --rebase failed"
+            print(f"   ⚠️  Git pull --rebase failed on branch '{branch}': {err}")
+            return PublishResult(success=False, error=f"Pull failed: {err}", repo_name=repo_name, branch=branch)
+    except Exception as e:
+        print(f"   ⚠️  Git pull exception: {e}")
+        return PublishResult(success=False, error=f"Pull failed: {e}", repo_name=repo_name, branch=branch)
 
     # Extract clean slug
     clean_url = url.rstrip("/")
@@ -2418,16 +2562,18 @@ def commit_solution_to_github(
 
     # Write Java source file
     src_filename = repo_info["class_filename"]
-    (prob_dir / src_filename).write_text(code, encoding="utf-8")
+    src_path = prob_dir / src_filename
+    src_path.write_text(code, encoding="utf-8")
 
     # Write README.md with verifiable submission evidence
     readme_path = prob_dir / "README.md"
-    sub_id_text = f"\nSubmission ID: `{verdict.submission_id or verdict.correlation_mechanism}`" if verdict else ""
+    sub_id_text = f"\nSubmission ID: `{verdict.submission_id or verdict.correlation_mechanism}`" if verdict is not None else ""
+    verdict_display = "Accepted" if (verdict is not None and verdict.state == VerdictState.ACCEPTED) else (verdict.state.value if verdict is not None else "Unverified")
     readme_content = f"""# {clean_slug}
 
 [Original practice problem]({url})
 
-Date: {today_str} (Asia/Kolkata). Status: **Accepted**. Platform: **{platform_name}**.{sub_id_text}
+Date: {today_str} (Asia/Kolkata). Status: **{verdict_display}**. Platform: **{platform_name}**.{sub_id_text}
 
 ## Approach
 
@@ -2439,29 +2585,66 @@ Solution generated in Java and verified on {platform_name} by autonomous AI bot.
 """
     readme_path.write_text(readme_content, encoding="utf-8")
 
-    # Git pull --rebase, add, commit, push
+    # Stage ONLY the solution and generated documentation (NEVER git add .)
     try:
-        subprocess.run(["git", "pull", "--rebase", "origin", "main"], cwd=repo_dir, capture_output=True)
-        subprocess.run(["git", "add", "."], cwd=repo_dir, check=True)
+        rel_src = src_path.relative_to(repo_dir)
+        rel_readme = readme_path.relative_to(repo_dir)
 
-        status = subprocess.run(["git", "status", "--porcelain"], cwd=repo_dir, capture_output=True, text=True).stdout.strip()
-        if not status:
-            print(f"   ℹ️  GitHub repo '{repo_name}' already up-to-date.")
-            return True
+        add_res = subprocess.run(
+            ["git", "add", str(rel_src), str(rel_readme)],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True
+        )
+        if add_res.returncode != 0:
+            err = add_res.stderr.strip() or add_res.stdout.strip() or "git add failed"
+            print(f"   ⚠️  Git add failed: {err}")
+            return PublishResult(success=False, error=f"Stage failed: {err}", repo_name=repo_name, branch=branch)
 
-        commit_msg = f"Add verified Java solution for {clean_slug} [{platform_name}]"
-        subprocess.run(["git", "commit", "-m", commit_msg], cwd=repo_dir, check=True, capture_output=True)
-        push_res = subprocess.run(["git", "push", "origin", "main"], cwd=repo_dir, capture_output=True, text=True)
+        status_res = subprocess.run(
+            ["git", "status", "--porcelain", str(rel_src), str(rel_readme)],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True
+        )
 
-        if push_res.returncode == 0:
-            print(f"   🐙 GitHub Commit & Push successful: {GITHUB_USERNAME}/{repo_name} ({clean_slug})!")
-            return True
+        # Commit only if there are changes; stop immediately on failure (Failed commit -> no push)
+        if status_res.stdout.strip():
+            commit_msg = f"Add verified Java solution for {clean_slug} [{platform_name}]"
+            commit_res = subprocess.run(
+                ["git", "commit", "-m", commit_msg],
+                cwd=repo_dir,
+                capture_output=True,
+                text=True
+            )
+            if commit_res.returncode != 0:
+                err = commit_res.stderr.strip() or commit_res.stdout.strip() or "git commit failed"
+                print(f"   ⚠️  Git commit failed: {err}")
+                return PublishResult(success=False, error=f"Commit failed: {err}", repo_name=repo_name, branch=branch)
         else:
-            print(f"   ⚠️  Git push notice: {push_res.stderr.strip() or push_res.stdout.strip()}")
-            return False
+            print(f"   ℹ️  GitHub repo '{repo_name}' already has solution staged/committed for {clean_slug}.")
+
+        # Push to remote default branch to confirm remote is in sync
+        push_res = subprocess.run(
+            ["git", "push", "origin", branch],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True
+        )
+        if push_res.returncode == 0:
+            commit_hash = None
+            rev_res = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo_dir, capture_output=True, text=True)
+            if rev_res.returncode == 0:
+                commit_hash = rev_res.stdout.strip()
+            print(f"   🐙 GitHub Commit & Push successful: {GITHUB_USERNAME}/{repo_name} ({clean_slug}) [{branch}]!")
+            return PublishResult(success=True, repo_name=repo_name, branch=branch, commit_hash=commit_hash)
+        else:
+            err = push_res.stderr.strip() or push_res.stdout.strip() or "git push failed"
+            print(f"   ⚠️  Git push notice: {err}")
+            return PublishResult(success=False, error=f"Push failed: {err}", repo_name=repo_name, branch=branch)
     except Exception as e:
         print(f"   ⚠️  Git operation notice: {e}")
-        return False
+        return PublishResult(success=False, error=f"Git operation failed: {e}", repo_name=repo_name, branch=branch)
 
 # ==============================================================================
 # Problem Solver Pipeline (Fully Automated, Java)
@@ -2469,8 +2652,12 @@ Solution generated in Java and verified on {platform_name} by autonomous AI bot.
 async def process_problem(
     page: Page,
     url: str,
-    mode: str = "run"
-) -> bool:
+    mode: str = "run",
+    retry_publish: bool = False,
+    cached_verdict: Optional[SubmissionVerdict] = None,
+    cached_code: Optional[str] = None,
+    cached_explanation: Optional[str] = None,
+) -> ProcessResult:
     """Processes a single coding problem URL end-to-end in Java with zero human input."""
     print(f"\n{'='*70}")
     print(f"🚀 Processing: {url}")
@@ -2484,10 +2671,68 @@ async def process_problem(
 
     if not config:
         print(f"❌ Unsupported platform domain for URL: {url}")
-        return False
+        return ProcessResult(stage=ProcessStage.GENERATED, success=False, url=url, error="Unsupported platform domain")
 
     platform_name = config["name"]
     platform_type = config["type"]
+    prob_id = extract_problem_id(url, platform_type)
+
+    # Fast-path for retrying publishing on already accepted solution without resubmitting
+    if retry_publish:
+        print(f"\n🔄 Retrying publishing for {url} without re-submitting to judge...")
+        if not cached_verdict or cached_verdict.state != VerdictState.ACCEPTED or not cached_code:
+            return ProcessResult(
+                stage=ProcessStage.PUBLISH_FAILED,
+                success=False,
+                url=url,
+                platform=platform_type,
+                problem_id=prob_id,
+                solution_code=cached_code,
+                explanation=cached_explanation,
+                verdict=cached_verdict,
+                error="Cannot retry publish without accepted verdict and solution code",
+                publish_error="Missing accepted verdict or code for publish retry",
+                published=False
+            )
+        filename = get_safe_java_filename(url, platform_name)
+        save_java_solution(filename, cached_code, url, cached_explanation or "", platform_name, verdict=cached_verdict)
+        pub_res = commit_solution_to_github(
+            platform_type=platform_type,
+            url=url,
+            code=cached_code,
+            explanation=cached_explanation or "",
+            platform_name=platform_name,
+            verdict=cached_verdict
+        )
+        if pub_res.success:
+            print(f"✅ Retry publish succeeded for {url}!\n")
+            return ProcessResult(
+                stage=ProcessStage.PUBLISHED,
+                success=True,
+                url=url,
+                platform=platform_type,
+                problem_id=prob_id,
+                solution_code=cached_code,
+                explanation=cached_explanation,
+                verdict=cached_verdict,
+                saved_path=str(SOLUTIONS_DIR / filename),
+                published=True
+            )
+        else:
+            return ProcessResult(
+                stage=ProcessStage.PUBLISH_FAILED,
+                success=False,
+                url=url,
+                platform=platform_type,
+                problem_id=prob_id,
+                solution_code=cached_code,
+                explanation=cached_explanation,
+                verdict=cached_verdict,
+                saved_path=str(SOLUTIONS_DIR / filename),
+                publish_error=pub_res.error,
+                error=f"Publish retry failed: {pub_res.error}",
+                published=False
+            )
 
     # 1. Navigate to problem page
     print(f"[1/6] Navigating to {platform_name}...")
@@ -2496,7 +2741,7 @@ async def process_problem(
         await asyncio.sleep(4)
     except Exception as e:
         print(f"❌ Failed to load {url}: {e}")
-        return False
+        return ProcessResult(stage=ProcessStage.GENERATED, success=False, url=url, platform=platform_type, problem_id=prob_id, error=f"Failed to load {url}: {e}")
 
     # 2. Automatically ensure editor language is set to Java
     print("[2/6] Ensuring editor language is set to Java...")
@@ -2511,7 +2756,7 @@ async def process_problem(
         problem_text = await extract_problem_text(page, config["question_selectors"])
         if not problem_text:
             print("❌ Unable to find problem description. Skipping.")
-            return False
+            return ProcessResult(stage=ProcessStage.GENERATED, success=False, url=url, platform=platform_type, problem_id=prob_id, error="Unable to find problem description")
 
     print(f"   📄 Extracted problem description ({len(problem_text)} characters).")
 
@@ -2551,9 +2796,27 @@ async def process_problem(
 
     if not compile_passed or not solution_code:
         print(f"❌ Failed to generate compiling Java code for {url} after 3 attempts. Skipping to protect repo integrity.")
-        return False
+        return ProcessResult(stage=ProcessStage.GENERATED, success=False, url=url, platform=platform_type, problem_id=prob_id, error="Failed to generate compiling Java code after 3 attempts")
 
     print(f"   💡 Approach: {explanation}")
+    filename = get_safe_java_filename(url, platform_name)
+
+    # In mode 'save', store locally only; no judge submission or GitHub commit
+    if mode == "save":
+        print(f"   💾 Mode 'SAVE': saving compiled Java solution locally without running or submitting.")
+        save_java_solution(filename, solution_code, url, explanation, platform_name, verdict=None)
+        return ProcessResult(
+            stage=ProcessStage.COMPILED,
+            success=True,
+            url=url,
+            platform=platform_type,
+            problem_id=prob_id,
+            solution_code=solution_code,
+            explanation=explanation,
+            verdict=None,
+            saved_path=str(SOLUTIONS_DIR / filename),
+            published=False
+        )
 
     # Optional local sample test verification for Codeforces
     if platform_type == "codeforces":
@@ -2633,9 +2896,19 @@ async def process_problem(
                     if not logged_in:
                         page._anti_bot_blocked = True
                         print("\n🛑 Login timed out. Codeforces submissions require an authenticated user account.")
-                        filename = get_safe_java_filename(url, platform_name)
                         save_java_solution(filename, solution_code, url, explanation, platform_name)
-                        return False
+                        return ProcessResult(
+                            stage=ProcessStage.SUBMITTED,
+                            success=False,
+                            url=url,
+                            platform=platform_type,
+                            problem_id=prob_id,
+                            solution_code=solution_code,
+                            explanation=explanation,
+                            saved_path=str(SOLUTIONS_DIR / filename),
+                            error="Codeforces login timed out",
+                            published=False
+                        )
                 
                 # Fill problem code (e.g. 1352C)
                 await page.locator('input[name="submittedProblemCode"]').fill(prob_code)
@@ -2664,7 +2937,6 @@ async def process_problem(
                 }""")
 
                 if has_turnstile:
-                    # Give Turnstile up to 8s to generate token automatically
                     token = ""
                     for _ in range(8):
                         token = await page.evaluate("""() => {
@@ -2704,9 +2976,19 @@ async def process_problem(
                     if not token:
                         page._anti_bot_blocked = True
                         print("\n🛑 Codeforces anti-bot verification (Cloudflare Turnstile) was not completed.")
-                        filename = get_safe_java_filename(url, platform_name)
                         save_java_solution(filename, solution_code, url, explanation, platform_name)
-                        return False
+                        return ProcessResult(
+                            stage=ProcessStage.SUBMITTED,
+                            success=False,
+                            url=url,
+                            platform=platform_type,
+                            problem_id=prob_id,
+                            solution_code=solution_code,
+                            explanation=explanation,
+                            saved_path=str(SOLUTIONS_DIR / filename),
+                            error="Codeforces anti-bot verification was not completed",
+                            published=False
+                        )
 
                 # Capture pre-submission snapshot to anchor submission time and detect stale submissions
                 submission_snapshot = await capture_pre_submission_snapshot(page, platform_type, url)
@@ -2744,9 +3026,19 @@ async def process_problem(
                     if not token:
                         page._anti_bot_blocked = True
                         print("\n🛑 Codeforces anti-bot verification was not completed.")
-                        filename = get_safe_java_filename(url, platform_name)
                         save_java_solution(filename, solution_code, url, explanation, platform_name)
-                        return False
+                        return ProcessResult(
+                            stage=ProcessStage.SUBMITTED,
+                            success=False,
+                            url=url,
+                            platform=platform_type,
+                            problem_id=prob_id,
+                            solution_code=solution_code,
+                            explanation=explanation,
+                            saved_path=str(SOLUTIONS_DIR / filename),
+                            error="Codeforces anti-bot verification not completed on retry",
+                            published=False
+                        )
             except Exception as e:
                 print(f"   ⚠️  Codeforces submit notice: {e}")
         else:
@@ -2794,7 +3086,17 @@ async def process_problem(
         print("[7/7] Verifying live judge submission verdict...")
         if platform_type != "codeforces" and not submit_clicked:
             print(f"   ❌ No submit button could be clicked on {platform_name}.")
-            return False
+            return ProcessResult(
+                stage=ProcessStage.SUBMITTED,
+                success=False,
+                url=url,
+                platform=platform_type,
+                problem_id=prob_id,
+                solution_code=solution_code,
+                explanation=explanation,
+                error=f"No submit button could be clicked on {platform_name}",
+                published=False
+            )
 
         verdict = await verify_live_submission_verdict(
             page,
@@ -2814,23 +3116,72 @@ async def process_problem(
         if verdict_state != VerdictState.ACCEPTED:
             print(f"   ❌ Problem {url} NOT accepted by judge ({verdict_msg}) [State: {verdict_state.value}].")
             print(f"   🛑 SKIPPING GitHub commit to guarantee ZERO broken solutions in repository!")
-            return False
+            save_java_solution(filename, solution_code, url, explanation, platform_name, verdict=verdict)
+            return ProcessResult(
+                stage=ProcessStage.REJECTED,
+                success=False,
+                url=url,
+                platform=platform_type,
+                problem_id=prob_id,
+                solution_code=solution_code,
+                explanation=explanation,
+                verdict=verdict,
+                saved_path=str(SOLUTIONS_DIR / filename),
+                error=verdict_msg,
+                published=False
+            )
     else:
         # In RUN mode, no submission was made to the judge
         print(f"   ℹ️  Mode '{mode.upper()}': solution tested locally without judge submission. Skipping GitHub commit.")
-        filename = get_safe_java_filename(url, platform_name)
-        save_java_solution(filename, solution_code, url, explanation, platform_name)
-        return True
+        save_java_solution(filename, solution_code, url, explanation, platform_name, verdict=None)
+        return ProcessResult(
+            stage=ProcessStage.TESTED,
+            success=True,
+            url=url,
+            platform=platform_type,
+            problem_id=prob_id,
+            solution_code=solution_code,
+            explanation=explanation,
+            verdict=None,
+            saved_path=str(SOLUTIONS_DIR / filename),
+            published=False
+        )
 
     # 8. ONLY COMMIT TO GITHUB IF GENUINELY VERIFIED & ACCEPTED
-    filename = get_safe_java_filename(url, platform_name)
     save_java_solution(filename, solution_code, url, explanation, platform_name, verdict=verdict)
 
     print("   🐙 Committing verified solution to GitHub repo...")
-    commit_solution_to_github(platform_type, url, solution_code, explanation, platform_name, verdict=verdict)
+    pub_res = commit_solution_to_github(platform_type, url, solution_code, explanation, platform_name, verdict=verdict)
+    if not pub_res.success:
+        print(f"   ❌ GitHub publishing failed: {pub_res.error}")
+        return ProcessResult(
+            stage=ProcessStage.PUBLISH_FAILED,
+            success=False,
+            url=url,
+            platform=platform_type,
+            problem_id=prob_id,
+            solution_code=solution_code,
+            explanation=explanation,
+            verdict=verdict,
+            saved_path=str(SOLUTIONS_DIR / filename),
+            publish_error=pub_res.error,
+            error=f"Publish failed: {pub_res.error}",
+            published=False
+        )
 
     print(f"✅ Completed processing: {url} (VERIFIED ACCEPTED & COMMITTED)\n")
-    return True
+    return ProcessResult(
+        stage=ProcessStage.PUBLISHED,
+        success=True,
+        url=url,
+        platform=platform_type,
+        problem_id=prob_id,
+        solution_code=solution_code,
+        explanation=explanation,
+        verdict=verdict,
+        saved_path=str(SOLUTIONS_DIR / filename),
+        published=True
+    )
 
 async def ensure_live_page(page: Page, p_playwright=None, browser=None, context=None) -> Tuple[Any, Any, Page]:
     """Guarantees an active, responsive browser page by reconnecting over CDP if disconnected."""
@@ -2955,19 +3306,35 @@ async def solve_platform_quota(
 
         try:
             # 180s hard timeout per problem to prevent any infinite freeze
-            success = await asyncio.wait_for(process_problem(page, url, mode=mode), timeout=180)
+            result = await asyncio.wait_for(process_problem(page, url, mode=mode), timeout=180)
         except asyncio.TimeoutError:
             print(f"   ⏱️  Problem processing timed out after 180s for {url}. Recovering...")
             try:
                 await page.goto("about:blank", timeout=5000)
             except Exception:
                 pass
-            success = False
+            result = ProcessResult(stage=ProcessStage.SUBMITTED, success=False, url=url, error="Processing timeout (180s)")
         except Exception as e:
             print(f"   ❌ Unhandled error processing {url}: {e}")
-            success = False
+            result = ProcessResult(stage=ProcessStage.SUBMITTED, success=False, url=url, error=str(e))
 
-        if success:
+        # Check for publish failure on confirmed accepted solution: retry publishing without resubmitting
+        if result.stage == ProcessStage.PUBLISH_FAILED and result.verdict and result.verdict.state == VerdictState.ACCEPTED:
+            print(f"   ⚠️  Publish failed for {url} ({result.publish_error}). Retrying publish without resubmitting to judge...")
+            retry_res = await process_problem(
+                page, url, mode=mode,
+                retry_publish=True,
+                cached_verdict=result.verdict,
+                cached_code=result.solution_code,
+                cached_explanation=result.explanation
+            )
+            if retry_res.published:
+                result = retry_res
+
+        # Quota credit requires confirmed publication in submit/both modes
+        is_successful = (result.success and result.published) if mode in ["submit", "both"] else result.success
+
+        if is_successful:
             accepted_count += 1
             SolvedRegistry.mark_solved(platform, url)
             print(f"🎉 [{platform.upper()}] Progress: {accepted_count}/{target_accepted} ACCEPTED & COMMITTED TO GITHUB!\n")
@@ -2979,7 +3346,10 @@ async def solve_platform_quota(
                 print(f"🛑 Stopping {platform.upper()} attempts immediately to avoid continuous looping.")
                 print(f"📁 Generated Java solution has been saved to: {SOLUTIONS_DIR.resolve()}\n")
                 break
-            print(f"⚠️ [{platform.upper()}] Problem was NOT accepted by the judge.")
+            if result.stage == ProcessStage.PUBLISH_FAILED:
+                print(f"⚠️ [{platform.upper()}] Problem was accepted by judge, but GitHub publishing failed ({result.publish_error}).")
+            else:
+                print(f"⚠️ [{platform.upper()}] Problem was NOT accepted by the judge ({result.error or 'rejected'}).")
             print(f"🔄 Selecting next unsolved replacement problem to guarantee {target_accepted} accepted solutions...\n")
 
         await asyncio.sleep(3)
@@ -2994,7 +3364,7 @@ async def execute_batch(
     mode: str,
     file_path: Optional[str] = None,
     headless: bool = False
-):
+) -> bool:
     """Executes a complete automated batch of problems with zero human input."""
     start_time = datetime.now()
     print("\n" + "=" * 70)
@@ -3108,13 +3478,16 @@ async def execute_batch(
         await asyncio.sleep(2)
 
         total_accepted = 0
+        target_total = 0
         if platform == "file" and file_path and os.path.exists(file_path):
             with open(file_path, "r", encoding="utf-8") as f:
                 urls_to_solve = [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
+            target_total = len(urls_to_solve)
             for idx, url in enumerate(urls_to_solve, 1):
                 browser, context, page = await ensure_live_page(page, p, browser, context)
-                success = await process_problem(page, url, mode=mode)
-                if success:
+                res = await process_problem(page, url, mode=mode)
+                is_ok = (res.success and res.published) if mode in ["submit", "both"] else res.success
+                if is_ok:
                     total_accepted += 1
                 if idx < len(urls_to_solve):
                     await asyncio.sleep(4)
@@ -3159,6 +3532,7 @@ async def execute_batch(
 
             print(f"\n🏆 COMPLETED! {total_accepted}/{target_total} total problems verified Accepted & committed to GitHub!")
         else:
+            target_total = count
             total_accepted, browser, context, page = await solve_platform_quota(
                 page, platform, target_accepted=count, difficulty=difficulty, mode=mode,
                 p_playwright=p, browser=browser, context=context
@@ -3201,6 +3575,11 @@ async def execute_batch(
                 await browser.close()
             except Exception:
                 pass
+
+        batch_success = (total_accepted >= target_total) if target_total > 0 else True
+        if not batch_success:
+            print(f"\n⚠️  Batch quota shortfall: {total_accepted}/{target_total} completed.")
+        return batch_success
 
 # ==============================================================================
 # Daily Scheduler Loop
@@ -3445,8 +3824,8 @@ async def main():
         print("   Tip: Run './run.sh' for an interactive menu, or use --help for flags")
         print("=" * 70 + "\n")
 
-    async def run_batch():
-        await execute_batch(
+    async def run_batch() -> bool:
+        return await execute_batch(
             platform=args.platform,
             count=args.count,
             difficulty=args.difficulty,
@@ -3458,17 +3837,30 @@ async def main():
     if args.daily:
         if args.run_now:
             print("🚀 --run-now flag detected: Running first batch immediately...")
-            await run_batch()
+            ok = await run_batch()
+            if not ok:
+                print("⚠️ Initial run-now batch reported failures.")
         await run_daily_scheduler(args.daily, run_batch)
+        return 0
     else:
-        await run_batch()
+        ok = await run_batch()
+        if not ok:
+            print("\n❌ Batch execution completed with failure / quota shortfall.")
+            sys.exit(1)
+        return 0
 
 def cli():
     try:
-        asyncio.run(main())
+        ret = asyncio.run(main())
+        sys.exit(ret or 0)
+    except SystemExit as se:
+        sys.exit(se.code)
     except KeyboardInterrupt:
         print("\n👋 AutoCoder AI stopped by user. See you next time!")
         sys.exit(0)
+    except Exception as e:
+        print(f"\n❌ Fatal error: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     cli()

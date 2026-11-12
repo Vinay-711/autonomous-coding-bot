@@ -2,12 +2,16 @@ import asyncio
 import json
 import time
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock
 from pathlib import Path
 
 from bot import (
     VerdictState,
     SubmissionVerdict,
+    ProcessStage,
+    ProcessResult,
+    PublishResult,
+    get_repo_default_branch,
     PollingConfig,
     poll_with_backoff,
     extract_problem_id,
@@ -16,9 +20,43 @@ from bot import (
     record_submission_evidence,
     save_java_solution,
     commit_solution_to_github,
+    process_problem,
+    solve_platform_quota,
+    execute_batch,
     SUBMISSIONS_LOG_FILE,
     SOLUTIONS_DIR,
 )
+
+class MockLocator:
+    def __init__(self, visible=True):
+        self._visible = visible
+    @property
+    def first(self):
+        return self
+    async def is_visible(self):
+        return self._visible
+    async def click(self):
+        pass
+    async def count(self):
+        return 1
+    def locator(self, *args):
+        return self
+    async def all(self):
+        return []
+
+class MockPipelinePage:
+    def __init__(self, url="https://leetcode.com/problems/two-sum"):
+        self._anti_bot_blocked = False
+        self.url = url
+
+    async def goto(self, *args, **kwargs):
+        pass
+
+    async def evaluate(self, *args, **kwargs):
+        return ""
+
+    def locator(self, *args, **kwargs):
+        return MockLocator()
 
 
 class MockPage:
@@ -761,7 +799,7 @@ def test_commit_solution_to_github_includes_submission_id(tmp_path):
             "HackerRank",
             verdict=verdict,
         )
-        assert ok is True
+        assert ok.success is True
         # Check generated README
         readmes = list(repo_dir.glob("**/README.md"))
         assert len(readmes) == 1
@@ -772,39 +810,6 @@ def test_commit_solution_to_github_includes_submission_id(tmp_path):
 @pytest.mark.asyncio
 async def test_process_problem_skips_commit_on_unaccepted_verdict():
     """Verify that process_problem strictly refuses to commit when judge does not return ACCEPTED."""
-    from bot import process_problem
-
-    class MockLocator:
-        def __init__(self, visible=True):
-            self._visible = visible
-        @property
-        def first(self):
-            return self
-        async def is_visible(self):
-            return self._visible
-        async def click(self):
-            pass
-        async def count(self):
-            return 1
-        def locator(self, *args):
-            return self
-        async def all(self):
-            return []
-
-    class MockPipelinePage:
-        def __init__(self):
-            self._anti_bot_blocked = False
-            self.url = "https://leetcode.com/problems/two-sum"
-
-        async def goto(self, *args, **kwargs):
-            pass
-
-        async def evaluate(self, *args, **kwargs):
-            return ""
-
-        def locator(self, *args, **kwargs):
-            return MockLocator()
-
     page = MockPipelinePage()
 
     with patch("asyncio.sleep"):
@@ -818,8 +823,9 @@ async def test_process_problem_skips_commit_on_unaccepted_verdict():
              patch("bot.capture_pre_submission_snapshot", return_value={"start_time": time.time(), "pre_submission_id": None, "account": None, "problem_id": "two-sum"}), \
              patch("bot.verify_live_submission_verdict", return_value=SubmissionVerdict(VerdictState.REJECTED, "Wrong Answer")), \
              patch("bot.commit_solution_to_github") as mock_commit:
-            success = await process_problem(page, "https://leetcode.com/problems/two-sum", mode="submit")
-            assert success is False
+            res = await process_problem(page, "https://leetcode.com/problems/two-sum", mode="submit")
+            assert res.success is False
+            assert res.stage == ProcessStage.REJECTED
             mock_commit.assert_not_called()
 
         # Case 2: Pending verdict -> returns False, never commits
@@ -832,8 +838,9 @@ async def test_process_problem_skips_commit_on_unaccepted_verdict():
              patch("bot.capture_pre_submission_snapshot", return_value={"start_time": time.time(), "pre_submission_id": None, "account": None, "problem_id": "two-sum"}), \
              patch("bot.verify_live_submission_verdict", return_value=SubmissionVerdict(VerdictState.PENDING, "Judging")), \
              patch("bot.commit_solution_to_github") as mock_commit:
-            success = await process_problem(page, "https://leetcode.com/problems/two-sum", mode="submit")
-            assert success is False
+            res = await process_problem(page, "https://leetcode.com/problems/two-sum", mode="submit")
+            assert res.success is False
+            assert res.stage == ProcessStage.REJECTED
             mock_commit.assert_not_called()
 
         # Case 3: Accepted verdict -> returns True, commits to GitHub
@@ -846,8 +853,451 @@ async def test_process_problem_skips_commit_on_unaccepted_verdict():
              patch("bot.capture_pre_submission_snapshot", return_value={"start_time": time.time(), "pre_submission_id": None, "account": None, "problem_id": "two-sum"}), \
              patch("bot.verify_live_submission_verdict", return_value=SubmissionVerdict(VerdictState.ACCEPTED, "Accepted", submission_id="sub_999")), \
              patch("bot.save_java_solution"), \
-             patch("bot.commit_solution_to_github", return_value=True) as mock_commit:
-            success = await process_problem(page, "https://leetcode.com/problems/two-sum", mode="submit")
-            assert success is True
+             patch("bot.commit_solution_to_github", return_value=PublishResult(success=True, branch="main", repo_name="leetcode-daily")) as mock_commit:
+            res = await process_problem(page, "https://leetcode.com/problems/two-sum", mode="submit")
+            assert res.success is True
+            assert res.stage == ProcessStage.PUBLISHED
             mock_commit.assert_called_once()
+
+
+# ==============================================================================
+# 9. Structured ProcessResult & Safe Publishing Tests
+# ==============================================================================
+
+def test_process_result_and_publish_result_models():
+    """Verify ProcessStage, ProcessResult, and PublishResult behavior."""
+    assert ProcessStage.PUBLISHED == "PUBLISHED"
+    assert ProcessStage.PUBLISH_FAILED == "PUBLISH_FAILED"
+    assert ProcessStage.TESTED == "TESTED"
+    assert ProcessStage.COMPILED == "COMPILED"
+
+    res_ok = ProcessResult(stage=ProcessStage.PUBLISHED, success=True, published=True)
+    assert bool(res_ok) is True
+    assert res_ok == ProcessStage.PUBLISHED
+    assert res_ok == "PUBLISHED"
+    assert res_ok == True
+
+    res_fail = ProcessResult(stage=ProcessStage.PUBLISH_FAILED, success=False, published=False, publish_error="push error")
+    assert bool(res_fail) is False
+    assert res_fail == ProcessStage.PUBLISH_FAILED
+    assert res_fail == False
+
+    pub_ok = PublishResult(success=True, branch="main", repo_name="repo")
+    assert bool(pub_ok) is True
+    assert pub_ok == True
+    success_flag, err_msg = pub_ok
+    assert success_flag is True
+    assert err_msg is None
+
+    pub_fail = PublishResult(success=False, error="rebase conflict")
+    assert bool(pub_fail) is False
+    assert pub_fail == False
+
+
+def test_get_repo_default_branch(tmp_path):
+    """Verify default branch detection from git repository."""
+    assert get_repo_default_branch(tmp_path) == "main"
+
+    with patch("subprocess.run") as mock_sub:
+        mock_sub.return_value.returncode = 0
+        mock_sub.return_value.stdout = "origin/master\n"
+        assert get_repo_default_branch(tmp_path) == "master"
+
+    with patch("subprocess.run") as mock_sub:
+        mock_sub.return_value.returncode = 0
+        mock_sub.return_value.stdout = "origin/develop\n"
+        assert get_repo_default_branch(tmp_path) == "develop"
+
+
+def test_commit_solution_to_github_failed_pull_no_commit(tmp_path):
+    """Verify that if git pull --rebase fails, commit and push are NEVER attempted."""
+    repo_dir = tmp_path / "leetcode-daily"
+    repo_dir.mkdir(parents=True)
+    verdict = SubmissionVerdict(VerdictState.ACCEPTED, "Accepted", submission_id="sub_1")
+
+    call_commands = []
+    def fake_subprocess_run(cmd, *args, **kwargs):
+        call_commands.append(cmd)
+        mock = MagicMock()
+        if "pull" in cmd:
+            mock.returncode = 1
+            mock.stderr = "fatal: unable to rebase"
+            mock.stdout = ""
+        else:
+            mock.returncode = 0
+            mock.stdout = ""
+            mock.stderr = ""
+        return mock
+
+    with patch("bot.GITHUB_USERNAME", "testuser"), \
+         patch("bot.REPOS_DIR", tmp_path), \
+         patch("subprocess.run", side_effect=fake_subprocess_run):
+        res = commit_solution_to_github(
+            "leetcode",
+            "https://leetcode.com/problems/two-sum",
+            "class Solution {}",
+            "Greedy",
+            "LeetCode",
+            verdict=verdict
+        )
+        assert res.success is False
+        assert "Pull failed" in res.error
+        commit_calls = [c for c in call_commands if "commit" in c]
+        assert len(commit_calls) == 0, f"Expected no git commit calls, got: {commit_calls}"
+        push_calls = [c for c in call_commands if "push" in c]
+        assert len(push_calls) == 0, f"Expected no git push calls, got: {push_calls}"
+
+
+def test_commit_solution_to_github_failed_commit_no_push(tmp_path):
+    """Verify that if git commit fails, git push is NEVER attempted."""
+    repo_dir = tmp_path / "leetcode-daily"
+    repo_dir.mkdir(parents=True)
+    verdict = SubmissionVerdict(VerdictState.ACCEPTED, "Accepted", submission_id="sub_1")
+
+    call_commands = []
+    def fake_subprocess_run(cmd, *args, **kwargs):
+        call_commands.append(cmd)
+        mock = MagicMock()
+        if "status" in cmd:
+            mock.returncode = 0
+            mock.stdout = "A  Solution.java\n"
+            mock.stderr = ""
+        elif "commit" in cmd:
+            mock.returncode = 1
+            mock.stderr = "error: unable to write commit object"
+            mock.stdout = ""
+        else:
+            mock.returncode = 0
+            mock.stdout = ""
+            mock.stderr = ""
+        return mock
+
+    with patch("bot.GITHUB_USERNAME", "testuser"), \
+         patch("bot.REPOS_DIR", tmp_path), \
+         patch("subprocess.run", side_effect=fake_subprocess_run):
+        res = commit_solution_to_github(
+            "leetcode",
+            "https://leetcode.com/problems/two-sum",
+            "class Solution {}",
+            "Greedy",
+            "LeetCode",
+            verdict=verdict
+        )
+        assert res.success is False
+        assert "Commit failed" in res.error
+        push_calls = [c for c in call_commands if "push" in c]
+        assert len(push_calls) == 0, f"Expected no git push calls, got: {push_calls}"
+
+
+def test_commit_solution_to_github_stages_only_solution_and_readme_never_git_add_all(tmp_path):
+    """Verify that git add . is NEVER called; only targeted solution and readme files are staged."""
+    repo_dir = tmp_path / "leetcode-daily"
+    repo_dir.mkdir(parents=True)
+    verdict = SubmissionVerdict(VerdictState.ACCEPTED, "Accepted", submission_id="sub_1")
+
+    call_commands = []
+    def fake_subprocess_run(cmd, *args, **kwargs):
+        call_commands.append(cmd)
+        mock = MagicMock()
+        if "status" in cmd:
+            mock.returncode = 0
+            mock.stdout = "A  solutions/..."
+        else:
+            mock.returncode = 0
+            mock.stdout = ""
+            mock.stderr = ""
+        return mock
+
+    with patch("bot.GITHUB_USERNAME", "testuser"), \
+         patch("bot.REPOS_DIR", tmp_path), \
+         patch("subprocess.run", side_effect=fake_subprocess_run):
+        res = commit_solution_to_github(
+            "leetcode",
+            "https://leetcode.com/problems/two-sum",
+            "class Solution {}",
+            "Greedy",
+            "LeetCode",
+            verdict=verdict
+        )
+        assert res.success is True
+        for c in call_commands:
+            if c[:2] == ["git", "add"]:
+                assert "." not in c, f"Found unsafe 'git add .' invocation: {c}"
+                staged = [arg for arg in c[2:] if not arg.startswith("-")]
+                assert len(staged) == 2
+                assert any("Solution.java" in s for s in staged)
+                assert any("README.md" in s for s in staged)
+
+
+def test_commit_solution_to_github_refuses_non_accepted_verdict(tmp_path):
+    """Verify commit_solution_to_github refuses to publish non-accepted verdicts."""
+    repo_dir = tmp_path / "leetcode-daily"
+    repo_dir.mkdir(parents=True)
+    verdict = SubmissionVerdict(VerdictState.REJECTED, "Wrong Answer")
+
+    with patch("bot.GITHUB_USERNAME", "testuser"), \
+         patch("bot.REPOS_DIR", tmp_path):
+        res = commit_solution_to_github(
+            "leetcode",
+            "https://leetcode.com/problems/two-sum",
+            "class Solution {}",
+            "Greedy",
+            "LeetCode",
+            verdict=verdict
+        )
+        assert res.success is False
+        assert "Cannot commit solution with non-accepted verdict" in res.error
+
+
+@pytest.mark.asyncio
+async def test_process_problem_accepted_and_push_success_yields_published():
+    """Verify Accepted + push success -> PUBLISHED."""
+    page = MockPipelinePage()
+    with patch("asyncio.sleep"), \
+         patch("bot.switch_editor_to_java"), \
+         patch("bot.extract_problem_text", return_value="Solve Two Sum"), \
+         patch("bot.extract_editor_code", return_value="class Solution {}"), \
+         patch("bot.ask_gemini_for_java_code", return_value=("public class Solution {}", "Greedy")), \
+         patch("bot.compile_java_code_locally", return_value=(True, "", "public class Solution {}")), \
+         patch("bot.inject_code_into_editor", return_value=True), \
+         patch("bot.capture_pre_submission_snapshot", return_value={"start_time": time.time(), "pre_submission_id": None, "account": None, "problem_id": "two-sum"}), \
+         patch("bot.verify_live_submission_verdict", return_value=SubmissionVerdict(VerdictState.ACCEPTED, "Accepted", submission_id="sub_ok_100")), \
+         patch("bot.save_java_solution"), \
+         patch("bot.commit_solution_to_github", return_value=PublishResult(success=True, branch="main", repo_name="leetcode-daily")) as mock_commit:
+        result = await process_problem(page, "https://leetcode.com/problems/two-sum", mode="submit")
+        assert result.stage == ProcessStage.PUBLISHED
+        assert result.success is True
+        assert result.published is True
+        assert result.verdict.state == VerdictState.ACCEPTED
+        mock_commit.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_process_problem_accepted_and_push_failure_yields_publish_failed():
+    """Verify Accepted + push failure -> PUBLISH_FAILED."""
+    page = MockPipelinePage()
+    with patch("asyncio.sleep"), \
+         patch("bot.switch_editor_to_java"), \
+         patch("bot.extract_problem_text", return_value="Solve Two Sum"), \
+         patch("bot.extract_editor_code", return_value="class Solution {}"), \
+         patch("bot.ask_gemini_for_java_code", return_value=("public class Solution {}", "Greedy")), \
+         patch("bot.compile_java_code_locally", return_value=(True, "", "public class Solution {}")), \
+         patch("bot.inject_code_into_editor", return_value=True), \
+         patch("bot.capture_pre_submission_snapshot", return_value={"start_time": time.time(), "pre_submission_id": None, "account": None, "problem_id": "two-sum"}), \
+         patch("bot.verify_live_submission_verdict", return_value=SubmissionVerdict(VerdictState.ACCEPTED, "Accepted", submission_id="sub_ok_100")), \
+         patch("bot.save_java_solution"), \
+         patch("bot.commit_solution_to_github", return_value=PublishResult(success=False, error="Git push failed: network error")) as mock_commit:
+        result = await process_problem(page, "https://leetcode.com/problems/two-sum", mode="submit")
+        assert result.stage == ProcessStage.PUBLISH_FAILED
+        assert result.success is False
+        assert result.published is False
+        assert result.verdict.state == VerdictState.ACCEPTED
+        assert "Git push failed" in result.publish_error
+        mock_commit.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_process_problem_mode_run_yields_tested_never_accepted():
+    """Verify Run-only -> TESTED, never ACCEPTED, never published."""
+    page = MockPipelinePage()
+    with patch("asyncio.sleep"), \
+         patch("bot.switch_editor_to_java"), \
+         patch("bot.extract_problem_text", return_value="Solve Two Sum"), \
+         patch("bot.extract_editor_code", return_value="class Solution {}"), \
+         patch("bot.ask_gemini_for_java_code", return_value=("public class Solution {}", "Greedy")), \
+         patch("bot.compile_java_code_locally", return_value=(True, "", "public class Solution {}")), \
+         patch("bot.inject_code_into_editor", return_value=True), \
+         patch("bot.save_java_solution") as mock_save, \
+         patch("bot.verify_live_submission_verdict") as mock_verify, \
+         patch("bot.commit_solution_to_github") as mock_commit:
+        result = await process_problem(page, "https://leetcode.com/problems/two-sum", mode="run")
+        assert result.stage == ProcessStage.TESTED
+        assert result.success is True
+        assert result.published is False
+        assert result.verdict is None
+        mock_verify.assert_not_called()
+        mock_commit.assert_not_called()
+        mock_save.assert_called_once()
+        assert mock_save.call_args[1].get("verdict") is None
+
+
+@pytest.mark.asyncio
+async def test_process_problem_mode_save_yields_compiled_never_accepted():
+    """Verify Save-only -> local save, COMPILED, never ACCEPTED, never submitted."""
+    page = MockPipelinePage()
+    with patch("asyncio.sleep"), \
+         patch("bot.switch_editor_to_java"), \
+         patch("bot.extract_problem_text", return_value="Solve Two Sum"), \
+         patch("bot.extract_editor_code", return_value="class Solution {}"), \
+         patch("bot.ask_gemini_for_java_code", return_value=("public class Solution {}", "Greedy")), \
+         patch("bot.compile_java_code_locally", return_value=(True, "", "public class Solution {}")), \
+         patch("bot.save_java_solution") as mock_save, \
+         patch("bot.inject_code_into_editor") as mock_inject, \
+         patch("bot.verify_live_submission_verdict") as mock_verify, \
+         patch("bot.commit_solution_to_github") as mock_commit:
+        result = await process_problem(page, "https://leetcode.com/problems/two-sum", mode="save")
+        assert result.stage == ProcessStage.COMPILED
+        assert result.success is True
+        assert result.published is False
+        assert result.verdict is None
+        mock_inject.assert_not_called()
+        mock_verify.assert_not_called()
+        mock_commit.assert_not_called()
+        mock_save.assert_called_once()
+        assert mock_save.call_args[1].get("verdict") is None
+
+
+@pytest.mark.asyncio
+async def test_process_problem_retry_publish_no_duplicate_judge_submission():
+    """Verify Retry publish -> no duplicate judge submission (0 evaluate/submit calls on page)."""
+    class SpyPage:
+        def __init__(self):
+            self.goto_calls = 0
+            self.eval_calls = 0
+            self.click_calls = 0
+            self._anti_bot_blocked = False
+
+        async def goto(self, *args, **kwargs):
+            self.goto_calls += 1
+
+        async def evaluate(self, *args, **kwargs):
+            self.eval_calls += 1
+            return ""
+
+        def locator(self, *args, **kwargs):
+            spy = self
+            class SpyLocator:
+                @property
+                def first(self):
+                    return self
+                async def is_visible(self):
+                    return True
+                async def click(self):
+                    spy.click_calls += 1
+            return SpyLocator()
+
+    page = SpyPage()
+    cached_verdict = SubmissionVerdict(
+        state=VerdictState.ACCEPTED,
+        message="Accepted",
+        submission_id="sub_cached_42",
+        correlation_mechanism="leetcode_rest_api_submission_id"
+    )
+
+    with patch("bot.save_java_solution"), \
+         patch("bot.verify_live_submission_verdict") as mock_judge, \
+         patch("bot.commit_solution_to_github", return_value=PublishResult(success=True, branch="main", repo_name="leetcode-daily")) as mock_commit:
+        result = await process_problem(
+            page,
+            "https://leetcode.com/problems/two-sum",
+            mode="submit",
+            retry_publish=True,
+            cached_verdict=cached_verdict,
+            cached_code="public class Solution {}",
+            cached_explanation="Hash Map"
+        )
+        assert result.stage == ProcessStage.PUBLISHED
+        assert result.success is True
+        assert result.published is True
+        assert page.goto_calls == 0
+        assert page.eval_calls == 0
+        assert page.click_calls == 0
+        mock_judge.assert_not_called()
+        mock_commit.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_solve_platform_quota_retries_publish_and_credits_quota():
+    """Verify solve_platform_quota retries publish on PUBLISH_FAILED without resubmitting to judge."""
+    page = MockPipelinePage()
+    accepted_verdict = SubmissionVerdict(VerdictState.ACCEPTED, "Accepted", submission_id="sub_q1")
+
+    call_count = 0
+    async def mock_process_problem(p, url, mode="both", retry_publish=False, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if retry_publish:
+            return ProcessResult(
+                stage=ProcessStage.PUBLISHED,
+                success=True,
+                published=True,
+                solution_code="code",
+                verdict=accepted_verdict
+            )
+        return ProcessResult(
+            stage=ProcessStage.PUBLISH_FAILED,
+            success=False,
+            published=False,
+            publish_error="Temporary git push network timeout",
+            solution_code="code",
+            explanation="Greedy",
+            verdict=accepted_verdict
+        )
+
+    with patch("asyncio.sleep"), \
+         patch("bot.ensure_live_page", return_value=(None, None, page)), \
+         patch("bot.discover_leetcode_candidates", return_value=["https://leetcode.com/problems/two-sum"]), \
+         patch("bot.SolvedRegistry.is_solved", return_value=False), \
+         patch("bot.SolvedRegistry.mark_solved") as mock_mark, \
+         patch("bot.process_problem", side_effect=mock_process_problem):
+        acc, _, _, _ = await solve_platform_quota(page, "leetcode", target_accepted=1, mode="both")
+        assert acc == 1
+        assert call_count == 2
+        mock_mark.assert_called_once_with("leetcode", "https://leetcode.com/problems/two-sum")
+
+
+@pytest.mark.asyncio
+async def test_solve_platform_quota_does_not_credit_unconfirmed_publish():
+    """Verify solve_platform_quota does not increment quota or mark solved if publish fails and retry fails."""
+    page = MockPipelinePage()
+    accepted_verdict = SubmissionVerdict(VerdictState.ACCEPTED, "Accepted", submission_id="sub_q2")
+
+    async def mock_process_problem(p, url, mode="both", retry_publish=False, **kwargs):
+        return ProcessResult(
+            stage=ProcessStage.PUBLISH_FAILED,
+            success=False,
+            published=False,
+            publish_error="Permanent auth error",
+            solution_code="code",
+            explanation="Greedy",
+            verdict=accepted_verdict
+        )
+
+    with patch("asyncio.sleep"), \
+         patch("bot.ensure_live_page", return_value=(None, None, page)), \
+         patch("bot.discover_leetcode_candidates", return_value=["https://leetcode.com/problems/two-sum"]), \
+         patch("bot.SolvedRegistry.is_solved", return_value=False), \
+         patch("bot.SolvedRegistry.mark_solved") as mock_mark, \
+         patch("bot.process_problem", side_effect=mock_process_problem):
+        acc, _, _, _ = await solve_platform_quota(page, "leetcode", target_accepted=1, mode="both")
+        assert acc == 0
+        mock_mark.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_execute_batch_returns_boolean_reflecting_quota_completion():
+    """Verify execute_batch returns True on quota fulfillment and False on deficit."""
+    with patch("bot.async_playwright") as mock_playwright:
+        mock_p = MagicMock()
+        mock_browser = MagicMock()
+        mock_browser.pages = []
+        mock_browser.new_page = AsyncMock()
+        mock_browser.close = AsyncMock()
+        mock_browser.add_init_script = AsyncMock()
+        mock_p.chromium.launch_persistent_context = AsyncMock(return_value=mock_browser)
+        mock_p.chromium.connect_over_cdp = AsyncMock(return_value=mock_browser)
+        mock_playwright.return_value.__aenter__.return_value = mock_p
+
+        # Case 1: Quota met -> returns True
+        with patch("bot.solve_platform_quota", return_value=(2, None, None, None)), \
+             patch("urllib.request.urlopen"):
+            success = await execute_batch(platform="leetcode", count=2, difficulty="medium", mode="both", headless=True)
+            assert success is True
+
+        # Case 2: Quota unmet -> returns False
+        with patch("bot.solve_platform_quota", return_value=(1, None, None, None)), \
+             patch("urllib.request.urlopen"):
+            success = await execute_batch(platform="leetcode", count=3, difficulty="medium", mode="both", headless=True)
+            assert success is False
+
 
