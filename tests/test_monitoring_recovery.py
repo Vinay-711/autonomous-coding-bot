@@ -22,7 +22,6 @@ import json
 import pytest
 import urllib.request
 from unittest.mock import patch, MagicMock
-from pathlib import Path
 
 from bot import (
     DatabaseManager,
@@ -37,9 +36,7 @@ from bot import (
     print_status_summary,
     handle_retry_failed,
     VerdictState,
-    SubmissionVerdict,
     ProcessStage,
-    ProcessResult,
 )
 
 @pytest.fixture

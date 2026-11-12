@@ -25,6 +25,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.bak*
+*.egg-info/
 
 # OS specific files
 .DS_Store

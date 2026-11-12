@@ -1,14 +1,11 @@
 import os
-import sys
 import json
 import time
 import signal
 import pytest
 from unittest.mock import patch, MagicMock
-from pathlib import Path
 
 from bot import (
-    CloudWorkerConfig,
     validate_startup_configuration,
     get_secret,
     log_event,
@@ -16,9 +13,6 @@ from bot import (
     DatabaseManager,
     SolvedRegistry,
     execute_batch,
-    VerdictState,
-    SubmissionVerdict,
-    SHUTDOWN_REQUESTED,
 )
 
 @pytest.fixture

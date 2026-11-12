@@ -5,39 +5,22 @@ injection verification, stale selector handling, CAPTCHA/challenge detection,
 rate limiting/circuit breakers, contest guards, and sensitive data redaction.
 """
 
-import time
-import asyncio
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from bot import (
     AuthState,
-    AuthStateResult,
-    SecurityChallengeDetection,
     InjectionResult,
-    ProblemExtractionResult,
-    SelectorResolutionResult,
     redact_sensitive_data,
     CircuitState,
     PlatformRateLimiter,
     get_rate_limiter,
     detect_security_challenge_or_captcha,
     check_live_or_rated_contest,
-    resolve_verified_selector,
     BrowserManager,
-    BasePlatformAdapter,
-    LeetCodeAdapter,
-    CodeforcesAdapter,
-    HackerRankAdapter,
-    CodeChefAdapter,
-    HackerEarthAdapter,
-    GenericPlatformAdapter,
     get_platform_adapter,
     process_problem,
-    ProcessResult,
     ProcessStage,
-    SubmissionVerdict,
-    VerdictState,
     extract_problem_text,
     extract_editor_code,
     inject_code_into_editor,

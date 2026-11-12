@@ -51,8 +51,7 @@ import pyperclip
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
-from google.genai.errors import APIError
-from playwright.async_api import async_playwright, Page, BrowserContext
+from playwright.async_api import async_playwright, Page
 
 # ==============================================================================
 # Typed Verdict States & Data Models
@@ -1888,6 +1887,8 @@ class DatabaseManager:
         Supports safe reclamation of expired leases by recovered workers.
         Returns True if claim acquired; False if already accepted or actively claimed by another worker.
         """
+        plat, canon = normalize_problem_identity(canonical_id, platform)
+        platform, canonical_id = plat, canon
         now = time.time()
         now_iso = get_kolkata_now().isoformat()
         with self.get_connection() as conn:
@@ -2022,6 +2023,8 @@ class DatabaseManager:
         verdict: Optional[SubmissionVerdict] = None
     ):
         """Records confirmed acceptance in both problems and judge_verdicts tables."""
+        plat, canon = normalize_problem_identity(canonical_id, platform)
+        platform, canonical_id = plat, canon
         now_iso = get_kolkata_now().isoformat()
         with self.get_connection() as conn:
             cursor = conn.cursor()
@@ -3657,7 +3660,7 @@ def ask_gemini_for_java_code(
 6. Optimal time & space complexity to prevent TLE (Time Limit Exceeded).
 """
     elif platform_type == "hackerrank":
-        platform_instructions = f"""
+        platform_instructions = """
 1. For HackerRank, inspect the starter code template below.
 2. If the starter template defines `class Result` and `public class Solution`, you MUST include BOTH classes intact in your output.
 3. NEVER omit or remove `public class Solution` or its `main` method, because HackerRank judge runs `Solution.main`!
@@ -3670,9 +3673,9 @@ def ask_gemini_for_java_code(
    - DO NOT use modern switch expressions (use standard switch-case statements).
 """
     else:  # hackerearth
-        platform_instructions = f"""
+        platform_instructions = """
 1. For HackerEarth, write a complete, standalone Java program.
-2. The primary class MUST be named 'TestClass' (e.g. `public class TestClass {{ public static void main(String[] args) throws Exception {{ ... }} }}`).
+2. The primary class MUST be named 'TestClass' (e.g. `public class TestClass { public static void main(String[] args) throws Exception { ... } }`).
 3. Read input from System.in using BufferedReader / Scanner and print to System.out.
 4. Optimal time and space complexity.
 5. STRICT JAVA 8 COMPATIBILITY REQUIRED (HackerEarth judge executes with Java 8):
@@ -4284,7 +4287,7 @@ def execute_java_sandboxed(
     java_cmd = [
         "java",
         f"-Xmx{max_memory_mb}m",
-        f"-Xms16m",
+        "-Xms16m",
         "-XX:+UseSerialGC",
         "-Dfile.encoding=UTF-8",
     ]
@@ -6341,8 +6344,24 @@ async def process_problem(
                 platform_name=platform_name,
                 verdict=verdict
             )
+            if not pub_res.success:
+                return ProcessResult(
+                    stage=ProcessStage.PUBLISH_FAILED,
+                    success=False,
+                    url=url,
+                    platform=platform_type,
+                    problem_id=prob_id,
+                    solution_code=solution_code,
+                    explanation=explanation,
+                    verdict=verdict,
+                    saved_path=str(SOLUTIONS_DIR / filename),
+                    published=False,
+                    error=f"Publish failed: {pub_res.error}",
+                    publish_error=pub_res.error,
+                    sample_results=pipeline_res.sample_results
+                )
             return ProcessResult(
-                stage=ProcessStage.PUBLISHED if pub_res.success else ProcessStage.ACCEPTED,
+                stage=ProcessStage.PUBLISHED,
                 success=True,
                 url=url,
                 platform=platform_type,
@@ -6351,7 +6370,7 @@ async def process_problem(
                 explanation=explanation,
                 verdict=verdict,
                 saved_path=str(SOLUTIONS_DIR / filename),
-                published=pub_res.success,
+                published=True,
                 repo_name=pub_res.repo_name,
                 repo_branch=pub_res.branch,
                 commit_hash=pub_res.commit_hash,
@@ -6594,7 +6613,7 @@ async def process_problem(
 
     # In mode 'save', store locally only; no judge submission or GitHub commit
     if mode == "save":
-        print(f"   💾 Mode 'SAVE': saving verified Java solution locally without running or submitting.")
+        print("   💾 Mode 'SAVE': saving verified Java solution locally without running or submitting.")
         save_java_solution(filename, solution_code, url, explanation, platform_name, verdict=None)
         return ProcessResult(
             stage=ProcessStage.COMPILED,
@@ -6627,7 +6646,7 @@ async def process_problem(
                 clean_url = url.rstrip("/")
                 parts = clean_url.split("/")
                 prob_code = f"{parts[-2]}{parts[-1]}"
-                
+
                 await page.goto("https://codeforces.com/problemset/submit", wait_until="domcontentloaded", timeout=25000)
                 await asyncio.sleep(2)
 
@@ -6680,11 +6699,11 @@ async def process_problem(
                             error="Codeforces login timed out",
                             published=False
                         )
-                
+
                 # Fill problem code (e.g. 1352C)
                 await page.locator('input[name="submittedProblemCode"]').fill(prob_code)
                 print(f"   📝 Entered problem code: {prob_code}")
-                
+
                 # Select Java
                 sel = page.locator('select[name="programTypeId"]').first
                 if await sel.count() > 0:
@@ -6696,7 +6715,7 @@ async def process_problem(
                             await sel.select_option(val)
                             print(f"   ☕ Selected language: {txt.strip()}")
                             break
-                            
+
                 # Fill source code
                 await page.locator('textarea#sourceCodeTextarea, textarea[name="source"]').fill(solution_code)
                 print("   📋 Pasted Java solution code.")
@@ -6916,7 +6935,7 @@ async def process_problem(
 
         if verdict_state != VerdictState.ACCEPTED:
             print(f"   ❌ Problem {url} NOT accepted by judge ({verdict_msg}) [State: {verdict_state.value}].")
-            print(f"   🛑 SKIPPING GitHub commit to guarantee ZERO broken solutions in repository!")
+            print("   🛑 SKIPPING GitHub commit to guarantee ZERO broken solutions in repository!")
             save_java_solution(filename, solution_code, url, explanation, platform_name, verdict=verdict)
             return ProcessResult(
                 stage=ProcessStage.REJECTED,
@@ -7405,7 +7424,7 @@ async def execute_batch(
     max_dur = timeout if timeout is not None else MAX_RUN_DURATION_SECONDS
 
     # 1. Startup configuration validation
-    cfg = validate_startup_configuration(
+    _cfg = validate_startup_configuration(
         mode=mode,
         platform=platform,
         count=count,
@@ -7430,7 +7449,7 @@ async def execute_batch(
     print(f"   Platform   : {platform.upper()}")
     count_label = f"{count} problem(s) per platform ({count * 5} total across 5 platforms)" if platform == "all" else f"{count} problem(s)"
     print(f"   Count      : {count_label}")
-    print(f"   Language   : JAVA ☕")
+    print("   Language   : JAVA ☕")
     print(f"   Difficulty : {difficulty.upper()}")
     print(f"   Mode       : {mode.upper()}")
     print(f"   Offline    : {is_offline} | Dry Run: {is_dry}")

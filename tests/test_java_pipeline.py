@@ -1,30 +1,18 @@
 import pytest
 import tempfile
-import sys
 from pathlib import Path
-from unittest.mock import MagicMock, AsyncMock, patch
 
 from bot import (
-    VerdictState,
-    SubmissionVerdict,
     ProcessStage,
-    ProcessResult,
     SampleTestCase,
-    CompilationResult,
-    ExecutionResult,
     SampleTestResult,
-    VerificationPipelineResult,
     detect_java_class_and_filename,
     validate_code_security_and_dependencies,
-    validate_platform_signatures,
     compare_sample_outputs,
     compile_java_code_sandboxed,
-    compile_java_code_locally,
     execute_java_sandboxed,
     run_all_sample_tests_sandboxed,
     verify_and_repair_java_pipeline,
-    extract_sample_test_cases_from_text,
-    process_problem,
     DatabaseManager,
 )
 

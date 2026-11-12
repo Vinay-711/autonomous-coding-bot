@@ -1,9 +1,7 @@
-import asyncio
 import json
 import time
 import pytest
 from unittest.mock import patch, MagicMock, AsyncMock
-from pathlib import Path
 
 from bot import (
     VerdictState,
@@ -16,13 +14,9 @@ from bot import (
     normalize_problem_identity,
     get_kolkata_now,
     get_kolkata_today_str,
-    is_transient_error,
     print_status_summary,
     get_repo_default_branch,
-    PollingConfig,
-    poll_with_backoff,
     extract_problem_id,
-    capture_pre_submission_snapshot,
     verify_live_submission_verdict,
     record_submission_evidence,
     save_java_solution,
@@ -30,7 +24,6 @@ from bot import (
     process_problem,
     solve_platform_quota,
     execute_batch,
-    SUBMISSIONS_LOG_FILE,
     SOLUTIONS_DIR,
 )
 

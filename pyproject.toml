@@ -47,4 +47,20 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 norecursedirs = ["repos", "solutions", ".venv", "saved_chrome_login"]
 
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = [
+    "E501",  # line length handled by formatter
+    "E402",  # module level import not at top of file
+    "E722",  # bare except (in legacy browser exception handlers)
+    "E741",  # ambiguous variable name
+    "E712",  # equality comparison to True/False (explicitly tested for dataclass __eq__ compatibility)
+    "W293",  # blank line contains whitespace
+]
+
+
 
