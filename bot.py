@@ -5791,6 +5791,8 @@ async def _verify_hackerearth(
             res = await page.evaluate(r"""() => {
                 // Scope STRICTLY to the submission result / modal container
                 const selectors = [
+                    'div[id*="-content-results"]',
+                    'div[id*="results"]',
                     'div[class*="submission-result"]',
                     '.submission-result',
                     'div[class*="track-submission"]',
@@ -5799,7 +5801,8 @@ async def _verify_hackerearth(
                     'div[class*="verdict-wrapper"]',
                     'div.modal-content .verdict',
                     'div[class*="submission-overview"]',
-                    '.status-description'
+                    '.status-description',
+                    '[role="tabpanel"]'
                 ];
                 let container = null;
                 for (const sel of selectors) {
@@ -5829,6 +5832,29 @@ async def _verify_hackerearth(
             last_error = str(e)
             continue
 
+        if (not res or not isinstance(res, dict)) and elapsed > 10.0:
+            try:
+                sub_btn = page.locator("button:has-text('Submissions')").first
+                if await sub_btn.count() > 0 and await sub_btn.is_visible():
+                    await sub_btn.click()
+                    await asyncio.sleep(1.0)
+                    res = await page.evaluate(r"""() => {
+                        const table = document.querySelector('table');
+                        if (!table) return null;
+                        const row = table.querySelector('tbody tr') || table.querySelectorAll('tr')[1];
+                        if (!row) return null;
+                        const rowText = (row.innerText || '').trim();
+                        let subId = null;
+                        const link = row.querySelector('a[href*="/submission/"]');
+                        if (link && link.href) {
+                            const m = link.href.match(/submission\/(?:[a-zA-Z0-9_\-]+\/)?(\d+)/);
+                            if (m) subId = m[1];
+                        }
+                        return { text: rowText, submissionId: subId };
+                    }""")
+            except Exception:
+                pass
+
         if not res or not isinstance(res, dict):
             continue
 
@@ -5845,7 +5871,7 @@ async def _verify_hackerearth(
             continue
 
         # Accepted check
-        if any(a in text for a in ["Accepted", "Correct Answer", "Score: 100"]):
+        if any(a in text for a in ["Accepted", "Correct Answer", "Score: 100", "100 / 100", "100/100", "100 pts"]):
             corr_mechanism = "hackerearth_dom_modal_submission_id" if sub_id else "hackerearth_dom_scoped_modal_container"
             effective_id = str(sub_id) if sub_id else f"hackerearth_{slug}_{int(submission_start_time)}"
             evidence = {
