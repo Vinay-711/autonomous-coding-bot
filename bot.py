@@ -56,10 +56,11 @@ GITHUB_USERNAME = os.environ.get("GITHUB_USERNAME", "").strip()
 CODEFORCES_HANDLE = os.environ.get("CODEFORCES_HANDLE", "").strip()
 
 AI_MODELS = [
+    "gemini-3.1-flash-lite",
+    "gemini-3.5-flash-lite",
     "gemini-2.5-flash",
     "gemini-3.5-flash",
     "gemini-3.6-flash",
-    "gemini-3.1-flash-lite",
 ]
 SOLUTIONS_DIR = BASE_DIR / "solutions"
 SOLUTIONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1333,18 +1334,60 @@ async def verify_live_submission_verdict(page: Page, platform_type: str, url: st
         return True, "Submitted (No negative verdict detected)."
 
     elif platform_type == "codechef":
-        print("   ⏳ Checking CodeChef submission result...")
-        for poll in range(10):
-            await asyncio.sleep(2.5)
-            res = await page.evaluate("""() => {
-                const el = document.querySelector('#submission-status, .submission-status, .status-label, div[class*="status"]');
+        target_slug = url.rstrip("/").split("/")[-1].upper()
+        print(f"   ⏳ Verifying CodeChef submission verdict for {target_slug}...")
+        
+        # Detect username handle from session cookie / page
+        handle = await page.evaluate("""() => {
+            try {
+                const m = document.cookie.match(/Authorization=([^;]+)/);
+                if (m) {
+                    const payload = JSON.parse(atob(m[1].split('.')[1]));
+                    return payload.username || 'flair_ref_46';
+                }
+            } catch(e) {}
+            return 'flair_ref_46';
+        }""")
+        
+        for poll in range(15):
+            await asyncio.sleep(3)
+            # Check page DOM status
+            dom_res = await page.evaluate("""() => {
+                const el = document.querySelector('#submission-status, .submission-status, .status-label, div[class*="status"], div[class*="verdict"]');
                 return el ? el.innerText : '';
             }""")
-            if "Correct" in res or "AC" in res or "Accepted" in res:
-                return True, "Accepted"
-            elif any(err in res for err in ["Wrong", "WA", "TLE", "Runtime Error"]):
-                return False, res.strip()
-        return True, "CodeChef submission sent."
+            if "Correct" in dom_res or "Accepted" in dom_res or "100/100" in dom_res:
+                return True, "Accepted (100 pts)"
+            elif any(err in dom_res for err in ["Wrong Answer", "WA", "Time Limit Exceeded", "TLE", "Runtime Error"]):
+                return False, dom_res.strip()
+
+            # Query recent submissions table API for handle
+            try:
+                import re
+                api_data = await page.evaluate(f"""async () => {{
+                    try {{
+                        const r = await fetch('/recent/user?page=0&user_handle={handle}');
+                        return await r.json();
+                    }} catch(e) {{
+                        return null;
+                    }}
+                }}""")
+                if api_data and "content" in api_data:
+                    rows = re.findall(r'<tr\s*>(.*?)</tr>', api_data["content"], re.DOTALL)
+                    for row in rows:
+                        tds = re.findall(r'<td.*?>(.*?)</td>', row, re.DOTALL)
+                        clean_tds = [re.sub(r'<.*?>', '', td).strip() for td in tds]
+                        if len(clean_tds) >= 3 and clean_tds[1].upper() == target_slug:
+                            score = clean_tds[2]
+                            sol = clean_tds[4] if len(clean_tds) > 4 else ""
+                            print(f"      [CodeChef Poll {poll+1}/15] Match: {target_slug} -> Score: {score}, Solution: {sol}")
+                            if "(100)" in score or "Explain" in sol:
+                                return True, "Accepted (100 pts)"
+                            else:
+                                return False, f"Not Accepted (Score: {score})"
+            except Exception:
+                pass
+        return False, "CodeChef evaluation timed out or verdict not accepted (100 pts)."
 
     elif platform_type == "hackerearth":
         print("   ⏳ Checking HackerEarth submission verdict...")
@@ -1763,9 +1806,9 @@ async def process_problem(
                 }""")
 
                 if has_turnstile:
-                    # Give Turnstile up to 8s to generate token automatically
+                    # Give Turnstile up to 15s to generate token automatically
                     token = ""
-                    for _ in range(8):
+                    for _ in range(15):
                         token = await page.evaluate("""() => {
                             const el = document.querySelector('input[name="turnstileToken"], input[name="cf-turnstile-response"], input[name*="turnstile" i]');
                             return el && el.value && el.value.length > 5 ? el.value : '';
@@ -1780,7 +1823,7 @@ async def process_problem(
                         print("🛡️  [Codeforces] Cloudflare Anti-Bot Verification Detected!")
                         print("=" * 68)
                         print("👉 Please complete the verification directly in your open Chrome window.")
-                        print("   Waiting for verification to complete (up to 30s)...")
+                        print("   Waiting for verification to complete (up to 45s)...")
                         print("=" * 68)
                         if sys.platform == "darwin":
                             try:
@@ -1788,7 +1831,7 @@ async def process_problem(
                             except Exception:
                                 pass
 
-                        for sec in range(15):
+                        for sec in range(23):
                             await asyncio.sleep(2)
                             token = await page.evaluate("""() => {
                                 const el = document.querySelector('input[name="turnstileToken"], input[name="cf-turnstile-response"], input[name*="turnstile" i]');
@@ -1798,7 +1841,7 @@ async def process_problem(
                                 print("   ✅ Human verification completed in Chrome! Submitting...")
                                 break
                             if sec > 0 and sec % 5 == 0:
-                                print(f"   ⏳ Waiting for verification in Chrome ({30 - sec * 2}s remaining)...")
+                                print(f"   ⏳ Waiting for verification in Chrome ({46 - sec * 2}s remaining)...")
 
                     if not token:
                         page._anti_bot_blocked = True
@@ -1992,6 +2035,7 @@ async def solve_platform_quota(
     page._anti_bot_blocked = False
     accepted_count = 0
     attempt_count = 0
+    anti_bot_failures = 0
     max_attempts = target_accepted * 3  # Up to 3x attempts to guarantee quota fulfillment
 
     browser, context, page = await ensure_live_page(page, p_playwright, browser, context)
@@ -2040,16 +2084,26 @@ async def solve_platform_quota(
 
         if success:
             accepted_count += 1
+            anti_bot_failures = 0
             SolvedRegistry.mark_solved(platform, url)
             print(f"🎉 [{platform.upper()}] Progress: {accepted_count}/{target_accepted} ACCEPTED & COMMITTED TO GITHUB!\n")
-            await asyncio.sleep(6)
+            if platform == "codeforces":
+                print("   ⏳ Codeforces cooldown: waiting 25s before next problem to prevent rate-limiting...")
+                await asyncio.sleep(25)
+            else:
+                await asyncio.sleep(6)
         else:
             if getattr(page, "_anti_bot_blocked", False):
                 page._anti_bot_blocked = False
-                print(f"\n🛑 [{platform.upper()}] Platform is gated by Cloudflare Anti-Bot verification.")
-                print(f"🛑 Stopping {platform.upper()} attempts immediately to avoid continuous looping.")
-                print(f"📁 Generated Java solution has been saved to: {SOLUTIONS_DIR.resolve()}\n")
-                break
+                anti_bot_failures += 1
+                if anti_bot_failures >= 2:
+                    print(f"\n🛑 [{platform.upper()}] Platform is gated by Cloudflare Anti-Bot verification.")
+                    print(f"🛑 Stopping {platform.upper()} attempts immediately to avoid continuous looping.")
+                    print(f"📁 Generated Java solution has been saved to: {SOLUTIONS_DIR.resolve()}\n")
+                    break
+                else:
+                    print(f"\n⚠️ [{platform.upper()}] Anti-bot challenge encountered. Waiting 20s before trying next candidate...")
+                    await asyncio.sleep(20)
             print(f"⚠️ [{platform.upper()}] Problem was NOT accepted by the judge.")
             print(f"🔄 Selecting next unsolved replacement problem to guarantee {target_accepted} accepted solutions...\n")
 
