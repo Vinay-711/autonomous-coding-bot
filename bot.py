@@ -282,18 +282,19 @@ def get_existing_solved_slugs() -> Set[str]:
 
 async def discover_leetcode_candidates(page: Page, count: int = 15, difficulty: str = "medium-hard") -> List[str]:
     """Queries LeetCode GraphQL directly for free, completely unsolved problems for user."""
-    print(f"\n🔍 [LeetCode] Finding up to {count} unsolved problems (Difficulty: {difficulty.upper()})...")
+    # Enforce policy: strictly Easy or Medium only (never Hard)
+    eff_diff = "easy" if difficulty.lower() == "easy" else ("medium" if difficulty.lower() == "medium" else "easy-medium")
+    print(f"\n🔍 [LeetCode] Finding up to {count} unsolved problems (Difficulty: {eff_diff.upper()}, strictly no Hard)...")
     candidates = []
 
     diff_list = []
-    if difficulty.lower() == "hard":
-        diff_list = ["HARD"]
-    elif difficulty.lower() == "medium":
-        diff_list = ["MEDIUM"]
-    elif difficulty.lower() == "easy":
+    if eff_diff == "easy":
         diff_list = ["EASY"]
-    else:  # medium-hard
-        diff_list = ["HARD", "MEDIUM"]
+    elif eff_diff == "medium":
+        diff_list = ["MEDIUM"]
+    else:
+        # Strictly Medium and Easy only (never Hard as requested)
+        diff_list = ["MEDIUM", "EASY"]
 
     try:
         await page.goto("https://leetcode.com/problemset/", wait_until="domcontentloaded", timeout=25000)
@@ -328,7 +329,7 @@ async def discover_leetcode_candidates(page: Page, count: int = 15, difficulty: 
                     body: JSON.stringify({
                         query: query,
                         variables: {
-                            categorySlug: "",
+                            categorySlug: "algorithms",
                             skip: 0,
                             limit: 50,
                             filters: {
@@ -348,6 +349,8 @@ async def discover_leetcode_candidates(page: Page, count: int = 15, difficulty: 
                     continue
                 if q.get("status") in ["ac", "not_started_false"]:
                     continue
+                if q.get("difficulty", "").upper() == "HARD":
+                    continue
                 slug = q.get("titleSlug")
                 if not slug:
                     continue
@@ -361,7 +364,7 @@ async def discover_leetcode_candidates(page: Page, count: int = 15, difficulty: 
     except Exception as e:
         print(f"   ⚠️  LeetCode GraphQL query notice: {e}")
 
-    print(f"   ✅ Discovered {len(candidates)} completely unsolved LeetCode candidates.")
+    print(f"   ✅ Discovered {len(candidates)} completely unsolved LeetCode candidates (strictly Easy/Medium).")
     return candidates
 
 async def discover_codeforces_candidates(page: Page, count: int = 15, difficulty: str = "medium-hard") -> List[str]:
@@ -2268,8 +2271,11 @@ async def execute_batch(
                 print(f"🛡️  FAIL-SAFE REALLOCATION: Solving remaining {deficit} problems on healthy platforms...")
                 print("=" * 70)
 
-                successful = [p for p in all_platforms if platform_results.get(p, 0) > 0]
-                fallback_pool = successful if successful else ["hackerrank", "codechef", "hackerearth", "leetcode"]
+                # User directive: Reallocation must be done to HackerRank (never to LeetCode)
+                preferred_order = ["hackerrank", "hackerearth", "codechef", "codeforces"]
+                fallback_pool = [p for p in preferred_order if platform_results.get(p, 0) > 0]
+                if not fallback_pool:
+                    fallback_pool = preferred_order
 
                 for p_name in fallback_pool:
                     if total_accepted >= target_total:
