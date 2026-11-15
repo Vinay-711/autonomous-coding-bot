@@ -1,6 +1,6 @@
-# 🤖 AutoCoder AI: Autonomous Multi-Platform Coding Agent
+# 🤖 Vinay's Coding Bot: Autonomous Multi-Platform Coding Agent
 
-[![npm](https://img.shields.io/badge/npm-autonomous--coding--bot-cb3837.svg?logo=npm)](https://www.npmjs.com/package/autonomous-coding-bot)
+[![npm](https://img.shields.io/badge/npm-vinays--coding--bot-cb3837.svg?logo=npm)](https://www.npmjs.com/package/vinays-coding-bot)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![Playwright](https://img.shields.io/badge/Playwright-Automated_Browsing-green.svg)](https://playwright.dev/)
 [![Google Gemini](https://img.shields.io/badge/AI-Google_Gemini_2.5%2F3.1-orange.svg)](https://aistudio.google.com/)
@@ -72,16 +72,16 @@ Anyone can run this bot directly via **`npx`** without manual installation or vi
 
 ```bash
 # ⚡ Instant run with npx (auto-provisions environment):
-npx autonomous-coding-bot
+npx vinays-coding-bot
 
 # 🎯 Solve on a specific platform:
-npx autonomous-coding-bot --platform leetcode --count 5 --difficulty easy
-npx autonomous-coding-bot --platform codeforces --count 5
-npx autonomous-coding-bot --status
+npx vinays-coding-bot --platform leetcode --count 5 --difficulty easy
+npx vinays-coding-bot --platform codeforces --count 5
+npx vinays-coding-bot --status
 
 # 🌍 Or install globally via npm:
-npm install -g autonomous-coding-bot
-autonomous-coding-bot --platform all --count 5
+npm install -g vinays-coding-bot
+vinays-coding-bot --platform all --count 5
 ```
 
 ### Or using standard `npm` scripts in a local clone:

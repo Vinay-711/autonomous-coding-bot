@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * Autonomous Coding Bot - NPM CLI Launcher
+ * Vinay's Coding Bot - NPM CLI Launcher
  * https://github.com/Vinay-711/autonomous-coding-bot
  */
 
@@ -33,11 +33,11 @@ const colors = {
 };
 
 function log(msg) {
-  console.log(`${colors.cyan}[autonomous-coding-bot]${colors.reset} ${msg}`);
+  console.log(`${colors.cyan}[vinays-coding-bot]${colors.reset} ${msg}`);
 }
 
 function logError(msg) {
-  console.error(`${colors.red}[autonomous-coding-bot:error]${colors.reset} ${msg}`);
+  console.error(`${colors.red}[vinays-coding-bot:error]${colors.reset} ${msg}`);
 }
 
 // 1. Check if command exists
