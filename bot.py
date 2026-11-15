@@ -2556,7 +2556,16 @@ async def main():
         action="store_true",
         help="Run browser in headless mode (recommended for scheduled/daemon execution)"
     )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Print summary status table of solved problems across platforms and exit"
+    )
     args = parser.parse_args()
+
+    if args.status:
+        print_status_summary()
+        sys.exit(0)
 
     if not GEMINI_API_KEY:
         print("\n" + "=" * 70)
