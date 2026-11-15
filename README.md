@@ -1,5 +1,6 @@
 # 🤖 AutoCoder AI: Autonomous Multi-Platform Coding Agent
 
+[![npm](https://img.shields.io/badge/npm-autonomous--coding--bot-cb3837.svg?logo=npm)](https://www.npmjs.com/package/autonomous-coding-bot)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![Playwright](https://img.shields.io/badge/Playwright-Automated_Browsing-green.svg)](https://playwright.dev/)
 [![Google Gemini](https://img.shields.io/badge/AI-Google_Gemini_2.5%2F3.1-orange.svg)](https://aistudio.google.com/)
@@ -21,7 +22,7 @@ An autonomous AI pair programmer that **discovers unsolved competitive programmi
 
 | Platform | Difficulty Targeting | Judge Verification | Target GitHub File |
 | :--- | :--- | :--- | :--- |
-| **LeetCode** | Easy / Medium / Hard | Live DOM & Result Box | `Solution.java` |
+| **LeetCode** | Easy / Medium (Algorithms) | Live DOM & Result Box | `Solution.java` |
 | **Codeforces** | Rating 1200–2400 (Div 2/1) | Codeforces Official API | `Main.java` |
 | **CodeChef** | Practice / Starters | Contest/Practice Judge | `Main.java` |
 | **HackerRank** | Algorithmic Subdomains | HackerRank Submissions API | `Solution.java` |
@@ -62,6 +63,43 @@ flowchart TD
 - **Central Solved Registry**: Maintains a persistent deduplication registry (`solved_history.json`) across all platforms and local folders so no problem is ever repeated.
 - **Cloudflare & Anti-Bot Resiliency**: Built-in desktop User-Agent masking, automated session handling, and direct Chrome DevTools Protocol (`CDP`) integration to pass Cloudflare Turnstile smoothly.
 - **Native Daily Scheduling**: Includes a one-click macOS `launchd` scheduler (and Linux cron compatibility) for hands-free daily practice.
+
+---
+
+## 📦 Run with NPM / NPX (Zero-Setup)
+
+Anyone can run this bot directly via **`npx`** without manual installation or virtualenv configuration:
+
+```bash
+# ⚡ Instant run with npx (auto-provisions environment):
+npx autonomous-coding-bot
+
+# 🎯 Solve on a specific platform:
+npx autonomous-coding-bot --platform leetcode --count 5 --difficulty easy
+npx autonomous-coding-bot --platform codeforces --count 5
+npx autonomous-coding-bot --status
+
+# 🌍 Or install globally via npm:
+npm install -g autonomous-coding-bot
+autonomous-coding-bot --platform all --count 5
+```
+
+### Or using standard `npm` scripts in a local clone:
+
+```bash
+git clone https://github.com/Vinay-711/autonomous-coding-bot.git
+cd autonomous-coding-bot
+
+npm run setup            # Automatic virtualenv and dependency installation
+npm start                # Run daily 5-problem batch across all platforms
+npm run status           # Check verified solve counts across platforms
+npm run solve:leetcode   # Solve LeetCode (Easy/Medium algorithms)
+npm run solve:codeforces # Solve Codeforces (with Turnstile auto-detection)
+npm run solve:hackerrank # Solve HackerRank
+npm run solve:codechef   # Solve CodeChef (with 100/100 score verification)
+npm run solve:hackerearth# Solve HackerEarth
+npm run chrome           # Launch Chrome with remote debugging on port 9222
+```
 
 ---
 
