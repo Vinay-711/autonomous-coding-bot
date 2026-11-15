@@ -1,0 +1,55 @@
+{
+  "name": "autonomous-coding-bot",
+  "version": "1.0.0",
+  "description": "Autonomous AI competitive programming solver with Gemini AI across LeetCode, Codeforces, HackerRank, CodeChef, and HackerEarth",
+  "main": "bin/cli.js",
+  "bin": {
+    "autonomous-coding-bot": "./bin/cli.js",
+    "autocoder": "./bin/cli.js"
+  },
+  "scripts": {
+    "setup": "node ./bin/cli.js --setup",
+    "start": "node ./bin/cli.js --platform all --count 5 --mode both",
+    "chrome": "node ./bin/cli.js --chrome",
+    "status": "node ./bin/cli.js --status",
+    "schedule": "node ./bin/cli.js --schedule 18:00",
+    "solve:leetcode": "node ./bin/cli.js --platform leetcode --count 5 --difficulty easy --mode both",
+    "solve:codeforces": "node ./bin/cli.js --platform codeforces --count 5 --mode both",
+    "solve:hackerrank": "node ./bin/cli.js --platform hackerrank --count 5 --mode both",
+    "solve:codechef": "node ./bin/cli.js --platform codechef --count 5 --difficulty easy --mode both",
+    "solve:hackerearth": "node ./bin/cli.js --platform hackerearth --count 5 --mode both"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Vinay-711/autonomous-coding-bot.git"
+  },
+  "keywords": [
+    "leetcode",
+    "codeforces",
+    "hackerrank",
+    "codechef",
+    "hackerearth",
+    "automation",
+    "gemini-ai",
+    "competitive-programming",
+    "java"
+  ],
+  "author": "Vinay-711",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/Vinay-711/autonomous-coding-bot/issues"
+  },
+  "homepage": "https://github.com/Vinay-711/autonomous-coding-bot#readme",
+  "files": [
+    "bin/",
+    "bot.py",
+    "requirements.txt",
+    ".env.example",
+    "connect_chrome.sh",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}
