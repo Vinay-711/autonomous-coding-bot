@@ -56,9 +56,9 @@ GITHUB_USERNAME = os.environ.get("GITHUB_USERNAME", "").strip()
 CODEFORCES_HANDLE = os.environ.get("CODEFORCES_HANDLE", "").strip()
 
 AI_MODELS = [
-    "gemini-3.1-flash-lite",
-    "gemini-3.5-flash-lite",
     "gemini-2.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
     "gemini-3.5-flash",
     "gemini-3.6-flash",
 ]
@@ -502,7 +502,8 @@ async def discover_hackerrank_candidates(page: Page, count: int = 15, difficulty
     if difficulty.lower() == "hard":
         diff_params = "&filters%5Bdifficulty%5D%5B%5D=hard"
     elif difficulty.lower() in ["medium-hard", "hard-medium"]:
-        diff_params = "&filters%5Bdifficulty%5D%5B%5D=medium&filters%5Bdifficulty%5D%5B%5D=hard"
+        # Prioritize Medium challenges to avoid impossible Expert/Hard DP problems
+        diff_params = "&filters%5Bdifficulty%5D%5B%5D=medium"
     elif difficulty.lower() == "medium":
         diff_params = "&filters%5Bdifficulty%5D%5B%5D=medium"
     elif difficulty.lower() == "easy":
