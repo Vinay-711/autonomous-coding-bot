@@ -17,7 +17,7 @@ import subprocess
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, Tuple, List, Set
+from typing import Optional, Tuple, List, Set, Any, Dict
 
 import pyperclip
 from pydantic import BaseModel, Field
