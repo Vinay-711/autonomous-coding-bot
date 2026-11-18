@@ -940,7 +940,8 @@ def call_openai_compatible_model(endpoint: str, api_key: str, model_name: str, p
     """Queries any OpenAI-compatible provider (Groq, OpenRouter, DeepSeek) for coding answers."""
     headers = {
         "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0"
     }
     if "openrouter" in endpoint:
         headers["HTTP-Referer"] = "https://github.com/Vinay-711/autonomous-coding-bot"
@@ -1109,11 +1110,11 @@ IMPORTANT FORMATTING:
     # Prioritized model queue across available open-source & frontier providers
     model_queue = []
 
-    # 1. Groq (Free high-speed open-source models: DeepSeek-R1 Distill 70B, Llama 3.3 70B, Qwen 2.5 Coder 32B)
+    # 1. Groq (High-speed open models: GPT-OSS 120B, Qwen 3.8 27B, GPT-OSS 20B)
     if GROQ_API_KEY:
-        model_queue.append(("groq", "deepseek-r1-distill-llama-70b"))
-        model_queue.append(("groq", "llama-3.3-70b-versatile"))
-        model_queue.append(("groq", "qwen-2.5-coder-32b"))
+        model_queue.append(("groq", "openai/gpt-oss-120b"))
+        model_queue.append(("groq", "qwen/qwen3.8-27b"))
+        model_queue.append(("groq", "openai/gpt-oss-20b"))
 
     # 2. DeepSeek Official API
     if DEEPSEEK_API_KEY:

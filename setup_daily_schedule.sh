@@ -46,6 +46,8 @@ cat << EOF > "$PLIST_PATH"
         <string>1</string>
         <key>GEMINI_API_KEY</key>
         <string>${GEMINI_API_KEY}</string>
+        <key>GROQ_API_KEY</key>
+        <string>${GROQ_API_KEY}</string>
     </dict>
     <key>ProgramArguments</key>
     <array>
