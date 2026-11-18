@@ -186,8 +186,9 @@ PLATFORM_RULES = {
 # Pydantic Output Schema
 # ==============================================================================
 class CodingAnswer(BaseModel):
+    thought_and_algorithm: str = Field(description="Step-by-step reasoning: analyze constraints (N, time limits), formulate optimal algorithm, check for edge cases (recursion depth, 64-bit integer overflow, corner cases), and plan data structures.")
     code: str = Field(description="Complete, valid, standalone code in the requested programming language without markdown fences")
-    explanation: str = Field(description="Concise summary of approach and time/space complexity")
+    explanation: str = Field(description="Concise summary of final approach and time/space complexity")
 
 # ==============================================================================
 # ==============================================================================
@@ -522,7 +523,7 @@ async def discover_hackerrank_candidates(page: Page, count: int = 15, difficulty
         if len(candidates) >= count:
             break
 
-    # 2. If more candidates needed, query API while filtering out known unsolvable/expert problems
+    # 2. If more candidates needed, query API with popularity ranking (sorted by solved_count desc)
     if len(candidates) < count:
         diff_params = "&filters%5Bdifficulty%5D%5B%5D=medium"
         if difficulty.lower() == "easy":
@@ -537,16 +538,14 @@ async def discover_hackerrank_candidates(page: Page, count: int = 15, difficulty
             "prime-xor", "kingdom-division", "cloudy-day", "determining-dna-health",
             "insertion-sort", "morgan-and-a-string", "count-strings", "cards-permutation",
             "string-similarity", "super-functional-strings", "gridland-provinces",
-            "ashton-and-string", "circular-palindromes", "similar-strings"
+            "ashton-and-string", "circular-palindromes", "similar-strings",
+            "wet-shark-and-two-subsequences", "cut-tree", "xor-and-sum", "two-robots", "nikita-and-the-game"
         }
 
-        tracks = ["algorithms", "data-structures"]
+        api_candidates = []
+        tracks = ["data-structures", "algorithms"]
         for track in tracks:
-            if len(candidates) >= count:
-                break
-            for offset in [0, 50, 100, 150]:
-                if len(candidates) >= count:
-                    break
+            for offset in [0, 50, 100, 150, 200]:
                 try:
                     api_url = f"https://www.hackerrank.com/rest/contests/master/tracks/{track}/challenges?offset={offset}&limit=50{diff_params}"
                     req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
@@ -554,16 +553,24 @@ async def discover_hackerrank_candidates(page: Page, count: int = 15, difficulty
                         data = json.loads(resp.read().decode("utf-8"))
                         for m in data.get("models", []):
                             slug = m.get("slug")
+                            solved_cnt = m.get("solved_count", 0)
+                            succ_rate = m.get("success_ratio", 0)
                             if not slug or slug in unsolvable_blacklist or SolvedRegistry.is_solved("hackerrank", slug):
                                 continue
-                            u = f"https://www.hackerrank.com/challenges/{slug}/problem"
-                            if u not in candidates:
-                                candidates.append(u)
-                            if len(candidates) >= count:
-                                break
+                            # Require at least 10,000 solves and 65% success rate for high reliability
+                            if solved_cnt >= 10000 and succ_rate >= 0.65:
+                                api_candidates.append((slug, solved_cnt))
                 except Exception as e:
-                    print(f"   ⚠️  HackerRank API ({track}, offset {offset}) note: {e}")
                     continue
+
+        # Sort candidate models by popularity (highest solved_count first)
+        api_candidates.sort(key=lambda x: x[1], reverse=True)
+        for slug, _ in api_candidates:
+            u = f"https://www.hackerrank.com/challenges/{slug}/problem"
+            if u not in candidates:
+                candidates.append(u)
+            if len(candidates) >= count:
+                break
 
     print(f"   ✅ Discovered {len(candidates)} completely unsolved HackerRank candidates.")
     return candidates
@@ -930,7 +937,7 @@ def parse_model_json_response(content: str) -> Tuple[str, str]:
         data = json.loads(content)
         if isinstance(data, dict):
             c = data.get("code", "").strip()
-            e = data.get("explanation", "").strip() or "Optimal approach."
+            e = data.get("explanation", "").strip() or data.get("thought_and_algorithm", "").strip() or "Optimal approach."
             if c:
                 return c, e
     except Exception:
@@ -964,7 +971,7 @@ def call_openai_compatible_model(endpoint: str, api_key: str, model_name: str, p
         "messages": [
             {
                 "role": "system",
-                "content": "You are a world-class competitive programmer. You MUST return your answer as a valid JSON object with exactly two keys: 'code' (raw solution code without markdown code blocks) and 'explanation' (time/space complexity and algorithm)."
+                "content": "You are a world-class competitive programmer. You MUST return your answer as a valid JSON object with three keys in this exact order:\n1. 'thought_and_algorithm': Step-by-step reasoning, constraints analysis (N, time limits), edge cases (recursion depth, 64-bit integer overflow, corner cases), and algorithmic plan.\n2. 'code': Raw, complete, working solution code without markdown code blocks.\n3. 'explanation': Concise summary of final time and space complexity."
             },
             {
                 "role": "user",
@@ -1041,12 +1048,15 @@ def ask_ai_for_code(
 1. For HackerRank, write a complete Python 3 program.
 2. If the starter template defines helper functions or a main block, preserve the function signature and implement the optimal solution.
 3. Read from standard input using sys.stdin.read().split() or input() and print results to standard output.
+4. For tree, graph, or recursive algorithms, ALWAYS include `import sys; sys.setrecursionlimit(200000)` to avoid RecursionError.
+5. Use 64-bit operations and optimal algorithms (O(N) or O(N log N)) to prevent timeout (TLE).
 """
         else:  # hackerearth
             platform_instructions = """
 1. For HackerEarth, write a complete standalone Python 3 program.
 2. Read input from standard input using sys.stdin and print results to standard output.
-3. Optimal time and space complexity.
+3. For tree, graph, or recursive algorithms, ALWAYS include `import sys; sys.setrecursionlimit(200000)` to avoid RecursionError.
+4. Optimal time and space complexity.
 """
     else:  # Java
         if platform_type == "leetcode":
@@ -1073,6 +1083,7 @@ def ask_ai_for_code(
 3. NEVER omit or remove `public class Solution` or its `main` method, because HackerRank judge runs `Solution.main`!
 4. Write optimal algorithm in `Result` (or `Solution`), using fast I/O and handling all constraints and multiple test cases.
 5. STRICT JAVA 8 COMPATIBILITY REQUIRED (HackerRank judge executes with Java 8):
+   - Use 'long' for sums, products, factorials, and counts to avoid 32-bit integer overflow.
    - DO NOT use the 'var' keyword (use explicit types like int, String, List<Integer>, etc.).
    - DO NOT use Java 11+ methods like 'String.strip()', 'String.repeat()', or 'String.isBlank()' (use 'trim()' or standard loops).
    - DO NOT use Java 9+ factory methods like 'List.of()', 'Set.of()', or 'Map.of()' (use 'Arrays.asList()' or 'new ArrayList<>()').
@@ -1086,6 +1097,7 @@ def ask_ai_for_code(
 3. Read input from System.in using BufferedReader / Scanner and print to System.out.
 4. Optimal time and space complexity.
 5. STRICT JAVA 8 COMPATIBILITY REQUIRED (HackerEarth judge executes with Java 8):
+   - Use 'long' for sums, products, factorials, and counts to avoid 32-bit integer overflow.
    - DO NOT use the 'var' keyword (use explicit types like int, String, List<Integer>, etc.).
    - DO NOT use Java 11+ methods like 'String.strip()', 'String.repeat()', or 'String.isBlank()' (use 'trim()' or standard loops).
    - DO NOT use Java 9+ factory methods like 'List.of()', 'Set.of()', or 'Map.of()' (use 'Arrays.asList()' or 'new ArrayList<>()').
@@ -2231,7 +2243,7 @@ async def ensure_live_page(page: Page, p_playwright=None, browser=None, context=
 async def solve_platform_quota(
     page: Page,
     platform: str,
-    target_accepted: int = 5,
+    target_accepted: int = 2,
     difficulty: str = "medium-hard",
     mode: str = "both",
     p_playwright = None,
@@ -2729,7 +2741,7 @@ async def main():
             return
         elif cmd == "daily":
             # Run daily quota: replace 'daily' with --platform all
-            sys.argv = [sys.argv[0], "--platform", "all", "--count", "5", "--difficulty", "medium-hard", "--mode", "both"] + sys.argv[2:]
+            sys.argv = [sys.argv[0], "--platform", "all", "--count", "2", "--difficulty", "medium-hard", "--mode", "both"] + sys.argv[2:]
         elif cmd == "solve":
             if len(sys.argv) > 2 and not sys.argv[2].startswith("-"):
                 plat = sys.argv[2]
@@ -2746,8 +2758,8 @@ async def main():
     parser.add_argument(
         "--count",
         type=int,
-        default=5,
-        help="Number of unsolved problems to solve per platform (default: 5)"
+        default=2,
+        help="Number of unsolved problems to solve per platform (default: 2)"
     )
     parser.add_argument(
         "--difficulty",

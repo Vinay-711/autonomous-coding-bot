@@ -196,8 +196,8 @@ while true; do
 
     case "$CHOICE" in
         1)
-            echo -e "\n${GREEN}🚀 Starting autonomous quota run across ALL platforms (5 each)...${NC}"
-            $PYTHON_EXEC bot.py --platform all --count 5 --difficulty medium-hard --mode both
+            echo -e "\n${GREEN}🚀 Starting autonomous quota run across ALL platforms (2 each)...${NC}"
+            $PYTHON_EXEC bot.py --platform all --count 2 --difficulty medium-hard --mode both
             echo ""
             read -r -p "Press Enter to return to main menu..."
             ;;
