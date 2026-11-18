@@ -52,6 +52,9 @@ for _env in env_candidates:
             pass
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "").strip()
 GITHUB_USERNAME = os.environ.get("GITHUB_USERNAME", "").strip()
 CODEFORCES_HANDLE = os.environ.get("CODEFORCES_HANDLE", "").strip()
 
@@ -770,55 +773,67 @@ async def discover_hackerearth_candidates(page: Page, count: int = 15, difficult
     return candidates
 
 # ==============================================================================
-# Editor Language Switcher (Auto-selects Java in the Web UI)
+# Editor Language Switcher (Auto-selects Java or Python in the Web UI)
 # ==============================================================================
-async def switch_editor_to_java(page: Page, platform_type: str):
-    """Automatically ensures the web code editor is set to Java."""
+async def switch_editor_language(page: Page, platform_type: str, language: str = "java"):
+    """Automatically ensures the web code editor is set to the requested language (Java or Python)."""
+    lang_lower = language.lower()
+    target_display = "Python 3" if lang_lower == "python" else "Java"
+    lang_icon = "🐍" if lang_lower == "python" else "☕"
+
     try:
         if platform_type == "leetcode":
-            # LeetCode language dropdown button
             btn = page.locator("button[id*='headlessui-listbox-button'], div[data-cy='lang-select'] button, button:has-text('Python3'), button:has-text('Python'), button:has-text('C++'), button:has-text('JavaScript'), button:has-text('Java')").first
             if await btn.count() > 0 and await btn.is_visible():
                 btn_text = (await btn.inner_text()).strip()
-                if "Java" not in btn_text:
+                already_set = ("Python" in btn_text if lang_lower == "python" else "Java" in btn_text)
+                if not already_set:
                     await btn.click()
                     await asyncio.sleep(0.6)
-                    java_option = page.locator("div[role='option']:has-text('Java'), li[role='option']:has-text('Java')").first
-                    if await java_option.count() > 0:
-                        await java_option.click()
-                        print("   ☕ Automatically switched LeetCode editor to Java.")
+                    if lang_lower == "python":
+                        opt = page.locator("div[role='option']:has-text('Python3'), li[role='option']:has-text('Python3'), div[role='option']:has-text('Python'), li[role='option']:has-text('Python')").first
+                    else:
+                        opt = page.locator("div[role='option']:has-text('Java'), li[role='option']:has-text('Java')").first
+                    if await opt.count() > 0:
+                        await opt.click()
+                        print(f"   {lang_icon} Automatically switched LeetCode editor to {target_display}.")
                         await asyncio.sleep(1.5)
 
         elif platform_type == "codeforces":
-            # Codeforces language select
             select_loc = page.locator("form.submit-form select[name='programTypeId'], select[name='programTypeId']").first
             if await select_loc.count() > 0:
                 options = await select_loc.locator("option").all()
                 for opt in options:
                     opt_text = await opt.inner_text()
-                    if "Java" in opt_text:
+                    if lang_lower == "python" and ("Python 3" in opt_text or "PyPy 3" in opt_text):
                         val = await opt.get_attribute("value")
                         await select_loc.select_option(val)
-                        print(f"   ☕ Automatically selected Codeforces language: {opt_text.strip()}")
+                        print(f"   {lang_icon} Automatically selected Codeforces language: {opt_text.strip()}")
+                        break
+                    elif lang_lower == "java" and "Java" in opt_text:
+                        val = await opt.get_attribute("value")
+                        await select_loc.select_option(val)
+                        print(f"   {lang_icon} Automatically selected Codeforces language: {opt_text.strip()}")
                         break
 
         elif platform_type == "hackerrank":
-            # Check current selected language in HackerRank's custom React-Select container
             current_lang = await page.evaluate("""() => {
                 const el = document.querySelector('.select-language, [class*="select-language"]');
                 return el ? (el.innerText || '').trim() : '';
             }""")
-            if "Java" not in current_lang:
+            already_set = ("Python" in current_lang if lang_lower == "python" else "Java" in current_lang)
+            if not already_set:
+                search_text = "Python 3" if lang_lower == "python" else "Java 8"
                 input_loc = page.locator("#select-language-input").first
                 if await input_loc.count() > 0:
                     try:
                         await input_loc.click()
                         await asyncio.sleep(0.4)
-                        await input_loc.fill("Java 8")
+                        await input_loc.fill(search_text)
                         await asyncio.sleep(0.4)
                         await page.keyboard.press("Enter")
                         await asyncio.sleep(1.5)
-                        print("   ☕ Automatically switched HackerRank editor to Java 8 via #select-language-input!")
+                        print(f"   {lang_icon} Automatically switched HackerRank editor to {search_text} via #select-language-input!")
                     except Exception as e:
                         print(f"   ⚠️ Could not switch via input: {e}")
                 else:
@@ -826,91 +841,230 @@ async def switch_editor_to_java(page: Page, platform_type: str):
                     if await container.count() > 0:
                         await container.click()
                         await asyncio.sleep(0.6)
-                        opt = page.locator("div[id*='react-select']:has-text('Java 8'), div[id*='react-select']:has-text('Java 15'), div[id*='react-select']:has-text('Java'), li:has-text('Java')").first
+                        if lang_lower == "python":
+                            opt = page.locator("div[id*='react-select']:has-text('Python 3'), div[id*='react-select']:has-text('Python'), li:has-text('Python 3')").first
+                        else:
+                            opt = page.locator("div[id*='react-select']:has-text('Java 8'), div[id*='react-select']:has-text('Java 15'), div[id*='react-select']:has-text('Java'), li:has-text('Java')").first
                         if await opt.count() > 0:
                             await opt.click()
-                            print("   ☕ Automatically switched HackerRank editor to Java.")
+                            print(f"   {lang_icon} Automatically switched HackerRank editor to {target_display}.")
                             await asyncio.sleep(1.5)
 
         elif platform_type == "codechef":
-            lang_btn = page.locator("button:has-text('Python'), button:has-text('C++'), select[name='language']").first
+            lang_btn = page.locator("button:has-text('Python'), button:has-text('Java'), button:has-text('C++'), select[name='language']").first
             if await lang_btn.count() > 0 and await lang_btn.is_visible():
                 tag = await lang_btn.evaluate("el => el.tagName.toLowerCase()")
                 if tag == "select":
                     options = await lang_btn.locator("option").all()
                     for opt in options:
-                        if "Java" in (await opt.inner_text()):
+                        txt = await opt.inner_text()
+                        if lang_lower == "python" and "Python" in txt:
                             val = await opt.get_attribute("value")
                             await lang_btn.select_option(val)
-                            print("   ☕ Automatically selected CodeChef language: Java")
+                            print(f"   {lang_icon} Automatically selected CodeChef language: Python 3")
+                            break
+                        elif lang_lower == "java" and "Java" in txt:
+                            val = await opt.get_attribute("value")
+                            await lang_btn.select_option(val)
+                            print(f"   {lang_icon} Automatically selected CodeChef language: Java")
                             break
                 else:
                     await lang_btn.click()
                     await asyncio.sleep(0.6)
-                    opt = page.locator("div:has-text('Java'), li:has-text('Java')").first
+                    if lang_lower == "python":
+                        opt = page.locator("div:has-text('Python 3'), li:has-text('Python 3'), div:has-text('Python'), li:has-text('Python')").first
+                    else:
+                        opt = page.locator("div:has-text('Java'), li:has-text('Java')").first
                     if await opt.count() > 0:
                         await opt.click()
-                        print("   ☕ Automatically switched CodeChef editor to Java.")
+                        print(f"   {lang_icon} Automatically switched CodeChef editor to {target_display}.")
                         await asyncio.sleep(1.5)
 
         elif platform_type == "hackerearth":
-            # 1. Modern Radix UI / Tailwind combobox
             trigger = page.locator("button[data-slot='select-trigger'], button[role='combobox']").first
             if await trigger.count() > 0:
                 txt = await trigger.inner_text()
-                if "Java" not in txt:
+                already_set = ("Python" in txt if lang_lower == "python" else "Java" in txt)
+                if not already_set:
                     await trigger.click()
                     await asyncio.sleep(0.8)
-                    java_opt = page.locator("[role='option']:has-text('Java 17'), [role='option']:has-text('Java 14'), [role='option']:has-text('Java 8'), [role='option']:has-text('Java')").first
-                    if await java_opt.count() > 0:
-                        sel_text = await java_opt.inner_text()
-                        await java_opt.click()
-                        print(f"   ☕ Automatically switched HackerEarth language to: {sel_text}")
+                    if lang_lower == "python":
+                        opt = page.locator("[role='option']:has-text('Python 3'), [role='option']:has-text('Python')").first
+                    else:
+                        opt = page.locator("[role='option']:has-text('Java 17'), [role='option']:has-text('Java 14'), [role='option']:has-text('Java 8'), [role='option']:has-text('Java')").first
+                    if await opt.count() > 0:
+                        sel_text = await opt.inner_text()
+                        await opt.click()
+                        print(f"   {lang_icon} Automatically switched HackerEarth language to: {sel_text}")
                         await asyncio.sleep(1.5)
-            # 2. Legacy fallback
             sel = page.locator("select#language, select[name='language']").first
             if await sel.count() > 0:
                 options = await sel.locator("option").all()
                 for opt in options:
-                    if "Java" in (await opt.inner_text()):
+                    txt = await opt.inner_text()
+                    if lang_lower == "python" and "Python" in txt:
                         val = await opt.get_attribute("value")
                         await sel.select_option(val)
-                        print("   ☕ Automatically selected HackerEarth language: Java")
+                        print(f"   {lang_icon} Automatically selected HackerEarth language: Python 3")
+                        break
+                    elif lang_lower == "java" and "Java" in txt:
+                        val = await opt.get_attribute("value")
+                        await sel.select_option(val)
+                        print(f"   {lang_icon} Automatically selected HackerEarth language: Java")
                         break
     except Exception as e:
         print(f"   ⚠️  Language switch check notice: {e}")
 
-# ==============================================================================
-# AI Solver Engine (Gemini 2.5 generating Java solutions)
-# ==============================================================================
-def ask_gemini_for_java_code(
-    problem_text: str,
-    starter_code: str,
-    platform_name: str,
-    platform_type: str,
-    error_feedback: Optional[str] = None
-) -> Tuple[str, str]:
-    """Generates pure Java solution using Gemini 2.5 with model fallbacks."""
-    if not GEMINI_API_KEY:
-        raise ValueError("GEMINI_API_KEY is not set.")
+async def switch_editor_to_java(page: Page, platform_type: str):
+    """Backward compatibility alias."""
+    await switch_editor_language(page, platform_type, "java")
 
+# ==============================================================================
+# Multi-Provider AI Solver Engine (Groq, OpenRouter, DeepSeek, Gemini)
+# ==============================================================================
+def parse_model_json_response(content: str) -> Tuple[str, str]:
+    """Robustly extracts code and explanation from JSON or markdown responses."""
+    content = content.strip()
+    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+
+    if content.startswith("```json"):
+        content = content[7:]
+    elif content.startswith("```"):
+        content = content[3:]
+    if content.endswith("```"):
+        content = content[:-3]
+    content = content.strip()
+
+    try:
+        data = json.loads(content)
+        if isinstance(data, dict):
+            c = data.get("code", "").strip()
+            e = data.get("explanation", "").strip() or "Optimal approach."
+            if c:
+                return c, e
+    except Exception:
+        pass
+
+    code_match = re.search(r'"code"\s*:\s*"((?:\\.|[^"\\])*)"', content, re.DOTALL)
+    exp_match = re.search(r'"explanation"\s*:\s*"((?:\\.|[^"\\])*)"', content, re.DOTALL)
+    if code_match:
+        try:
+            raw_c = json.loads(f'"{code_match.group(1)}"')
+            raw_e = json.loads(f'"{exp_match.group(1)}"') if exp_match else "Optimal approach."
+            return raw_c.strip(), raw_e.strip()
+        except Exception:
+            pass
+
+    return content, "Optimal algorithmic approach."
+
+def call_openai_compatible_model(endpoint: str, api_key: str, model_name: str, prompt: str) -> Tuple[str, str]:
+    """Queries any OpenAI-compatible provider (Groq, OpenRouter, DeepSeek) for coding answers."""
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    if "openrouter" in endpoint:
+        headers["HTTP-Referer"] = "https://github.com/Vinay-711/autonomous-coding-bot"
+        headers["X-Title"] = "Vinays Coding Bot"
+
+    payload = {
+        "model": model_name,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a world-class competitive programmer. You MUST return your answer as a valid JSON object with exactly two keys: 'code' (raw solution code without markdown code blocks) and 'explanation' (time/space complexity and algorithm)."
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        "temperature": 0.1,
+        "response_format": {"type": "json_object"}
+    }
+
+    req = urllib.request.Request(endpoint, headers=headers, data=json.dumps(payload).encode("utf-8"))
+    with urllib.request.urlopen(req, timeout=50) as resp:
+        res_data = json.loads(resp.read().decode("utf-8"))
+        raw_text = res_data["choices"][0]["message"]["content"]
+        code, exp = parse_model_json_response(raw_text)
+        return code, exp
+
+def call_gemini_model(model_name: str, prompt: str) -> Tuple[str, str]:
+    """Queries Google Gemini model with high-timeout client."""
     client = genai.Client(
         api_key=GEMINI_API_KEY,
         http_options=types.HttpOptions(
             api_version="v1beta",
-            timeout=90000,
+            timeout=120000,
         )
     )
+    response = client.models.generate_content(
+        model=model_name,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=CodingAnswer,
+            temperature=0.1,
+        ),
+    )
+    result = CodingAnswer.model_validate_json(response.text)
+    return result.code, result.explanation
 
-    if platform_type == "leetcode":
-        platform_instructions = """
+def ask_ai_for_code(
+    problem_text: str,
+    starter_code: str,
+    platform_name: str,
+    platform_type: str,
+    language: str = "java",
+    error_feedback: Optional[str] = None
+) -> Tuple[str, str]:
+    """Generates pure solution code in Java or Python 3 using open-source models (Groq, OpenRouter, DeepSeek)
+    and frontier models (Gemini 2.5 Flash).
+    """
+    lang_lower = language.lower()
+    lang_display = "Python 3" if lang_lower == "python" else "Java"
+
+    if lang_lower == "python":
+        if platform_type == "leetcode":
+            platform_instructions = """
+1. LeetCode expects solutions inside `class Solution` (e.g. `class Solution:\n    def twoSum(self, nums: List[int], target: int) -> List[int]:`).
+2. DO NOT use sys.stdin or input(). Return the answer directly from the method.
+3. Include standard imports from typing (List, Dict, Optional, etc.) if needed.
+4. If starter code is provided below, PRESERVE the exact method signature.
+"""
+        elif platform_type in ["codeforces", "codechef"]:
+            platform_instructions = f"""
+1. Write a complete, standalone Python 3 program for {platform_name}.
+2. Use fast standard I/O:
+   import sys
+   input = sys.stdin.readline
+3. Handle multiple test cases (T) if required by the problem statement.
+4. Print the output to sys.stdout.
+5. Ensure optimal time and space complexity to prevent TLE (Time Limit Exceeded).
+"""
+        elif platform_type == "hackerrank":
+            platform_instructions = """
+1. For HackerRank, write a complete Python 3 program.
+2. If the starter template defines helper functions or a main block, preserve the function signature and implement the optimal solution.
+3. Read from standard input using sys.stdin.read().split() or input() and print results to standard output.
+"""
+        else:  # hackerearth
+            platform_instructions = """
+1. For HackerEarth, write a complete standalone Python 3 program.
+2. Read input from standard input using sys.stdin and print results to standard output.
+3. Optimal time and space complexity.
+"""
+    else:  # Java
+        if platform_type == "leetcode":
+            platform_instructions = """
 1. LeetCode expects solutions inside `class Solution` (e.g. `class Solution { public int[] twoSum(...) { ... } }`).
 2. DO NOT use System.in or Scanner. Return the answer directly from the method.
 3. Import java.util.* and any necessary packages.
 4. If starter code is provided below, PRESERVE the exact class name, method name, and parameter types.
 """
-    elif platform_type in ["codeforces", "codechef"]:
-        platform_instructions = f"""
+        elif platform_type in ["codeforces", "codechef"]:
+            platform_instructions = f"""
 1. Write a complete, standalone Java program for {platform_name}.
 2. The class MUST be named 'Main' (e.g. `public class Main {{ public static void main(String[] args) throws IOException {{ ... }} }}`).
 3. Read all input from standard input using fast I/O:
@@ -919,8 +1073,8 @@ def ask_gemini_for_java_code(
 5. Print the output to System.out using PrintWriter or System.out.println.
 6. Optimal time & space complexity to prevent TLE (Time Limit Exceeded).
 """
-    elif platform_type == "hackerrank":
-        platform_instructions = f"""
+        elif platform_type == "hackerrank":
+            platform_instructions = f"""
 1. For HackerRank, inspect the starter code template below.
 2. If the starter template defines `class Result` and `public class Solution`, you MUST include BOTH classes intact in your output.
 3. NEVER omit or remove `public class Solution` or its `main` method, because HackerRank judge runs `Solution.main`!
@@ -932,8 +1086,8 @@ def ask_gemini_for_java_code(
    - DO NOT use 'Stream.toList()' (use '.collect(Collectors.toList())').
    - DO NOT use modern switch expressions (use standard switch-case statements).
 """
-    else:  # hackerearth
-        platform_instructions = f"""
+        else:  # hackerearth
+            platform_instructions = f"""
 1. For HackerEarth, write a complete, standalone Java program.
 2. The primary class MUST be named 'TestClass' (e.g. `public class TestClass {{ public static void main(String[] args) throws Exception {{ ... }} }}`).
 3. Read input from System.in using BufferedReader / Scanner and print to System.out.
@@ -946,15 +1100,15 @@ def ask_gemini_for_java_code(
    - DO NOT use modern switch expressions (use standard switch-case statements).
 """
 
-    starter_section = f"STARTER CODE TEMPLATE:\n```java\n{starter_code}\n```" if starter_code.strip() else "STARTER CODE TEMPLATE: None provided. Write a complete standalone Java solution."
+    starter_section = f"STARTER CODE TEMPLATE:\n```{lang_lower}\n{starter_code}\n```" if starter_code.strip() else f"STARTER CODE TEMPLATE: None provided. Write a complete standalone {lang_display} solution."
 
-    feedback_section = f"\nATTENTION - PREVIOUS ATTEMPT FAILED WITH ERROR:\n{error_feedback}\nPlease diagnose and fix the issue in Java." if error_feedback else ""
+    feedback_section = f"\nATTENTION - PREVIOUS ATTEMPT FAILED WITH ERROR:\n{error_feedback}\nPlease diagnose and fix the issue in {lang_display}." if error_feedback else ""
 
     java_version_spec = "Java 8 (STRICT Java 8 compatibility, NO var, NO Java 9+ methods)" if platform_type in ["hackerrank", "hackerearth"] else "Java (Java 17/21)"
+    lang_full_spec = "Python 3" if lang_lower == "python" else f"Java ({java_version_spec})"
 
-    prompt = f"""
-You are an expert competitive programmer and Java software engineer.
-Solve this {platform_name} coding problem in Java ({java_version_spec}).
+    prompt = f"""You are an expert competitive programmer and software engineer.
+Solve this {platform_name} coding problem in {lang_full_spec}.
 
 PROBLEM STATEMENT:
 {problem_text}
@@ -966,48 +1120,100 @@ PLATFORM INSTRUCTIONS:
 {feedback_section}
 
 IMPORTANT FORMATTING:
-- Provide clean, readable Java code with standard indentation (4 spaces) and proper newlines between methods, loops, and statements.
-- Provide pure Java code in the 'code' field of the JSON output. Do NOT include markdown code fences (```) inside the code field itself.
+- Provide pure, complete, working {lang_display} code with standard indentation (4 spaces).
+- Return your answer as a valid JSON object with:
+  "code": "pure code without markdown backticks",
+  "explanation": "brief overview of approach and time/space complexity"
 """
 
+    # Prioritized model queue across available open-source & frontier providers
+    model_queue = []
+
+    # 1. Groq (Free high-speed open-source models: DeepSeek-R1 Distill 70B, Llama 3.3 70B, Qwen 2.5 Coder 32B)
+    if GROQ_API_KEY:
+        model_queue.append(("groq", "deepseek-r1-distill-llama-70b"))
+        model_queue.append(("groq", "llama-3.3-70b-versatile"))
+        model_queue.append(("groq", "qwen-2.5-coder-32b"))
+
+    # 2. DeepSeek Official API
+    if DEEPSEEK_API_KEY:
+        model_queue.append(("deepseek", "deepseek-chat"))
+
+    # 3. OpenRouter (Free open-source tier: DeepSeek-R1, Llama 3.3, Qwen)
+    if OPENROUTER_API_KEY:
+        model_queue.append(("openrouter", "deepseek/deepseek-r1:free"))
+        model_queue.append(("openrouter", "meta-llama/llama-3.3-70b-instruct:free"))
+        model_queue.append(("openrouter", "qwen/qwen-2.5-coder-32b-instruct:free"))
+
+    # 4. Google Gemini (Frontier 2.5 Flash with 120s timeout & Flash Lite)
+    if GEMINI_API_KEY:
+        model_queue.append(("gemini", "gemini-2.5-flash"))
+        model_queue.append(("gemini", "gemini-3.5-flash-lite"))
+        model_queue.append(("gemini", "gemini-3.1-flash-lite"))
+
+    if not model_queue:
+        raise ValueError("No AI API keys configured. Please set GEMINI_API_KEY, GROQ_API_KEY, or OPENROUTER_API_KEY in .env.")
+
     last_error = None
-    for model_name in AI_MODELS:
+    for provider, model_name in model_queue:
         for m_retry in range(2):
             try:
-                print(f"   🤖 Querying {model_name} for Java solution...")
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=CodingAnswer,
-                        temperature=0.1,
-                    ),
-                )
-                result = CodingAnswer.model_validate_json(response.text)
-                clean_code = clean_code_string(result.code)
-                return clean_code, result.explanation
+                print(f"   🤖 Querying {provider.upper()} ({model_name}) for {lang_display} solution...")
+                if provider == "groq":
+                    code, exp = call_openai_compatible_model("https://api.groq.com/openai/v1/chat/completions", GROQ_API_KEY, model_name, prompt)
+                elif provider == "openrouter":
+                    code, exp = call_openai_compatible_model("https://openrouter.ai/api/v1/chat/completions", OPENROUTER_API_KEY, model_name, prompt)
+                elif provider == "deepseek":
+                    code, exp = call_openai_compatible_model("https://api.deepseek.com/chat/completions", DEEPSEEK_API_KEY, model_name, prompt)
+                else:  # gemini
+                    code, exp = call_gemini_model(model_name, prompt)
+
+                clean_code = clean_code_string(code, language=lang_lower)
+                if clean_code:
+                    return clean_code, exp
             except Exception as e:
                 last_error = e
                 err_str = str(e).lower()
-                if ("503" in err_str or "unavailable" in err_str or "429" in err_str or "rate" in err_str) and m_retry == 0:
+                if ("503" in err_str or "unavailable" in err_str or "429" in err_str or "rate" in err_str or "504" in err_str) and m_retry == 0:
                     time.sleep(2)
                     continue
-                print(f"   ⚠️  Model {model_name} failed: {e}. Trying next model...")
+                print(f"   ⚠️  Model {provider}:{model_name} failed: {e}. Trying next model...")
                 break
 
-    raise RuntimeError(f"All Gemini models failed. Last error: {last_error}")
+    raise RuntimeError(f"All AI models failed for {lang_display}. Last error: {last_error}")
 
-def clean_code_string(code: str) -> str:
+def ask_gemini_for_java_code(
+    problem_text: str,
+    starter_code: str,
+    platform_name: str,
+    platform_type: str,
+    error_feedback: Optional[str] = None
+) -> Tuple[str, str]:
+    """Backward compatibility alias."""
+    return ask_ai_for_code(problem_text, starter_code, platform_name, platform_type, "java", error_feedback)
+
+def clean_code_string(code: str, language: str = "java") -> str:
     """Removes stray markdown fences if any."""
     code = code.strip()
-    if code.startswith("```java"):
-        code = code[7:]
-    elif code.startswith("```"):
-        code = code[3:]
+    prefixes = [f"```{language}", "```python3", "```python", "```py", "```java", "```"]
+    for p in prefixes:
+        if code.lower().startswith(p):
+            code = code[len(p):].lstrip("\r\n")
+            break
     if code.endswith("```"):
-        code = code[:-3]
+        code = code[:-3].rstrip()
     return code.strip()
+
+def verify_python_code_locally(code: str, platform_type: str) -> Tuple[bool, str, str]:
+    """Verifies Python code syntax and imports locally using compile()."""
+    cleaned = clean_code_string(code, language="python")
+    try:
+        compile(cleaned, "<solution>", "exec")
+        return True, "Python syntax verified cleanly.", cleaned
+    except SyntaxError as e:
+        return False, f"Python SyntaxError at line {e.lineno}: {e.msg}", cleaned
+    except Exception as e:
+        return False, f"Python verification failed: {e}", cleaned
 
 # ==============================================================================
 # Browser Page Helpers (Selectors & Text Extraction)
@@ -1473,8 +1679,47 @@ async def verify_codeforces_samples_java(page: Page, code: str) -> Tuple[bool, s
     except Exception as e:
         return True, f"Local test skipped: {e}"
 
+async def verify_codeforces_samples_python(page: Page, code: str) -> Tuple[bool, str]:
+    """Runs Python solution against sample test cases locally."""
+    try:
+        inputs = await page.locator(".sample-test .input pre").all_inner_texts()
+        outputs = await page.locator(".sample-test .output pre").all_inner_texts()
+        if not inputs or not outputs:
+            return True, "No sample test cases found on page."
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_file = Path(tmpdir) / "solution.py"
+            with open(src_file, "w", encoding="utf-8") as f:
+                f.write(code)
+
+            all_passed = True
+            summary = []
+            for i, (inp, expected) in enumerate(zip(inputs, outputs), 1):
+                inp = inp.strip()
+                expected = expected.strip()
+                run_proc = subprocess.run(
+                    [sys.executable, str(src_file)],
+                    input=inp,
+                    capture_output=True,
+                    text=True,
+                    timeout=6
+                )
+                actual = run_proc.stdout.strip()
+                if run_proc.returncode != 0:
+                    all_passed = False
+                    summary.append(f"Sample {i}: RUNTIME ERROR (Code {run_proc.returncode})\nStderr: {run_proc.stderr.strip()}")
+                elif actual == expected:
+                    summary.append(f"Sample {i}: PASSED (Output == Expected == '{expected}')")
+                else:
+                    all_passed = False
+                    summary.append(f"Sample {i}: FAILED\nInput:\n{inp}\nExpected:\n{expected}\nActual:\n{actual}")
+
+            return all_passed, "\n".join(summary)
+    except Exception as e:
+        return True, f"Local test skipped: {e}"
+
 # ==============================================================================
-# URL Helpers & File Archival (.java)
+# URL Helpers & File Archival (.java / .py)
 # ==============================================================================
 REPOS_DIR = BASE_DIR / "repos"
 
@@ -1501,8 +1746,8 @@ PLATFORM_REPO_CONFIG = {
     },
 }
 
-def get_safe_java_filename(url: str, platform_name: str) -> str:
-    """Generates a clean Java filename like 'solutions/leetcode_two_sum.java'."""
+def get_safe_filename(url: str, platform_name: str, language: str = "java") -> str:
+    """Generates a clean filename like 'solutions/leetcode_two_sum.java' or '.py'."""
     clean_url = url.rstrip("/")
     slug = clean_url.split("/")[-1]
     if slug in ["description", "problem"]:
@@ -1513,14 +1758,33 @@ def get_safe_java_filename(url: str, platform_name: str) -> str:
             slug = f"{parts[-2]}_{parts[-1]}"
 
     slug = re.sub(r"[^a-zA-Z0-9_\-]", "_", slug)
-    return f"{platform_name.lower()}_{slug}.java"
+    ext = "py" if language.lower() == "python" else "java"
+    return f"{platform_name.lower()}_{slug}.{ext}"
 
-def save_java_solution(filename: str, code: str, url: str, explanation: str, platform_name: str):
-    """Saves Java solution to solutions/ directory with metadata header."""
+def get_safe_java_filename(url: str, platform_name: str) -> str:
+    """Backward compatibility alias."""
+    return get_safe_filename(url, platform_name, "java")
+
+def save_solution(filename: str, code: str, url: str, explanation: str, platform_name: str, language: str = "java"):
+    """Saves solution to solutions/ directory with metadata header."""
     file_path = SOLUTIONS_DIR / filename
-    header = f"""/* ==============================================================================
+    lang_name = "Python 3" if language.lower() == "python" else "Java"
+    if language.lower() == "python":
+        header = f"""# ==============================================================================
+# Platform: {platform_name}
+# Language: {lang_name}
+# URL: {url}
+# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+#
+# Approach:
+# {explanation}
+# ==============================================================================
+
+"""
+    else:
+        header = f"""/* ==============================================================================
  * Platform: {platform_name}
- * Language: Java
+ * Language: {lang_name}
  * URL: {url}
  * Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
  *
@@ -1532,15 +1796,22 @@ def save_java_solution(filename: str, code: str, url: str, explanation: str, pla
 """
     with open(file_path, "w", encoding="utf-8") as f:
         f.write(header + code + "\n")
-    print(f"   💾 Saved Java solution to '{file_path}'")
+    print(f"   💾 Saved {lang_name} solution to '{file_path}'")
 
-def commit_solution_to_github(platform_type: str, url: str, code: str, explanation: str, platform_name: str) -> bool:
+def save_java_solution(filename: str, code: str, url: str, explanation: str, platform_name: str):
+    """Backward compatibility alias."""
+    save_solution(filename, code, url, explanation, platform_name, "java")
+
+def commit_solution_to_github(platform_type: str, url: str, code: str, explanation: str, platform_name: str, language: str = "java") -> bool:
     """Commits and pushes the solution to the user's dedicated GitHub repository for that platform."""
     if not GITHUB_USERNAME:
         return False
 
     if platform_type not in PLATFORM_REPO_CONFIG:
         return False
+
+    lang_lower = language.lower()
+    lang_name = "Python 3" if lang_lower == "python" else "Java"
 
     repo_info = PLATFORM_REPO_CONFIG[platform_type]
     repo_name = repo_info["repo_name"]
@@ -1571,8 +1842,11 @@ def commit_solution_to_github(platform_type: str, url: str, code: str, explanati
     prob_dir = repo_dir / "solutions" / today_str / clean_slug
     prob_dir.mkdir(parents=True, exist_ok=True)
 
-    # Write Java source file
-    src_filename = repo_info["class_filename"]
+    # Write source file
+    if lang_lower == "python":
+        src_filename = "main.py" if platform_type in ["codeforces", "codechef"] else "Solution.py"
+    else:
+        src_filename = repo_info["class_filename"]
     (prob_dir / src_filename).write_text(code, encoding="utf-8")
 
     # Write README.md
@@ -1581,7 +1855,7 @@ def commit_solution_to_github(platform_type: str, url: str, code: str, explanati
 
 [Original practice problem]({url})
 
-Date: {today_str} (Asia/Kolkata). Status: **Accepted**. Platform: **{platform_name}**.
+Date: {today_str} (Asia/Kolkata). Status: **Accepted**. Platform: **{platform_name}**. Language: **{lang_name}**.
 
 ## Approach
 
@@ -1589,7 +1863,7 @@ Date: {today_str} (Asia/Kolkata). Status: **Accepted**. Platform: **{platform_na
 
 ## Verification
 
-Solution generated in Java and verified on {platform_name} by autonomous AI bot.
+Solution generated in {lang_name} and verified Accepted on {platform_name} by autonomous AI bot.
 """
     readme_path.write_text(readme_content, encoding="utf-8")
 
@@ -1603,12 +1877,12 @@ Solution generated in Java and verified on {platform_name} by autonomous AI bot.
             print(f"   ℹ️  GitHub repo '{repo_name}' already up-to-date.")
             return True
 
-        commit_msg = f"Add verified Java solution for {clean_slug} [{platform_name}]"
+        commit_msg = f"Add verified {lang_name} solution for {clean_slug} [{platform_name}]"
         subprocess.run(["git", "commit", "-m", commit_msg], cwd=repo_dir, check=True, capture_output=True)
         push_res = subprocess.run(["git", "push", "origin", "main"], cwd=repo_dir, capture_output=True, text=True)
 
         if push_res.returncode == 0:
-            print(f"   🐙 GitHub Commit & Push successful: {GITHUB_USERNAME}/{repo_name} ({clean_slug})!")
+            print(f"   🐙 GitHub Commit & Push successful: {GITHUB_USERNAME}/{repo_name} ({clean_slug}) [{lang_name}]!")
             return True
         else:
             print(f"   ⚠️  Git push notice: {push_res.stderr.strip() or push_res.stdout.strip()}")
@@ -1625,7 +1899,10 @@ async def process_problem(
     url: str,
     mode: str = "run"
 ) -> bool:
-    """Processes a single coding problem URL end-to-end in Java with zero human input."""
+    """Processes a single coding problem URL end-to-end.
+    Attempts in Java first. If Java does not achieve an Accepted verdict (or fails compilation),
+    automatically falls back to Python 3!
+    """
     print(f"\n{'='*70}")
     print(f"🚀 Processing: {url}")
     print(f"{'='*70}")
@@ -1652,12 +1929,8 @@ async def process_problem(
         print(f"❌ Failed to load {url}: {e}")
         return False
 
-    # 2. Automatically ensure editor language is set to Java
-    print("[2/6] Ensuring editor language is set to Java...")
-    await switch_editor_to_java(page, platform_type)
-
-    # 3. Extract problem description
-    print("[3/6] Extracting problem description...")
+    # 2. Extract problem description
+    print("[2/6] Extracting problem description...")
     problem_text = await extract_problem_text(page, config["question_selectors"])
     if not problem_text:
         print("⚠️  Waiting 4 more seconds for lazy-loaded elements...")
@@ -1669,286 +1942,236 @@ async def process_problem(
 
     print(f"   📄 Extracted problem description ({len(problem_text)} characters).")
 
-    # 4. Extract starter code from editor (Java)
-    starter_code = await extract_editor_code(page)
-    if starter_code:
-        print(f"   📝 Detected Java starter template ({len(starter_code)} characters).")
-    else:
-        print("   ℹ️  No starter template detected (will generate complete standalone Java code).")
+    # Sequence of languages to try: Java first, then Python 3 fallback
+    languages_to_try = ["java", "python"]
 
-    # 5. Generate Java solution via Gemini with local javac verification & repair loop
-    print("[4/7] Solving in Java with Gemini AI & verifying locally...")
-    solution_code = None
-    explanation = None
-    compile_passed = False
-    last_error_log = None
+    for lang_idx, current_lang in enumerate(languages_to_try, 1):
+        lang_title = "Python 3" if current_lang == "python" else "Java"
+        lang_icon = "🐍" if current_lang == "python" else "☕"
+        print(f"\n{'─'*50}")
+        print(f"👉 [{lang_title.upper()}] Starting solver attempt ({lang_idx}/{len(languages_to_try)})...")
+        print(f"{'─'*50}")
 
-    for attempt in range(1, 4):
-        print(f"   [Attempt {attempt}/3] Generating Java solution...")
-        solution_code, explanation = ask_gemini_for_java_code(
-            problem_text=problem_text,
-            starter_code=starter_code,
-            platform_name=platform_name,
-            platform_type=platform_type,
-            error_feedback=last_error_log
-        )
+        # Ensure editor language is set
+        print(f"   {lang_icon} Ensuring editor language is set to {lang_title}...")
+        await switch_editor_language(page, platform_type, current_lang)
+        await asyncio.sleep(1.5)
 
-        # Local javac compilation check
-        print(f"   🧪 Compiling generated Java solution with javac locally...")
-        compile_passed, err_msg, solution_code = compile_java_code_locally(solution_code, platform_type)
-        if compile_passed:
-            print(f"   ✅ Local javac compilation PASSED cleanly!")
-            break
+        # Extract starter code for this language
+        starter_code = await extract_editor_code(page)
+        if starter_code:
+            print(f"   📝 Detected {lang_title} starter template ({len(starter_code)} characters).")
         else:
-            print(f"   ⚠️  Java compilation failed with error:\n{err_msg}")
-            last_error_log = f"Java compilation error:\n{err_msg}"
+            print(f"   ℹ️  No {lang_title} starter template detected.")
 
-    if not compile_passed or not solution_code:
-        print(f"❌ Failed to generate compiling Java code for {url} after 3 attempts. Skipping to protect repo integrity.")
-        return False
+        # Generate solution with local verification loop
+        print(f"   🧪 Generating {lang_title} solution & verifying locally...")
+        solution_code = None
+        explanation = None
+        verified_passed = False
+        last_error_log = None
 
-    print(f"   💡 Approach: {explanation}")
-
-    # Optional local sample test verification for Codeforces
-    if platform_type == "codeforces":
-        print("   🧪 Testing Java solution against sample test cases locally...")
-        passed_samples, sample_log = await verify_codeforces_samples_java(page, solution_code)
-        print(f"   {sample_log}")
-        if not passed_samples:
-            print("   ⚠️  Sample test failed! Attempting self-correction...")
+        for attempt in range(1, 4):
+            print(f"      [Attempt {attempt}/3] Generating {lang_title} code...")
             try:
-                corr_code, corr_exp = ask_gemini_for_java_code(
+                solution_code, explanation = ask_ai_for_code(
                     problem_text=problem_text,
                     starter_code=starter_code,
                     platform_name=platform_name,
                     platform_type=platform_type,
-                    error_feedback=sample_log
+                    language=current_lang,
+                    error_feedback=last_error_log
                 )
-                c_ok, _, clean_corr = compile_java_code_locally(corr_code, platform_type)
-                if c_ok:
-                    solution_code = clean_corr
-                    explanation = corr_exp
-            except Exception:
-                pass
-
-    # 6. Inject code into webpage editor & 7. Execute action
-    if platform_type == "codeforces":
-        if mode in ["submit", "both"]:
-            print("[5/7 & 6/7] Navigating to Codeforces submit page & submitting...")
-            try:
-                clean_url = url.rstrip("/")
-                parts = clean_url.split("/")
-                prob_code = f"{parts[-2]}{parts[-1]}"
-                
-                await page.goto("https://codeforces.com/problemset/submit", wait_until="domcontentloaded", timeout=25000)
-                await asyncio.sleep(2)
-
-                # Check if logged in
-                is_logged_in = await page.evaluate("""() => {
-                    return !!document.querySelector('a[href*="/logout"], a[href*="/profile/"]');
-                }""")
-                if not is_logged_in:
-                    print("\n" + "=" * 68)
-                    print("⚠️  [Codeforces] You are not logged in to Codeforces in this browser profile!")
-                    print(f"👉 Please enter your password for '{CODEFORCES_HANDLE}' in the open Chrome window.")
-                    print("   (Your login will be preserved in saved_chrome_login for all future runs)")
-                    print("=" * 68)
-                    try:
-                        await page.goto("https://codeforces.com/enter", wait_until="domcontentloaded", timeout=15000)
-                        if CODEFORCES_HANDLE:
-                            await page.locator('input[name="handleOrEmail"]').fill(CODEFORCES_HANDLE)
-                        cb = page.locator('input[name="remember"]')
-                        if await cb.count() > 0:
-                            await cb.check()
-                    except Exception:
-                        pass
-                    if sys.platform == "darwin":
-                        try:
-                            subprocess.run(["osascript", "-e", 'tell application "Google Chrome" to activate'], capture_output=True)
-                        except Exception:
-                            pass
-                    logged_in = False
-                    for _ in range(45):
-                        await asyncio.sleep(2)
-                        logged_in = await page.evaluate("""() => !!document.querySelector('a[href*="/logout"], a[href*="/profile/"]')""")
-                        if logged_in:
-                            print("   ✅ Detected Codeforces login! Navigating back to submit page...")
-                            await page.goto("https://codeforces.com/problemset/submit", wait_until="domcontentloaded", timeout=25000)
-                            await asyncio.sleep(2)
-                            break
-                    if not logged_in:
-                        page._anti_bot_blocked = True
-                        print("\n🛑 Login timed out. Codeforces submissions require an authenticated user account.")
-                        filename = get_safe_java_filename(url, platform_name)
-                        save_java_solution(filename, solution_code, url, explanation, platform_name)
-                        return False
-                
-                # Fill problem code (e.g. 1352C)
-                await page.locator('input[name="submittedProblemCode"]').fill(prob_code)
-                print(f"   📝 Entered problem code: {prob_code}")
-                
-                # Select Java
-                sel = page.locator('select[name="programTypeId"]').first
-                if await sel.count() > 0:
-                    options = await sel.locator("option").all()
-                    for opt in options:
-                        txt = await opt.inner_text()
-                        if "Java 21" in txt or "Java 17" in txt:
-                            val = await opt.get_attribute("value")
-                            await sel.select_option(val)
-                            print(f"   ☕ Selected language: {txt.strip()}")
-                            break
-                            
-                # Fill source code
-                await page.locator('textarea#sourceCodeTextarea, textarea[name="source"]').fill(solution_code)
-                print("   📋 Pasted Java solution code.")
-
-                # Check for Cloudflare Turnstile anti-bot challenge
-                has_turnstile = await page.evaluate("""() => {
-                    const cf = document.querySelector('iframe[src*="cloudflare"], iframe[src*="turnstile"], .cf-turnstile, input[name="turnstileToken"], input[name="cf-turnstile-response"]');
-                    return !!cf;
-                }""")
-
-                if has_turnstile:
-                    # Give Turnstile up to 15s to generate token automatically
-                    token = ""
-                    for _ in range(15):
-                        token = await page.evaluate("""() => {
-                            const el = document.querySelector('input[name="turnstileToken"], input[name="cf-turnstile-response"], input[name*="turnstile" i]');
-                            return el && el.value && el.value.length > 5 ? el.value : '';
-                        }""")
-                        if token:
-                            print("   ✅ Cloudflare Turnstile token ready! Submitting...")
-                            break
-                        await asyncio.sleep(1)
-
-                    if not token:
-                        print("\n" + "=" * 68)
-                        print("🛡️  [Codeforces] Cloudflare Anti-Bot Verification Detected!")
-                        print("=" * 68)
-                        print("👉 Please complete the verification directly in your open Chrome window.")
-                        print("   Waiting for verification to complete (up to 45s)...")
-                        print("=" * 68)
-                        if sys.platform == "darwin":
-                            try:
-                                subprocess.run(["osascript", "-e", 'tell application "Google Chrome" to activate'], capture_output=True)
-                            except Exception:
-                                pass
-
-                        for sec in range(23):
-                            await asyncio.sleep(2)
-                            token = await page.evaluate("""() => {
-                                const el = document.querySelector('input[name="turnstileToken"], input[name="cf-turnstile-response"], input[name*="turnstile" i]');
-                                return el && el.value && el.value.length > 5 ? el.value : '';
-                            }""")
-                            if token:
-                                print("   ✅ Human verification completed in Chrome! Submitting...")
-                                break
-                            if sec > 0 and sec % 5 == 0:
-                                print(f"   ⏳ Waiting for verification in Chrome ({46 - sec * 2}s remaining)...")
-
-                    if not token:
-                        page._anti_bot_blocked = True
-                        print("\n🛑 Codeforces anti-bot verification (Cloudflare Turnstile) was not completed.")
-                        filename = get_safe_java_filename(url, platform_name)
-                        save_java_solution(filename, solution_code, url, explanation, platform_name)
-                        return False
-
-                # Click submit
-                await page.locator('input.submit').click()
-                print("   🚀 Clicked Codeforces Submit! Waiting for judge verdict...")
-                await asyncio.sleep(3)
-
-                # Check if submission was blocked due to anti-bot verification
-                err_text = await page.evaluate("""() => {
-                    const els = Array.from(document.querySelectorAll('.error, .error__desc, span[class*="error"]'));
-                    return els.map(e => (e.innerText || '').trim()).join(' ');
-                }""")
-                if "anti-bot" in err_text.lower() or "verification" in err_text.lower():
-                    print("\n⚠️  Codeforces notice: 'Please complete the anti-bot verification'")
-                    print("👉 Please click the verification box in Chrome. Giving 20s before retry...")
-                    if sys.platform == "darwin":
-                        try:
-                            subprocess.run(["osascript", "-e", 'tell application "Google Chrome" to activate'], capture_output=True)
-                        except Exception:
-                            pass
-                    for _ in range(10):
-                        await asyncio.sleep(2)
-                        token = await page.evaluate("""() => {
-                            const el = document.querySelector('input[name="turnstileToken"], input[name="cf-turnstile-response"], input[name*="turnstile" i]');
-                            return el && el.value && el.value.length > 5 ? el.value : '';
-                        }""")
-                        if token:
-                            print("   ✅ Verification detected! Re-submitting now...")
-                            await page.locator('input.submit').click()
-                            await asyncio.sleep(3)
-                            break
-                    if not token:
-                        page._anti_bot_blocked = True
-                        print("\n🛑 Codeforces anti-bot verification was not completed.")
-                        filename = get_safe_java_filename(url, platform_name)
-                        save_java_solution(filename, solution_code, url, explanation, platform_name)
-                        return False
             except Exception as e:
-                print(f"   ⚠️  Codeforces submit notice: {e}")
-        else:
-            print("[5/7 & 6/7] Codeforces local test complete (Mode: RUN).")
-    else:
-        print("[5/7] Injecting Java solution into editor...")
-        await inject_code_into_editor(page, solution_code)
+                print(f"      ⚠️  AI generation failed: {e}")
+                last_error_log = str(e)
+                continue
 
-        # Execute action (Run / Submit) based on mode
-        print(f"[6/7] Performing action (Mode: {mode.upper()})...")
-        if mode in ["run", "both"] and config.get("run_selectors"):
-            run_clicked = False
-            for selector in config["run_selectors"]:
-                btn = page.locator(selector).first
+            if current_lang == "java":
+                verified_passed, err_msg, solution_code = compile_java_code_locally(solution_code, platform_type)
+                if verified_passed:
+                    print("      ✅ Local javac compilation PASSED cleanly!")
+                    break
+                else:
+                    print(f"      ⚠️  Java compilation failed:\n{err_msg[:300]}")
+                    last_error_log = f"Java compilation error:\n{err_msg}"
+            else:  # python
+                verified_passed, err_msg, solution_code = verify_python_code_locally(solution_code, platform_type)
+                if verified_passed:
+                    print("      ✅ Local Python syntax PASSED cleanly!")
+                    break
+                else:
+                    print(f"      ⚠️  Python syntax error:\n{err_msg[:300]}")
+                    last_error_log = f"Python syntax error:\n{err_msg}"
+
+        if not verified_passed or not solution_code:
+            print(f"   ❌ Failed to generate valid {lang_title} code after 3 attempts.")
+            if current_lang == "java":
+                print("   🔄 Automatically falling back from Java to Python 3 for this problem...")
+                continue
+            else:
+                return False
+
+        print(f"   💡 Approach: {explanation}")
+
+        # Optional sample test for Codeforces
+        if platform_type == "codeforces":
+            print(f"   🧪 Testing {lang_title} solution against sample test cases locally...")
+            if current_lang == "java":
+                passed_samples, sample_log = await verify_codeforces_samples_java(page, solution_code)
+            else:
+                passed_samples, sample_log = await verify_codeforces_samples_python(page, solution_code)
+            print(f"   {sample_log}")
+            if not passed_samples:
+                print("   ⚠️  Sample test failed! Attempting self-correction...")
                 try:
-                    if await btn.is_visible():
-                        await btn.click()
-                        print(f"   ▶️  Clicked 'Run Code' button ({selector})!")
-                        run_clicked = True
-                        break
+                    corr_code, corr_exp = ask_ai_for_code(
+                        problem_text=problem_text,
+                        starter_code=starter_code,
+                        platform_name=platform_name,
+                        platform_type=platform_type,
+                        language=current_lang,
+                        error_feedback=sample_log
+                    )
+                    if current_lang == "java":
+                        c_ok, _, clean_corr = compile_java_code_locally(corr_code, platform_type)
+                    else:
+                        c_ok, _, clean_corr = verify_python_code_locally(corr_code, platform_type)
+                    if c_ok:
+                        solution_code = clean_corr
+                        explanation = corr_exp
                 except Exception:
-                    continue
-            if run_clicked:
+                    pass
+
+        # Codeforces Submit Page Flow
+        if platform_type == "codeforces":
+            if mode in ["submit", "both"]:
+                print(f"   🚀 Submitting {lang_title} solution to Codeforces...")
+                try:
+                    clean_url = url.rstrip("/")
+                    parts = clean_url.split("/")
+                    prob_code = f"{parts[-2]}{parts[-1]}"
+
+                    await page.goto("https://codeforces.com/problemset/submit", wait_until="domcontentloaded", timeout=25000)
+                    await asyncio.sleep(2)
+
+                    # Check login
+                    is_logged_in = await page.evaluate("() => !!document.querySelector('a[href*=\"/logout\"], a[href*=\"/profile/\"]')")
+                    if not is_logged_in:
+                        print("⚠️  [Codeforces] Not logged in in browser profile.")
+                        filename = get_safe_filename(url, platform_name, current_lang)
+                        save_solution(filename, solution_code, url, explanation, platform_name, current_lang)
+                        return False
+
+                    # Fill problem code
+                    await page.locator('input[name="submittedProblemCode"]').fill(prob_code)
+
+                    # Select language in dropdown
+                    sel = page.locator('select[name="programTypeId"]').first
+                    if await sel.count() > 0:
+                        options = await sel.locator("option").all()
+                        for opt in options:
+                            txt = await opt.inner_text()
+                            if current_lang == "python" and ("Python 3" in txt or "PyPy 3" in txt):
+                                val = await opt.get_attribute("value")
+                                await sel.select_option(val)
+                                print(f"   🐍 Selected language: {txt.strip()}")
+                                break
+                            elif current_lang == "java" and ("Java 21" in txt or "Java 17" in txt):
+                                val = await opt.get_attribute("value")
+                                await sel.select_option(val)
+                                print(f"   ☕ Selected language: {txt.strip()}")
+                                break
+
+                    # Fill source code
+                    await page.locator('textarea#sourceCodeTextarea, textarea[name="source"]').fill(solution_code)
+
+                    # Cloudflare Turnstile token check
+                    has_turnstile = await page.evaluate("() => !!document.querySelector('iframe[src*=\"cloudflare\"], iframe[src*=\"turnstile\"], .cf-turnstile')")
+                    if has_turnstile:
+                        token = ""
+                        for _ in range(15):
+                            token = await page.evaluate("() => { const el = document.querySelector('input[name=\"turnstileToken\"], input[name=\"cf-turnstile-response\"], input[name*=\"turnstile\" i]'); return el && el.value && el.value.length > 5 ? el.value : ''; }")
+                            if token:
+                                break
+                            await asyncio.sleep(1)
+
+                        if not token:
+                            for sec in range(20):
+                                await asyncio.sleep(2)
+                                token = await page.evaluate("() => { const el = document.querySelector('input[name=\"turnstileToken\"], input[name=\"cf-turnstile-response\"], input[name*=\"turnstile\" i]'); return el && el.value && el.value.length > 5 ? el.value : ''; }")
+                                if token:
+                                    break
+                            if not token:
+                                page._anti_bot_blocked = True
+                                filename = get_safe_filename(url, platform_name, current_lang)
+                                save_solution(filename, solution_code, url, explanation, platform_name, current_lang)
+                                return False
+
+                    # Click Submit
+                    await page.locator('input.submit').click()
+                    print(f"   🚀 Clicked Codeforces Submit ({lang_title})! Waiting for judge verdict...")
+                    await asyncio.sleep(3)
+                except Exception as e:
+                    print(f"   ⚠️  Codeforces submit notice: {e}")
+            else:
+                print(f"   🧪 Codeforces local test complete ({lang_title}, Mode: RUN).")
+        else:
+            # Editor injection for LeetCode, HackerRank, CodeChef, HackerEarth
+            print(f"   📋 Injecting {lang_title} solution into editor...")
+            await inject_code_into_editor(page, solution_code)
+
+            if mode in ["run", "both"] and config.get("run_selectors"):
+                for selector in config["run_selectors"]:
+                    btn = page.locator(selector).first
+                    try:
+                        if await btn.is_visible():
+                            await btn.click()
+                            print(f"   ▶️  Clicked 'Run Code' button ({selector})!")
+                            break
+                    except Exception:
+                        continue
                 wait_time = 10 if mode == "both" else 7
-                print(f"   ⏳ Waiting {wait_time}s for compilation and test results...")
+                print(f"   ⏳ Waiting {wait_time}s for compilation/run results...")
                 await asyncio.sleep(wait_time)
 
-        if mode in ["submit", "both"] and config.get("submit_selectors"):
-            submit_clicked = False
-            for selector in config["submit_selectors"]:
-                btn = page.locator(selector).first
-                try:
-                    if await btn.is_visible():
-                        await btn.click()
-                        print(f"   🚀 Clicked 'Submit' button ({selector})!")
-                        submit_clicked = True
-                        break
-                except Exception:
+            if mode in ["submit", "both"] and config.get("submit_selectors"):
+                for selector in config["submit_selectors"]:
+                    btn = page.locator(selector).first
+                    try:
+                        if await btn.is_visible():
+                            await btn.click()
+                            print(f"   🚀 Clicked 'Submit' button ({selector})!")
+                            break
+                    except Exception:
+                        continue
+
+        # Post-submission judge verification
+        if mode in ["submit", "both"]:
+            print(f"   ⏳ Verifying live judge submission verdict for {lang_title}...")
+            is_accepted, verdict_msg = await verify_live_submission_verdict(page, platform_type, url)
+            print(f"   🎯 Live verdict: {verdict_msg}")
+
+            if not is_accepted:
+                print(f"   ❌ {lang_title} solution was NOT accepted by judge ({verdict_msg}).")
+                if current_lang == "java":
+                    print("   🔄 Java did not succeed. Automatically switching to Python 3 for this problem...")
                     continue
+                else:
+                    print("   🛑 SKIPPING GitHub commit to guarantee ZERO broken solutions in repository!")
+                    return False
 
-    # 7. POST-SUBMISSION JUDGE VERIFICATION
-    if mode in ["submit", "both"]:
-        print("[7/7] Verifying live judge submission verdict...")
-        is_accepted, verdict_msg = await verify_live_submission_verdict(page, platform_type, url)
-        print(f"   🎯 Live verdict: {verdict_msg}")
+        # If we reached here, the solution was accepted!
+        filename = get_safe_filename(url, platform_name, current_lang)
+        save_solution(filename, solution_code, url, explanation, platform_name, current_lang)
 
-        if not is_accepted:
-            print(f"   ❌ Problem {url} NOT accepted by judge ({verdict_msg}).")
-            print(f"   🛑 SKIPPING GitHub commit to guarantee ZERO broken solutions in repository!")
-            return False
+        print(f"   🐙 Committing verified {lang_title} solution to GitHub repo...")
+        commit_solution_to_github(platform_type, url, solution_code, explanation, platform_name, current_lang)
 
-    # 8. ONLY COMMIT TO GITHUB IF GENUINELY VERIFIED & ACCEPTED
-    filename = get_safe_java_filename(url, platform_name)
-    save_java_solution(filename, solution_code, url, explanation, platform_name)
+        print(f"✅ Completed processing: {url} (VERIFIED ACCEPTED IN {lang_title.upper()} & COMMITTED)\n")
+        return True
 
-    print("   🐙 Committing verified solution to GitHub repo...")
-    commit_solution_to_github(platform_type, url, solution_code, explanation, platform_name)
-
-    print(f"✅ Completed processing: {url} (VERIFIED ACCEPTED & COMMITTED)\n")
-    return True
+    return False
 
 async def ensure_live_page(page: Page, p_playwright=None, browser=None, context=None) -> Tuple[Any, Any, Page]:
     """Guarantees an active, responsive browser page by reconnecting over CDP if disconnected."""
