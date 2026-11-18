@@ -56,7 +56,7 @@ cat << EOF > "$PLIST_PATH"
         <string>--count</string>
         <string>5</string>
         <string>--difficulty</string>
-        <string>medium-hard</string>
+        <string>medium</string>
         <string>--mode</string>
         <string>both</string>
     </array>

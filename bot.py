@@ -186,8 +186,8 @@ PLATFORM_RULES = {
 # Pydantic Output Schema
 # ==============================================================================
 class CodingAnswer(BaseModel):
+    code: str = Field(description="Complete, valid, standalone code in the requested programming language without markdown fences")
     explanation: str = Field(description="Concise summary of approach and time/space complexity")
-    code: str = Field(description="Complete, valid, standalone Java code only with no markdown fences")
 
 # ==============================================================================
 # ==============================================================================
@@ -371,11 +371,12 @@ async def discover_leetcode_candidates(page: Page, count: int = 15, difficulty: 
     return candidates
 
 async def discover_codeforces_candidates(page: Page, count: int = 15, difficulty: str = "medium-hard") -> List[str]:
-    """Finds unsolved Codeforces problems in Medium/Hard ratings, excluding any already solved by user."""
+    """Finds unsolved Codeforces problems in Medium ratings, prioritizing curated standard catalog first."""
     print(f"\n🔍 [Codeforces] Finding up to {count} unsolved problems (Difficulty: {difficulty.upper()})...")
     candidates = []
 
-    try:
+    # 1. Sync user's solved list from Codeforces API
+    if CODEFORCES_HANDLE:
         try:
             cf_status_url = f"https://codeforces.com/api/user.status?handle={CODEFORCES_HANDLE}&from=1&count=10000"
             req = urllib.request.Request(cf_status_url, headers={"User-Agent": "Mozilla/5.0"})
@@ -392,239 +393,237 @@ async def discover_codeforces_candidates(page: Page, count: int = 15, difficulty
         except Exception:
             pass
 
-        req = urllib.request.Request("https://codeforces.com/api/problemset.problems", headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            res = json.loads(resp.read().decode("utf-8"))
+    # 2. Prioritize curated catalog of standard classic Div 2A/2B/Div 3 problems first
+    if difficulty.lower() == "easy":
+        catalog_fallback = [
+            "https://codeforces.com/problemset/problem/4/A",
+            "https://codeforces.com/problemset/problem/71/A",
+            "https://codeforces.com/problemset/problem/231/A",
+            "https://codeforces.com/problemset/problem/158/A",
+            "https://codeforces.com/problemset/problem/282/A",
+            "https://codeforces.com/problemset/problem/112/A",
+            "https://codeforces.com/problemset/problem/339/A",
+            "https://codeforces.com/problemset/problem/263/A",
+            "https://codeforces.com/problemset/problem/546/A",
+            "https://codeforces.com/problemset/problem/791/A",
+            "https://codeforces.com/problemset/problem/617/A",
+            "https://codeforces.com/problemset/problem/59/A",
+            "https://codeforces.com/problemset/problem/977/A",
+            "https://codeforces.com/problemset/problem/266/A",
+            "https://codeforces.com/problemset/problem/281/A",
+            "https://codeforces.com/problemset/problem/110/A",
+            "https://codeforces.com/problemset/problem/734/A",
+            "https://codeforces.com/problemset/problem/41/A",
+            "https://codeforces.com/problemset/problem/677/A",
+            "https://codeforces.com/problemset/problem/1030/A",
+            "https://codeforces.com/problemset/problem/467/A",
+            "https://codeforces.com/problemset/problem/344/A",
+            "https://codeforces.com/problemset/problem/486/A",
+            "https://codeforces.com/problemset/problem/271/A",
+            "https://codeforces.com/problemset/problem/136/A",
+            "https://codeforces.com/problemset/problem/200/B",
+            "https://codeforces.com/problemset/problem/144/A",
+            "https://codeforces.com/problemset/problem/996/A",
+            "https://codeforces.com/problemset/problem/1328/A",
+            "https://codeforces.com/problemset/problem/520/A",
+        ]
+    else:
+        catalog_fallback = [
+            "https://codeforces.com/problemset/problem/1352/C",
+            "https://codeforces.com/problemset/problem/1520/D",
+            "https://codeforces.com/problemset/problem/474/B",
+            "https://codeforces.com/problemset/problem/520/B",
+            "https://codeforces.com/problemset/problem/580/C",
+            "https://codeforces.com/problemset/problem/20/C",
+            "https://codeforces.com/problemset/problem/466/C",
+            "https://codeforces.com/problemset/problem/371/C",
+            "https://codeforces.com/problemset/problem/339/D",
+            "https://codeforces.com/problemset/problem/1294/C",
+            "https://codeforces.com/problemset/problem/459/B",
+            "https://codeforces.com/problemset/problem/1360/D",
+            "https://codeforces.com/problemset/problem/550/A",
+            "https://codeforces.com/problemset/problem/276/C",
+            "https://codeforces.com/problemset/problem/489/C",
+            "https://codeforces.com/problemset/problem/1335/D",
+            "https://codeforces.com/problemset/problem/1343/C",
+            "https://codeforces.com/problemset/problem/1352/D",
+            "https://codeforces.com/problemset/problem/1360/C",
+            "https://codeforces.com/problemset/problem/1374/C",
+        ]
+    for u in catalog_fallback:
+        slug = u.rstrip("/").split("/")[-2] + "_" + u.rstrip("/").split("/")[-1]
+        if not SolvedRegistry.is_solved("codeforces", slug) and u not in candidates:
+            candidates.append(u)
+        if len(candidates) >= count:
+            break
 
-        if res.get("status") == "OK":
-            probs = res["result"]["problems"]
-            stats = {(s["contestId"], s["index"]): s["solvedCount"] for s in res["result"]["problemStatistics"]}
-            sorted_probs = sorted(probs, key=lambda p: stats.get((p["contestId"], p["index"]), 0), reverse=True)
-
-            for p in sorted_probs:
-                rating = p.get("rating", 1200)
-                if difficulty.lower() in ["medium-hard", "hard-medium"]:
-                    if rating < 1300 or rating > 2000:
-                        continue
-                elif difficulty.lower() == "medium":
-                    if rating < 1200 or rating > 1600:
-                        continue
-                elif difficulty.lower() == "hard":
-                    if rating < 1600 or rating > 2400:
-                        continue
-                elif difficulty.lower() == "easy":
-                    if rating > 1000:
-                        continue
-
-                slug = f"{p['contestId']}_{p['index']}"
-                if SolvedRegistry.is_solved("codeforces", slug):
-                    continue
-
-                url = f"https://codeforces.com/problemset/problem/{p['contestId']}/{p['index']}"
-                if url not in candidates:
-                    candidates.append(url)
-                if len(candidates) >= count:
-                    break
-    except Exception as e:
-        print(f"   ⚠️  Codeforces API note: {e}")
-
-    # Fallback to curated catalog if API fails or yields insufficient candidates
+    # 3. If more needed, query Codeforces API with calibrated ratings
     if len(candidates) < count:
-        if difficulty.lower() == "easy":
-            catalog_fallback = [
-                "https://codeforces.com/problemset/problem/4/A",
-                "https://codeforces.com/problemset/problem/71/A",
-                "https://codeforces.com/problemset/problem/231/A",
-                "https://codeforces.com/problemset/problem/158/A",
-                "https://codeforces.com/problemset/problem/282/A",
-                "https://codeforces.com/problemset/problem/112/A",
-                "https://codeforces.com/problemset/problem/339/A",
-                "https://codeforces.com/problemset/problem/263/A",
-                "https://codeforces.com/problemset/problem/546/A",
-                "https://codeforces.com/problemset/problem/791/A",
-                "https://codeforces.com/problemset/problem/617/A",
-                "https://codeforces.com/problemset/problem/59/A",
-                "https://codeforces.com/problemset/problem/977/A",
-                "https://codeforces.com/problemset/problem/266/A",
-                "https://codeforces.com/problemset/problem/281/A",
-                "https://codeforces.com/problemset/problem/110/A",
-                "https://codeforces.com/problemset/problem/734/A",
-                "https://codeforces.com/problemset/problem/41/A",
-                "https://codeforces.com/problemset/problem/677/A",
-                "https://codeforces.com/problemset/problem/1030/A",
-                "https://codeforces.com/problemset/problem/467/A",
-                "https://codeforces.com/problemset/problem/344/A",
-                "https://codeforces.com/problemset/problem/486/A",
-                "https://codeforces.com/problemset/problem/271/A",
-                "https://codeforces.com/problemset/problem/136/A",
-                "https://codeforces.com/problemset/problem/200/B",
-                "https://codeforces.com/problemset/problem/144/A",
-                "https://codeforces.com/problemset/problem/996/A",
-                "https://codeforces.com/problemset/problem/1328/A",
-                "https://codeforces.com/problemset/problem/520/A",
-            ]
-        else:
-            catalog_fallback = [
-                "https://codeforces.com/problemset/problem/1352/C",
-                "https://codeforces.com/problemset/problem/1520/D",
-                "https://codeforces.com/problemset/problem/474/B",
-                "https://codeforces.com/problemset/problem/520/B",
-                "https://codeforces.com/problemset/problem/580/C",
-                "https://codeforces.com/problemset/problem/20/C",
-                "https://codeforces.com/problemset/problem/466/C",
-                "https://codeforces.com/problemset/problem/371/C",
-                "https://codeforces.com/problemset/problem/339/D",
-                "https://codeforces.com/problemset/problem/1294/C",
-                "https://codeforces.com/problemset/problem/459/B",
-                "https://codeforces.com/problemset/problem/1360/D",
-                "https://codeforces.com/problemset/problem/550/A",
-                "https://codeforces.com/problemset/problem/276/C",
-                "https://codeforces.com/problemset/problem/489/C",
-                "https://codeforces.com/problemset/problem/1335/D",
-                "https://codeforces.com/problemset/problem/1343/C",
-                "https://codeforces.com/problemset/problem/1352/D",
-                "https://codeforces.com/problemset/problem/1360/C",
-                "https://codeforces.com/problemset/problem/1374/C",
-            ]
-        for u in catalog_fallback:
-            slug = u.rstrip("/").split("/")[-2] + "_" + u.rstrip("/").split("/")[-1]
-            if not SolvedRegistry.is_solved("codeforces", slug) and u not in candidates:
-                candidates.append(u)
-            if len(candidates) >= count:
-                break
+        try:
+            req = urllib.request.Request("https://codeforces.com/api/problemset.problems", headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                res = json.loads(resp.read().decode("utf-8"))
+
+            if res.get("status") == "OK":
+                probs = res["result"]["problems"]
+                stats = {(s["contestId"], s["index"]): s["solvedCount"] for s in res["result"]["problemStatistics"]}
+                sorted_probs = sorted(probs, key=lambda p: stats.get((p["contestId"], p["index"]), 0), reverse=True)
+
+                for p in sorted_probs:
+                    rating = p.get("rating", 1200)
+                    if difficulty.lower() == "easy":
+                        if rating > 1000:
+                            continue
+                    elif difficulty.lower() == "hard":
+                        if rating < 1400 or rating > 1800:
+                            continue
+                    else: # medium / medium-hard: standard Div 2A/2B/Div 3 (rating 1000 - 1350)
+                        if rating < 1000 or rating > 1350:
+                            continue
+
+                    slug = f"{p['contestId']}_{p['index']}"
+                    if SolvedRegistry.is_solved("codeforces", slug):
+                        continue
+
+                    url = f"https://codeforces.com/problemset/problem/{p['contestId']}/{p['index']}"
+                    if url not in candidates:
+                        candidates.append(url)
+                    if len(candidates) >= count:
+                        break
+        except Exception as e:
+            print(f"   ⚠️  Codeforces API note: {e}")
 
     print(f"   ✅ Discovered {len(candidates)} completely unsolved Codeforces candidates.")
     return candidates
 
 async def discover_hackerrank_candidates(page: Page, count: int = 15, difficulty: str = "medium-hard") -> List[str]:
-    """Finds unsolved HackerRank challenges (Medium/Hard) using API with pagination and fallback catalog."""
+    """Finds unsolved HackerRank challenges (Medium/Easy) using curated catalog first, then API with pagination."""
     print(f"\n🔍 [HackerRank] Finding up to {count} unsolved challenges (Difficulty: {difficulty.upper()})...")
     candidates = []
 
-    diff_params = ""
-    if difficulty.lower() == "hard":
-        diff_params = "&filters%5Bdifficulty%5D%5B%5D=hard"
-    elif difficulty.lower() in ["medium-hard", "hard-medium"]:
-        # Prioritize Medium challenges to avoid impossible Expert/Hard DP problems
-        diff_params = "&filters%5Bdifficulty%5D%5B%5D=medium"
-    elif difficulty.lower() == "medium":
-        diff_params = "&filters%5Bdifficulty%5D%5B%5D=medium"
-    elif difficulty.lower() == "easy":
-        diff_params = "&filters%5Bdifficulty%5D%5B%5D=easy"
-
-    tracks = ["algorithms", "data-structures"]
-    for track in tracks:
+    # 1. Prioritize verified solvable challenges first
+    curated_hr = [
+        "magic-square-forming", "climbing-the-leaderboard", "extra-long-factorials",
+        "non-divisible-subset", "queens-attack-2", "organizing-containers-of-balls",
+        "bigger-is-greater", "the-time-in-words", "encryption", "surface-area-3d",
+        "absolute-permutation", "the-bomberman-game", "two-pluses", "larrys-array",
+        "almost-sorted", "reduced-string", "sherlock-and-anagrams",
+        "common-child", "special-palindrome-again", "fraudulent-activity-notifications",
+        "count-luck", "cut-the-tree", "connected-cell-in-a-grid",
+        "short-palindrome", "bear-and-steady-gene", "sherlock-and-valid-string",
+        "simple-array-sum", "compare-the-triplets", "a-very-big-sum", "diagonal-difference",
+        "plus-minus", "staircase", "mini-max-sum", "birthday-cake-candles", "time-conversion"
+    ]
+    for slug in curated_hr:
+        if not SolvedRegistry.is_solved("hackerrank", slug):
+            u = f"https://www.hackerrank.com/challenges/{slug}/problem"
+            if u not in candidates:
+                candidates.append(u)
         if len(candidates) >= count:
             break
-        for offset in [0, 50, 100, 150]:
-            if len(candidates) >= count:
-                break
-            try:
-                api_url = f"https://www.hackerrank.com/rest/contests/master/tracks/{track}/challenges?offset={offset}&limit=50{diff_params}"
-                req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=8) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
-                    for m in data.get("models", []):
-                        slug = m.get("slug")
-                        if not slug or SolvedRegistry.is_solved("hackerrank", slug):
-                            continue
-                        u = f"https://www.hackerrank.com/challenges/{slug}/problem"
-                        if u not in candidates:
-                            candidates.append(u)
-                        if len(candidates) >= count:
-                            break
-            except Exception as e:
-                print(f"   ⚠️  HackerRank API ({track}, offset {offset}) note: {e}")
-                continue
 
-    # Fallback catalog of verified active HackerRank challenges across tracks
+    # 2. If more candidates needed, query API while filtering out known unsolvable/expert problems
     if len(candidates) < count:
-        curated_hr = [
-            "magic-square-forming", "climbing-the-leaderboard", "extra-long-factorials",
-            "non-divisible-subset", "queens-attack-2", "organizing-containers-of-balls",
-            "bigger-is-greater", "the-time-in-words", "encryption", "surface-area-3d",
-            "absolute-permutation", "the-bomberman-game", "two-pluses", "larrys-array",
-            "almost-sorted", "matrix-rotation-algo", "reduced-string", "sherlock-and-anagrams",
-            "common-child", "special-palindrome-again", "fraudulent-activity-notifications",
-            "lily-ranking", "count-luck", "cut-the-tree", "connected-cell-in-a-grid",
-            "short-palindrome", "bear-and-steady-gene", "sherlock-and-valid-string",
-            "simple-array-sum", "compare-the-triplets", "a-very-big-sum", "diagonal-difference",
-            "plus-minus", "staircase", "mini-max-sum", "birthday-cake-candles", "time-conversion"
-        ]
-        for slug in curated_hr:
-            if not SolvedRegistry.is_solved("hackerrank", slug):
-                u = f"https://www.hackerrank.com/challenges/{slug}/problem"
-                if u not in candidates:
-                    candidates.append(u)
+        diff_params = "&filters%5Bdifficulty%5D%5B%5D=medium"
+        if difficulty.lower() == "easy":
+            diff_params = "&filters%5Bdifficulty%5D%5B%5D=easy"
+        elif difficulty.lower() == "hard":
+            diff_params = "&filters%5Bdifficulty%5D%5B%5D=hard"
+
+        # Slugs that are contest-level NP-hard, flawed judges, or expert DP
+        unsolvable_blacklist = {
+            "clique", "xor-quadruples", "lena-sort", "bonetrousle", "mr-k-marsh",
+            "summing-pieces", "hackerrank-city", "hr-city", "prime-digit-sums", "fair-cut",
+            "prime-xor", "kingdom-division", "cloudy-day", "determining-dna-health",
+            "insertion-sort", "morgan-and-a-string", "count-strings", "cards-permutation",
+            "string-similarity", "super-functional-strings", "gridland-provinces",
+            "ashton-and-string", "circular-palindromes", "similar-strings"
+        }
+
+        tracks = ["algorithms", "data-structures"]
+        for track in tracks:
             if len(candidates) >= count:
                 break
+            for offset in [0, 50, 100, 150]:
+                if len(candidates) >= count:
+                    break
+                try:
+                    api_url = f"https://www.hackerrank.com/rest/contests/master/tracks/{track}/challenges?offset={offset}&limit=50{diff_params}"
+                    req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(req, timeout=8) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        for m in data.get("models", []):
+                            slug = m.get("slug")
+                            if not slug or slug in unsolvable_blacklist or SolvedRegistry.is_solved("hackerrank", slug):
+                                continue
+                            u = f"https://www.hackerrank.com/challenges/{slug}/problem"
+                            if u not in candidates:
+                                candidates.append(u)
+                            if len(candidates) >= count:
+                                break
+                except Exception as e:
+                    print(f"   ⚠️  HackerRank API ({track}, offset {offset}) note: {e}")
+                    continue
 
     print(f"   ✅ Discovered {len(candidates)} completely unsolved HackerRank candidates.")
     return candidates
 
 async def discover_codechef_candidates(page: Page, count: int = 15, difficulty: str = "medium-hard") -> List[str]:
-    """Finds unsolved CodeChef problems in Medium/Hard ratings via API pagination."""
+    """Finds unsolved CodeChef problems in Medium ratings via curated pool and API."""
     print(f"\n🔍 [CodeChef] Finding up to {count} unsolved problems (Difficulty: {difficulty.upper()})...")
     candidates = []
 
-    if difficulty.lower() == "easy":
-        pages_to_check = [0, 1, 2, 3, 4, 5, 6, 7]
-    elif difficulty.lower() in ["medium-hard", "hard-medium", "medium"]:
-        pages_to_check = [10, 20, 30, 40, 50, 60]
-    else:
-        pages_to_check = [20, 40, 60, 80]
-    for p_num in pages_to_check:
+    # 1. Prioritize curated classic problems first
+    curated_cc = [
+        "NAME2", "ALTARAY", "MAXDIFF", "DIVSUBS", "TACHSTCK",
+        "CHEFA", "STONES", "MARCHA1", "CIELRCPT", "CARVANS",
+        "JOHNY", "CLEANUP", "HORSES", "CSUB", "CNOTE",
+        "RAINBOWA", "SALARY", "CHN15A", "FRGTNLNG", "COPS"
+    ]
+    for c in curated_cc:
+        if not SolvedRegistry.is_solved("codechef", c):
+            u = f"https://www.codechef.com/problems/{c}"
+            if u not in candidates:
+                candidates.append(u)
         if len(candidates) >= count:
             break
-        try:
-            api_url = f"https://www.codechef.com/api/list/problems?page={p_num}&limit=50&sort_by=successful_submissions&sort_order=desc"
-            req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=6) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                for p in data.get("data", []):
-                    try:
-                        r = int(p.get("difficulty_rating", 0))
-                        if difficulty.lower() == "hard":
-                            if r < 1600 or r > 2500:
-                                continue
-                        elif difficulty.lower() in ["medium-hard", "hard-medium"]:
-                            if r < 1200 or r > 2200:
-                                continue
-                        elif difficulty.lower() == "medium":
-                            if r < 1200 or r > 1600:
-                                continue
-                        elif difficulty.lower() == "easy":
-                            if r > 1100:
-                                continue
-                    except Exception:
-                        continue
 
-                    code = p.get("code")
-                    if not code or SolvedRegistry.is_solved("codechef", code):
-                        continue
-                    u = f"https://www.codechef.com/problems/{code}"
-                    if u not in candidates:
-                        candidates.append(u)
-                    if len(candidates) >= count:
-                        break
-        except Exception as e:
-            print(f"   ⚠️  CodeChef API page {p_num} note: {e}")
-
-    # Fallback to curated 4-star/Medium problems if API was unreachable
+    # 2. If more candidates needed, check API with calibrated rating (1000 - 1450 max, avoiding extreme 2200 problems)
     if len(candidates) < count:
-        curated_cc = [
-            "NAME2", "ALTARAY", "MAXDIFF", "DIVSUBS", "TACHSTCK",
-            "CHEFA", "STONES", "MARCHA1", "CIELRCPT", "CARVANS",
-            "JOHNY", "CLEANUP", "HORSES", "CSUB", "CNOTE",
-            "RAINBOWA", "SALARY", "CHN15A", "FRGTNLNG", "COPS"
-        ]
-        for c in curated_cc:
-            if not SolvedRegistry.is_solved("codechef", c):
-                u = f"https://www.codechef.com/problems/{c}"
-                if u not in candidates:
-                    candidates.append(u)
+        pages_to_check = [0, 1, 2, 3, 4, 5, 6, 7] if difficulty.lower() == "easy" else [5, 10, 15, 20]
+        for p_num in pages_to_check:
             if len(candidates) >= count:
                 break
+            try:
+                api_url = f"https://www.codechef.com/api/list/problems?page={p_num}&limit=50&sort_by=successful_submissions&sort_order=desc"
+                req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=6) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    for p in data.get("data", []):
+                        try:
+                            r = int(p.get("difficulty_rating", 0))
+                            if difficulty.lower() == "easy":
+                                if r > 1100:
+                                    continue
+                            elif difficulty.lower() == "hard":
+                                if r < 1400 or r > 1800:
+                                    continue
+                            else: # medium / medium-hard
+                                if r < 1000 or r > 1450:
+                                    continue
+                        except Exception:
+                            continue
+
+                        code = p.get("code")
+                        if not code or SolvedRegistry.is_solved("codechef", code):
+                            continue
+                        u = f"https://www.codechef.com/problems/{code}"
+                        if u not in candidates:
+                            candidates.append(u)
+                        if len(candidates) >= count:
+                            break
+            except Exception as e:
+                print(f"   ⚠️  CodeChef API page {p_num} note: {e}")
 
     print(f"   ✅ Discovered {len(candidates)} completely unsolved CodeChef candidates.")
     return candidates
@@ -635,75 +634,55 @@ async def discover_hackerearth_candidates(page: Page, count: int = 15, difficult
     candidates = []
 
     # Curated catalog of verified, active algorithmic challenges across topics
-    if difficulty.lower() == "easy":
-        catalog = [
-            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/zoos-06063825/",
-            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/roy-and-profile/",
-            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/find-product/",
-            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/count-divisors/",
-            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/palindromic-string/",
-            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/toggle-string/",
-            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/cost-of-balloons/",
-            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/divisibility-2-ee324d20/",
-            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/ali-and-helping-innocent-people/",
-            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/maximum-borders-9ecec21a/",
-            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/seven-segments-bm-1/",
-            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/split-houses/",
-            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/excursion-2-0a544a49/",
-            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/step-up-3-c82ee783/",
-            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/number-of-steps-38e680a5/",
-            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/best-index-1-45a2f8ff/",
-            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/minimum-steps-9/",
-            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/factorial-4/",
-            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/friend-relationship-1/",
-            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/maximum-number-11-c917f6bd/",
-            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/going-to-office-e2d4d5d3/",
-            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/conject-it/",
-            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/lift-queries/",
-            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/e-maze-in-1aa4e2ac/",
-            "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/magical-word-6/",
-        ]
-    else:
-        catalog = [
-        "https://www.hackerearth.com/practice/algorithms/graphs/breadth-first-search/practice-problems/algorithm/cloudy-days-82a872ec/",
-        "https://www.hackerearth.com/practice/algorithms/graphs/breadth-first-search/practice-problems/algorithm/waves-b18625d7/",
-        "https://www.hackerearth.com/practice/algorithms/graphs/breadth-first-search/practice-problems/algorithm/zero-path-a7d370fd/",
-        "https://www.hackerearth.com/practice/algorithms/graphs/breadth-first-search/practice-problems/algorithm/t1-1-6064aa64/",
-        "https://www.hackerearth.com/practice/algorithms/graphs/breadth-first-search/practice-problems/algorithm/traffic-light-2-ee27ba45/",
+    easy_catalog = [
+        "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/zoos-06063825/",
+        "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/roy-and-profile/",
+        "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/find-product/",
+        "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/count-divisors/",
+        "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/palindromic-string/",
+        "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/toggle-string/",
+        "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/cost-of-balloons/",
+        "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/divisibility-2-ee324d20/",
+        "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/ali-and-helping-innocent-people/",
+        "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/maximum-borders-9ecec21a/",
+        "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/seven-segments-bm-1/",
+        "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/split-houses/",
+        "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/excursion-2-0a544a49/",
+        "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/step-up-3-c82ee783/",
+        "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/number-of-steps-38e680a5/",
+        "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/best-index-1-45a2f8ff/",
+        "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/minimum-steps-9/",
+        "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/factorial-4/",
+        "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/friend-relationship-1/",
+        "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/maximum-number-11-c917f6bd/",
+        "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/going-to-office-e2d4d5d3/",
+        "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/conject-it/",
+        "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/lift-queries/",
+        "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/e-maze-in-1aa4e2ac/",
+        "https://www.hackerearth.com/practice/basic-programming/input-output/basics-of-input-output/practice-problems/algorithm/magical-word-6/",
+    ]
+    med_catalog = [
         "https://www.hackerearth.com/practice/algorithms/graphs/breadth-first-search/practice-problems/algorithm/monk-and-the-islands/",
         "https://www.hackerearth.com/practice/algorithms/graphs/breadth-first-search/practice-problems/algorithm/dhoom-4/",
         "https://www.hackerearth.com/practice/algorithms/graphs/breadth-first-search/practice-problems/algorithm/oliver-and-the-battle-1/",
-        "https://www.hackerearth.com/practice/algorithms/graphs/breadth-first-search/practice-problems/algorithm/flip-grid-c6f88af8/",
-        "https://www.hackerearth.com/practice/algorithms/graphs/breadth-first-search/practice-problems/algorithm/ujjwals-mine-9eacab11/",
-        "https://www.hackerearth.com/practice/algorithms/graphs/depth-first-search/practice-problems/algorithm/cryptic-line-92a6bd09/",
-        "https://www.hackerearth.com/practice/algorithms/graphs/depth-first-search/practice-problems/algorithm/optimal-network-expansion-de452a46/",
-        "https://www.hackerearth.com/practice/algorithms/graphs/depth-first-search/practice-problems/algorithm/find-pairs-4-699bc085/",
-        "https://www.hackerearth.com/practice/algorithms/graphs/depth-first-search/practice-problems/algorithm/areas-0475fb6e/",
-        "https://www.hackerearth.com/practice/algorithms/graphs/depth-first-search/practice-problems/algorithm/water-flow-4-38cea6c6/",
-        "https://www.hackerearth.com/practice/algorithms/graphs/depth-first-search/practice-problems/algorithm/minimize-the-magic-05a3986c/",
-        "https://www.hackerearth.com/practice/algorithms/graphs/depth-first-search/practice-problems/algorithm/breaking-edges-march-circuits-ca482e2a/",
-        "https://www.hackerearth.com/practice/algorithms/graphs/depth-first-search/practice-problems/algorithm/minimum-nodes-e023e51e/",
-        "https://www.hackerearth.com/practice/algorithms/graphs/depth-first-search/practice-problems/algorithm/words-and-trees-f9ef202c/",
-        "https://www.hackerearth.com/practice/algorithms/graphs/depth-first-search/practice-problems/algorithm/el-nino/",
-        "https://www.hackerearth.com/practice/algorithms/dynamic-programming/introduction-to-dynamic-programming-1/practice-problems/algorithm/group-minmax-1cddbceb/",
-        "https://www.hackerearth.com/practice/algorithms/dynamic-programming/introduction-to-dynamic-programming-1/practice-problems/algorithm/max-seperations-4ed0b552/",
-        "https://www.hackerearth.com/practice/algorithms/dynamic-programming/introduction-to-dynamic-programming-1/practice-problems/algorithm/roses-for-valentine-4a795f72/",
-        "https://www.hackerearth.com/practice/algorithms/dynamic-programming/introduction-to-dynamic-programming-1/practice-problems/algorithm/jump-k-forward-250d464b/",
-        "https://www.hackerearth.com/practice/algorithms/dynamic-programming/introduction-to-dynamic-programming-1/practice-problems/algorithm/yogi-and-his-steps-65b27a4b/",
-        "https://www.hackerearth.com/practice/algorithms/dynamic-programming/introduction-to-dynamic-programming-1/practice-problems/algorithm/analytically-stable-123d6381/",
-        "https://www.hackerearth.com/practice/algorithms/dynamic-programming/introduction-to-dynamic-programming-1/practice-problems/algorithm/abcd-26-81bc0a09/",
         "https://www.hackerearth.com/practice/algorithms/dynamic-programming/introduction-to-dynamic-programming-1/practice-problems/algorithm/equal-array-84cf6c5f/",
-        "https://www.hackerearth.com/practice/algorithms/dynamic-programming/introduction-to-dynamic-programming-1/practice-problems/algorithm/odd-even-subarrays-72ad69db/",
-        "https://www.hackerearth.com/practice/algorithms/dynamic-programming/introduction-to-dynamic-programming-1/practice-problems/algorithm/accomodation-a5c006f3/",
-        "https://www.hackerearth.com/practice/algorithms/dynamic-programming/state-space-reduction/practice-problems/algorithm/aeroplanes-scheduling-7df0c65c/",
-        "https://www.hackerearth.com/practice/algorithms/dynamic-programming/state-space-reduction/practice-problems/algorithm/coutinho/",
-        "https://www.hackerearth.com/practice/algorithms/dynamic-programming/state-space-reduction/practice-problems/algorithm/bytelandian-gold-coins/",
-        "https://www.hackerearth.com/practice/data-structures/trees/binary-search-tree/practice-problems/algorithm/b-sequence-f919fc86/",
         "https://www.hackerearth.com/practice/data-structures/trees/binary-search-tree/practice-problems/algorithm/monk-and-his-friends/",
         "https://www.hackerearth.com/practice/data-structures/trees/binary-search-tree/practice-problems/algorithm/distinct-count/",
-        "https://www.hackerearth.com/practice/data-structures/trees/binary-search-tree/practice-problems/algorithm/suarez/",
-        "https://www.hackerearth.com/practice/data-structures/trees/binary-search-tree/practice-problems/algorithm/mst-revisited-3f9d614c/",
+        "https://www.hackerearth.com/practice/codemonk/arrays-strings/practice-problems/algorithm/monk-and-inversions-arrays-strings/",
+        "https://www.hackerearth.com/practice/codemonk/arrays-strings/practice-problems/algorithm/monk-and-rotation-3/",
+        "https://www.hackerearth.com/practice/codemonk/sorting/practice-problems/algorithm/monk-being-monitor/",
+        "https://www.hackerearth.com/practice/codemonk/sorting/practice-problems/algorithm/the-monk-and-class-marks/",
+        "https://www.hackerearth.com/practice/codemonk/stacks-queues/practice-problems/algorithm/monk-and-power-of-time/",
+        "https://www.hackerearth.com/practice/codemonk/stacks-queues/practice-problems/algorithm/little-monk-and-good-string/",
+        "https://www.hackerearth.com/practice/codemonk/sorting/practice-problems/algorithm/monk-and-sorting-algorithm/",
+        "https://www.hackerearth.com/practice/codemonk/searching/practice-problems/algorithm/monk-and-search-2/",
+        "https://www.hackerearth.com/practice/codemonk/sorting/practice-problems/algorithm/monk-and-nice-strings-3/",
+        "https://www.hackerearth.com/practice/codemonk/searching/practice-problems/algorithm/monk-and-circular-distance-3/",
+        "https://www.hackerearth.com/practice/codemonk/trees/practice-problems/algorithm/monk-and-the-magical-candy-bags/",
+        "https://www.hackerearth.com/practice/codemonk/graphs-1/practice-problems/algorithm/monk-at-the-graph-factory/",
+        "https://www.hackerearth.com/practice/codemonk/graphs-1/practice-problems/algorithm/monk-and-graph-problem/",
     ]
+    catalog = easy_catalog + med_catalog if difficulty.lower() != "hard" else med_catalog + easy_catalog
 
     for u in catalog:
         slug = u.rstrip("/").split("/")[-1]
@@ -991,7 +970,7 @@ def call_openai_compatible_model(endpoint: str, api_key: str, model_name: str, p
         return code, exp
 
 def call_gemini_model(model_name: str, prompt: str) -> Tuple[str, str]:
-    """Queries Google Gemini model with high-timeout client."""
+    """Queries Google Gemini model with high-timeout client and safe token output limit."""
     client = genai.Client(
         api_key=GEMINI_API_KEY,
         http_options=types.HttpOptions(
@@ -1005,6 +984,7 @@ def call_gemini_model(model_name: str, prompt: str) -> Tuple[str, str]:
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=CodingAnswer,
+            max_output_tokens=8192,
             temperature=0.1,
         ),
     )
@@ -1145,11 +1125,12 @@ IMPORTANT FORMATTING:
         model_queue.append(("openrouter", "meta-llama/llama-3.3-70b-instruct:free"))
         model_queue.append(("openrouter", "qwen/qwen-2.5-coder-32b-instruct:free"))
 
-    # 4. Google Gemini (Frontier 2.5 Flash with 120s timeout & Flash Lite)
+    # 4. Google Gemini (Frontier 2.5 Flash, resilient Flash-Lite, and Fallback models)
     if GEMINI_API_KEY:
-        model_queue.append(("gemini", "gemini-2.5-flash"))
+        if not getattr(ask_ai_for_code, "_gemini_25_quota_exhausted", False):
+            model_queue.append(("gemini", "gemini-2.5-flash"))
+        model_queue.append(("gemini", "gemini-flash-lite-latest"))
         model_queue.append(("gemini", "gemini-3.5-flash-lite"))
-        model_queue.append(("gemini", "gemini-3.1-flash-lite"))
 
     if not model_queue:
         raise ValueError("No AI API keys configured. Please set GEMINI_API_KEY, GROQ_API_KEY, or OPENROUTER_API_KEY in .env.")
@@ -1174,7 +1155,12 @@ IMPORTANT FORMATTING:
             except Exception as e:
                 last_error = e
                 err_str = str(e).lower()
-                if ("503" in err_str or "unavailable" in err_str or "429" in err_str or "rate" in err_str or "504" in err_str) and m_retry == 0:
+                if "quota exceeded" in err_str or "resource_exhausted" in err_str:
+                    if model_name == "gemini-2.5-flash":
+                        ask_ai_for_code._gemini_25_quota_exhausted = True
+                        print(f"   ℹ️  Gemini 2.5 Flash free tier daily limit reached (20 RPD). Switching to Gemini Flash-Lite & Fallback models.")
+                    break
+                if ("503" in err_str or "unavailable" in err_str) and m_retry == 0:
                     time.sleep(2)
                     continue
                 print(f"   ⚠️  Model {provider}:{model_name} failed: {e}. Trying next model...")
@@ -2492,11 +2478,11 @@ async def execute_batch(
             if deficit > 0:
                 print(f"\n" + "=" * 70)
                 print(f"⚠️  Quota deficit detected: {total_accepted}/{target_total} achieved ({deficit} missing).")
-                print(f"🛡️  FAIL-SAFE REALLOCATION: Solving remaining {deficit} problems on healthy platforms...")
+                print(f"🛡️  FAIL-SAFE REALLOCATION: Distributing remaining {deficit} problem(s) across operational platforms...")
                 print("=" * 70)
 
-                # User directive: Reallocation must be done to HackerRank (never to LeetCode)
-                preferred_order = ["hackerrank", "hackerearth", "codechef", "codeforces"]
+                # Distribute deficit evenly across healthy platforms (capped at 2 extra per platform)
+                preferred_order = ["hackerrank", "codechef", "codeforces", "hackerearth"]
                 fallback_pool = [p for p in preferred_order if platform_results.get(p, 0) > 0]
                 if not fallback_pool:
                     fallback_pool = preferred_order
@@ -2504,7 +2490,10 @@ async def execute_batch(
                 for p_name in fallback_pool:
                     if total_accepted >= target_total:
                         break
-                    needed = min(deficit, target_total - total_accepted)
+                    # Cap extra reallocation to at most 2 per platform to prevent cascading retries
+                    needed = min(deficit, target_total - total_accepted, 2)
+                    if needed <= 0:
+                        continue
                     print(f"\n🎯 [REALLOCATION] Solving {needed} additional problem(s) on {p_name.upper()}...")
                     extra, browser, context, page = await solve_platform_quota(
                         page, p_name, target_accepted=needed, difficulty=difficulty, mode=mode,
