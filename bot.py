@@ -1604,8 +1604,10 @@ async def verify_live_submission_verdict(page: Page, platform_type: str, url: st
                             print(f"      [CodeChef Poll {poll+1}/15] Match: {target_slug} -> Score: {score}, Solution: {sol}")
                             if "100" in score or "(100)" in score or "Explain" in sol or "tick" in row.lower() or "accepted" in row.lower():
                                 return True, "Accepted (100 pts)"
-                            else:
-                                return False, f"Not Accepted (Score: {score})"
+                            elif any(w in row.lower() for w in ["wrong answer", "time limit exceeded", "runtime error", "compilation error"]):
+                                return False, f"Not Accepted ({score or 'Judge Error'})"
+                            # If still evaluating, continue polling instead of prematurely failing
+                            continue
             except Exception:
                 pass
         return False, "CodeChef evaluation timed out or verdict not accepted (100 pts)."
