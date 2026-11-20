@@ -2239,6 +2239,33 @@ async def ensure_live_page(page: Page, p_playwright=None, browser=None, context=
 
     return browser, context, page
 
+async def wait_for_internet_connection(max_wait_seconds: int = 120, check_interval: int = 5) -> bool:
+    """Verifies that the network interface is online and internet is accessible (e.g. after system wake)."""
+    import urllib.request
+    start_time = time.time()
+    attempt = 1
+    test_endpoints = [
+        "https://www.google.com",
+        "https://1.1.1.1",
+        "https://www.cloudflare.com",
+    ]
+    while time.time() - start_time < max_wait_seconds:
+        for url in test_endpoints:
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=4) as resp:
+                    if resp.status == 200:
+                        if attempt > 1:
+                            print(f"   ✅ [Network] Internet connectivity confirmed restored after {int(time.time() - start_time)}s!")
+                        return True
+            except Exception:
+                pass
+        elapsed = int(time.time() - start_time)
+        print(f"   ⏳ [Network] Waiting for internet connection to become active ({elapsed}s/{max_wait_seconds}s, attempt {attempt})...")
+        attempt += 1
+        await asyncio.sleep(check_interval)
+    return False
+
 # ==============================================================================
 # Autonomous Batch Execution (Zero Human Input)
 # ==============================================================================
@@ -2255,6 +2282,11 @@ async def solve_platform_quota(
     """Solves problems on the given platform until target_accepted ACCEPTED problems are achieved.
     If a problem is not accepted by the judge, it immediately fetches a replacement problem.
     """
+    # Pre-flight network check before attempting platform
+    if not await wait_for_internet_connection(max_wait_seconds=60):
+        print(f"⚠️  [Network] Internet unreachable before starting {platform.upper()}. Waiting 10s...")
+        await asyncio.sleep(10)
+
     print(f"\n{'='*70}")
     print(f"🎯 STARTING QUOTA SOLVER: {platform.upper()} (Target: {target_accepted} ACCEPTED Java solutions)")
     print(f"{'='*70}")
@@ -2373,16 +2405,9 @@ async def execute_batch(
     print("=" * 70)
 
     # Verify internet connectivity before proceeding (e.g. after system wake)
-    for net_try in range(10):
-        try:
-            import urllib.request
-            with urllib.request.urlopen("https://www.google.com", timeout=3) as resp:
-                if resp.status == 200:
-                    break
-        except Exception:
-            if net_try < 9:
-                print(f"   ⏳ Waiting for internet connection to be active ({net_try + 1}/10)...")
-                await asyncio.sleep(3)
+    if not await wait_for_internet_connection(max_wait_seconds=120):
+        print("❌ Error: No active internet connection detected after 120 seconds. Aborting batch run.")
+        return
 
     async with async_playwright() as p:
         browser = None
@@ -2508,16 +2533,16 @@ async def execute_batch(
                 print(f"🛡️  FAIL-SAFE REALLOCATION: Distributing remaining {deficit} problem(s) across operational platforms...")
                 print("=" * 70)
 
-                # Distribute deficit evenly across healthy platforms (capped at 2 extra per platform)
-                preferred_order = ["hackerrank", "codechef", "codeforces", "hackerearth"]
-                fallback_pool = [p for p in preferred_order if platform_results.get(p, 0) > 0]
-                if not fallback_pool:
-                    fallback_pool = preferred_order
+                # Prioritize platforms that had a deficit first, then other operational platforms
+                preferred_order = ["leetcode", "hackerrank", "codechef", "codeforces", "hackerearth"]
+                unfulfilled = [p for p in preferred_order if platform_results.get(p, 0) < count]
+                fulfilled = [p for p in preferred_order if platform_results.get(p, 0) >= count]
+                fallback_pool = unfulfilled + fulfilled
 
                 for p_name in fallback_pool:
                     if total_accepted >= target_total:
                         break
-                    # Cap extra reallocation to at most 2 per platform to prevent cascading retries
+                    # Allocate needed problems to reach target_total
                     needed = min(deficit, target_total - total_accepted, 2)
                     if needed <= 0:
                         continue
@@ -2527,6 +2552,7 @@ async def execute_batch(
                         p_playwright=p, browser=browser, context=context
                     )
                     total_accepted += extra
+                    platform_results[p_name] = platform_results.get(p_name, 0) + extra
 
             print(f"\n🏆 COMPLETED! {total_accepted}/{target_total} total problems verified Accepted & committed to GitHub!")
         else:
