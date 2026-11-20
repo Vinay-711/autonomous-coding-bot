@@ -102,10 +102,10 @@ PLATFORM_RULES = {
         "name": "HackerRank",
         "question_selectors": [
             ".challenge-body-html",
-            ".problem-statement",
-            ".challenge_problem_statement",
             ".challenge-body",
-            ".problem-statement-limits",
+            ".challenge_problem_statement",
+            ".problem-statement",
+            ".hackerrank-content",
         ],
         "run_selectors": [
             "button.hr-monaco-compile",
@@ -531,7 +531,7 @@ async def discover_hackerrank_candidates(page: Page, count: int = 15, difficulty
         elif difficulty.lower() == "hard":
             diff_params = "&filters%5Bdifficulty%5D%5B%5D=hard"
 
-        # Slugs that are contest-level NP-hard, flawed judges, or expert DP
+        # Slugs that are contest-level NP-hard, flawed judges, or function-only pointer stubs
         unsolvable_blacklist = {
             "clique", "xor-quadruples", "lena-sort", "bonetrousle", "mr-k-marsh",
             "summing-pieces", "hackerrank-city", "hr-city", "prime-digit-sums", "fair-cut",
@@ -539,11 +539,14 @@ async def discover_hackerrank_candidates(page: Page, count: int = 15, difficulty
             "insertion-sort", "morgan-and-a-string", "count-strings", "cards-permutation",
             "string-similarity", "super-functional-strings", "gridland-provinces",
             "ashton-and-string", "circular-palindromes", "similar-strings",
-            "wet-shark-and-two-subsequences", "cut-tree", "xor-and-sum", "two-robots", "nikita-and-the-game"
+            "wet-shark-and-two-subsequences", "cut-tree", "xor-and-sum", "two-robots", "nikita-and-the-game",
+            "detect-whether-a-linked-list-contains-a-cycle", "tree-huffman-decoding", "is-binary-search-tree",
+            "tree-level-order-traversal", "binary-search-tree-lowest-common-ancestor", "tree-top-view",
+            "tree-height-of-a-binary-tree", "tree-preorder-traversal", "tree-inorder-traversal", "tree-postorder-traversal"
         }
 
         api_candidates = []
-        tracks = ["data-structures", "algorithms"]
+        tracks = ["algorithms"]
         for track in tracks:
             for offset in [0, 50, 100, 150, 200]:
                 try:
@@ -1237,7 +1240,7 @@ async def extract_problem_text(page: Page, selectors: List[str], timeout_ms: int
             loc = page.locator(selector).first
             await loc.wait_for(state="visible", timeout=per_selector_timeout)
             text = (await loc.inner_text()).strip()
-            if len(text) > 150:
+            if len(text) > 300:
                 return text
         except Exception:
             continue
@@ -1247,7 +1250,7 @@ async def extract_problem_text(page: Page, selectors: List[str], timeout_ms: int
             loc = page.locator(fallback).first
             if await loc.is_visible():
                 text = (await loc.inner_text()).strip()
-                if len(text) > 80:
+                if len(text) > 250:
                     return text
         except Exception:
             continue
